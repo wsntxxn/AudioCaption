@@ -28,14 +28,12 @@ class Runner(BaseRunner):
 
     @staticmethod
     def _get_model(config, vocab_size):
-        embed_size = config["model_args"]["embed_size"]
         if config["encodermodel"] == "E2EASREncoder":
-            encodermodel = models.encoder.load_espnet_encoder(config["pretrained_encoder"])
+            encodermodel = models.encoder.load_espnet_encoder(config["pretrained_encoder"], pretrained=config["load_encoder_params"])
         else:
             encodermodel = getattr(
                 models.encoder, config["encodermodel"])(
                 inputdim=config["inputdim"],
-                embed_size=embed_size,
                 **config["encodermodel_args"])
             if "pretrained_encoder" in config:
                 encoder_state_dict = torch.load(
@@ -46,50 +44,55 @@ class Runner(BaseRunner):
         decodermodel = getattr(
             models.decoder, config["decodermodel"])(
             vocab_size=vocab_size,
-            input_size=embed_size,
+            enc_mem_size=config["encodermodel_args"]["embed_size"],
             **config["decodermodel_args"])
+        if "pretrained_word_embedding" in config:
+            embeddings = np.load(config["pretrained_word_embedding"])
+            decodermodel.load_word_embeddings(
+                embeddings, 
+                tune=config["tune_word_embedding"], 
+                projection=True
+            )
         model = getattr(
-            models.WordModel, config["model"])(encodermodel, decodermodel, **config["model_args"])
+            models, config["model"])(encodermodel, decodermodel, **config["model_args"])
         return model
 
     def _forward(self, model, batch, mode, **kwargs):
         assert mode in ("train", "validation", "eval")
-        kwargs["mode"] = mode
 
         if mode == "eval":
             feats = batch[1]
             feat_lens = batch[-1]
+        else:
+            feats = batch[0]
+            caps = batch[1]
+            feat_lens = batch[-2]
+            cap_lens = batch[-1]
 
-            feats = convert_tensor(feats.float(),
-                                   device=self.device,
-                                   non_blocking=True)
-            output = model(feats, feat_lens, **kwargs)
-            return output
-
-        # mode is "train"
-
-        feats = batch[0]
-        caps = batch[1]
-        feat_lens = batch[-2]
-        cap_lens = batch[-1]
         feats = convert_tensor(feats.float(),
                                device=self.device,
                                non_blocking=True)
-        caps = convert_tensor(caps.long(),
-                              device=self.device,
-                              non_blocking=True)
-        # pack labels to remove padding from caption labels
-        targets = torch.nn.utils.rnn.pack_padded_sequence(
-            caps, cap_lens, batch_first=True).data
 
-        output = model(feats, feat_lens, caps, cap_lens, **kwargs)
+        if mode == "train":
+            caps = convert_tensor(caps.long(),
+                                  device=self.device,
+                                  non_blocking=True)
+            # pack labels to remove padding from caption labels
+            targets = torch.nn.utils.rnn.pack_padded_sequence(
+                caps[:, 1:], cap_lens - 1, batch_first=True).data
 
-        packed_logits = torch.nn.utils.rnn.pack_padded_sequence(
-            output["logits"], cap_lens, batch_first=True).data
-        packed_logits = convert_tensor(packed_logits, device=self.device, non_blocking=True)
+            output = model(feats, feat_lens, caps, cap_lens, **kwargs)
 
-        output["packed_logits"] = packed_logits
-        output["targets"] = targets
+            packed_logits = torch.nn.utils.rnn.pack_padded_sequence(
+                output["logits"], cap_lens - 1, batch_first=True).data
+            packed_logits = convert_tensor(
+                packed_logits, device=self.device, non_blocking=True)
+
+            output["packed_logits"] = packed_logits
+            output["targets"] = targets
+        else:
+            output = model(feats, feat_lens, **kwargs)
+
         return output
 
     def train(self, config, **kwargs):
@@ -99,10 +102,10 @@ class Runner(BaseRunner):
         """
         from pycocoevalcap.cider.cider import Cider
 
-        config_parameters = train_util.parse_config_or_kwargs(config, **kwargs)
-        config_parameters["seed"] = self.seed
+        conf = train_util.parse_config_or_kwargs(config, **kwargs)
+        conf["seed"] = self.seed
         outputdir = os.path.join(
-            config_parameters["outputpath"], config_parameters["model"],
+            conf["outputpath"], conf["model"],
             "{}_{}".format(
                 datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%m'),
                 uuid.uuid1().hex))
@@ -120,32 +123,29 @@ class Runner(BaseRunner):
         logger = train_util.genlogger(os.path.join(outputdir, "train.log"))
         # print passed config parameters
         logger.info("Storing files in: {}".format(outputdir))
-        train_util.pprint_dict(config_parameters, logger.info)
+        train_util.pprint_dict(conf, logger.info)
 
-        zh = config_parameters["zh"]
-        vocabulary = torch.load(config_parameters["vocab_file"])
-        train_loader, val_loader, info = self._get_dataloaders(config_parameters, vocabulary)
-        config_parameters["inputdim"] = info["inputdim"]
+        zh = conf["zh"]
+        vocabulary = torch.load(conf["vocab_file"])
+        train_loader, val_loader, info = self._get_dataloaders(conf, vocabulary)
+        conf["inputdim"] = info["inputdim"]
         val_key2refs = info["val_key2refs"]
         logger.info("<== Estimating Scaler ({}) ==>".format(info["scaler"].__class__.__name__))
         logger.info(
             "Feature: {} Input dimension: {} Vocab Size: {}".format(
-                config_parameters["feature_file"], info["inputdim"], len(vocabulary)))
+                conf["feature_file"], info["inputdim"], len(vocabulary)))
 
-        model = self._get_model(config_parameters, len(vocabulary))
-        if "pretrained_word_embedding" in config_parameters:
-            embeddings = np.load(config_parameters["pretrained_word_embedding"])
-            model.load_word_embeddings(embeddings, tune=config_parameters["tune_word_embedding"], projection=True)
+        model = self._get_model(conf, len(vocabulary))
         model = model.to(self.device)
         train_util.pprint_dict(model, logger.info, formatter="pretty")
         optimizer = getattr(
-            torch.optim, config_parameters["optimizer"]
-        )(model.parameters(), **config_parameters["optimizer_args"])
+            torch.optim, conf["optimizer"]
+        )(model.parameters(), **conf["optimizer_args"])
         train_util.pprint_dict(optimizer, logger.info, formatter="pretty")
 
 
         criterion = torch.nn.CrossEntropyLoss().to(self.device)
-        crtrn_imprvd = train_util.criterion_improver(config_parameters['improvecriterion'])
+        crtrn_imprvd = train_util.criterion_improver(conf['improvecriterion'])
 
         def _train_batch(engine, batch):
             model.train()
@@ -153,7 +153,7 @@ class Runner(BaseRunner):
                 optimizer.zero_grad()
                 output = self._forward(
                     model, batch, "train",
-                    ss_ratio=config_parameters["scheduled_sampling_args"]["ss_ratio"]
+                    ss_ratio=conf["ss_args"]["ss_ratio"]
                 )
                 loss = criterion(output["packed_logits"], output["targets"]).to(self.device)
                 loss.backward()
@@ -200,26 +200,25 @@ class Runner(BaseRunner):
 
         for name, metric in metrics.items():
             metric.attach(trainer, name)
-            metric.attach(evaluator, name)
 
         trainer.add_event_handler(
               Events.EPOCH_COMPLETED, train_util.log_results, evaluator, val_loader,
-              logger.info, metrics.keys(), ["loss", "accuracy", "score"])
+              logger.info, metrics.keys(), ["score"])
 
-        if config_parameters["scheduled_sampling"]:
+        if conf["ss"]:
             trainer.add_event_handler(
-                Events.GET_BATCH_COMPLETED, train_util.update_ss_ratio, config_parameters, len(train_loader))
+                Events.GET_BATCH_COMPLETED, train_util.update_ss_ratio, conf, len(train_loader))
 
         evaluator.add_event_handler(
             Events.EPOCH_COMPLETED, train_util.save_model_on_improved, crtrn_imprvd,
             "score", {
                 "model": model.state_dict(),
-                "config": config_parameters,
+                "config": conf,
                 "scaler": info["scaler"]
         }, os.path.join(outputdir, "saved.pth"))
 
-        scheduler = getattr(torch.optim.lr_scheduler, config_parameters["scheduler"])(
-            optimizer, **config_parameters["scheduler_args"])
+        scheduler = getattr(torch.optim.lr_scheduler, conf["scheduler"])(
+            optimizer, **conf["scheduler_args"])
         evaluator.add_event_handler(
             Events.EPOCH_COMPLETED, train_util.update_lr,
             scheduler, "score")
@@ -236,7 +235,7 @@ class Runner(BaseRunner):
             # trainer=trainer)
         # evaluator.add_event_handler(Events.COMPLETED, early_stop_handler)
 
-        trainer.run(train_loader, max_epochs=config_parameters["epochs"])
+        trainer.run(train_loader, max_epochs=conf["epochs"])
         return outputdir
 
 

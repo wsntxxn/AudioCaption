@@ -7,7 +7,7 @@ class TimeMask(nn.Module):
     def __init__(self, n=1, p=50):
         super(TimeMask, self).__init__()
         self.p = p
-        self.n = 1
+        self.n = n
 
     def forward(self, x):
         time, freq = x.shape
@@ -20,23 +20,23 @@ class TimeMask(nn.Module):
         return x
 
 class FreqMask(nn.Module):
-    def __init__(self, n=1, p=12):                                                                                                 
-        super().__init__()
-        self.p = p                                                                                                 
-        self.n = 1                                                                                                 
-                                                                                                    
+    def __init__(self, n=1, p=12):
+        super(FreqMask, self).__init__()
+        self.p = p
+        self.n = n
+
     def forward(self, x):
         time, freq = x.shape
         if self.training: 
             for i in range(self.n):
                 f = torch.empty(1, dtype=int).random_(self.p).item()
-                f0 = torch.empty(1, dtype=int).random_(freq - f).item()                                                                                                 
-                x[:, f0:f0 + f] = 0.                                                                                                 
+                f0 = torch.empty(1, dtype=int).random_(freq - f).item()
+                x[:, f0:f0 + f] = 0.
         return x
 
 
 if __name__ == "__main__":
     torch.manual_seed(1)
-    timemask = FreqMask(1, 12)
+    timemask = TimeMask(1, 12)
     x = torch.randn(100, 64)
-    timemask(x)
+    print(timemask(x))

@@ -28,14 +28,9 @@ class Vocabulary(object):
         return len(self.word2idx)
 
 def build_vocab(json:str, threshold:int, keeppunctuation: bool, host_address:str, character_level:bool=False, zh:bool=True ):
-    from nltk.parse.corenlp import CoreNLPParser
-    from zhon.hanzi import punctuation
     """Build vocabulary from csv file with a given threshold to drop all counts < threshold
 
     Args:
-        csv (string): Input csv file. Needs to be tab separated and having a column named 'caption'
-        
-        Modiefied:
         json(string): Input json file. Shoud have a column named 'caption'
         threshold (int): Threshold to drop all words with counts < threshold
         keeppunctuation (bool): Includes or excludes punctuation.
@@ -43,11 +38,12 @@ def build_vocab(json:str, threshold:int, keeppunctuation: bool, host_address:str
     Returns:
         vocab (Vocab): Object with the processed vocabulary
     """
-    #df = pd.read_csv(csv, sep='\t')
     df = pd.read_json(json)
     counter = Counter()
     
     if zh:
+        from nltk.parse.corenlp import CoreNLPParser
+        from zhon.hanzi import punctuation
         parser = CoreNLPParser(host_address)
         for i in tqdm(range(len(df)), leave=False, ascii=True):
             caption = str(df.loc[i]['caption'])

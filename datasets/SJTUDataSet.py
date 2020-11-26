@@ -1,19 +1,19 @@
-import os
 import re
 import sys
-sys.path.append(os.getcwd())
+from pathlib import Path
 
 import pandas as pd
 import numpy as np
 import torch
+import h5py
 
-import utils.kaldi_io as kaldi_io
+sys.path.append(str(Path.cwd()))
 from utils.build_vocab import Vocabulary
 
 
 class SJTUDataset(torch.utils.data.Dataset):
 
-    def __init__(self, kaldi_stream, caption_df,
+    def __init__(self, feature, caption_df,
                  vocabulary, transform=None):
         """Dataloader for the SJTU Audiocaptioning dataset
 
@@ -24,14 +24,17 @@ class SJTUDataset(torch.utils.data.Dataset):
             transform (function, optional): Defaults to None. Transformation onto the data (function)
         """
         super(SJTUDataset, self).__init__()
-        self._dataset = {k: v for k, v in kaldi_io.read_mat_ark(kaldi_stream)}
+        self._feature = feature
+        self._dataset = None
         self._transform = transform
         self._caption_df = caption_df
         self._vocabulary = vocabulary
 
     def __getitem__(self, index: int):
         dataid = self._caption_df.iloc[index]["key"]
-        feature = self._dataset[str(dataid)]
+        if self._dataset is None:
+            self._dataset = h5py.File(self._feature, "r")
+        feature = self._dataset[str(dataid)][()]
         tokens = self._caption_df.iloc[[index]]['tokens'].tolist()[0]
         caption = [self._vocabulary('<start>')] + \
             [self._vocabulary(token) for token in tokens] + \
@@ -55,32 +58,37 @@ class SJTUDataset(torch.utils.data.Dataset):
 
 class SJTUSentenceDataset(SJTUDataset):
 
-    def __init__(self, kaldi_stream, caption_df, vocabulary,
+    def __init__(self, feature, caption_df, vocabulary,
                  sentence_embedding, transform=None):
-        super(SJTUSentenceDataset, self).__init__(kaldi_stream,
+        super(SJTUSentenceDataset, self).__init__(feature,
             caption_df, vocabulary, transform)
         self.sentence_embedding = sentence_embedding
 
     def __getitem__(self, index: int):
         feature, caption, dataid = super(SJTUSentenceDataset, self).__getitem__(index)
-        dataid = self._caption_df.iloc[index]["key"]
         caption_id = self._caption_df.iloc[index]["caption_index"]
         sentence_embedding = self.sentence_embedding["{}_{}".format(dataid, caption_id)]
         sentence_embedding = torch.as_tensor(sentence_embedding)
         return feature, caption, sentence_embedding, dataid
 
-scp_pattern = re.compile("(?<=scp:)[^\s]*(?=\s)")
 
 class SJTUDatasetEval(torch.utils.data.Dataset):
     
-    def __init__(self, kaldi_stream, transform=None):
+    def __init__(self, feature, eval_scp, transform=None):
         super(SJTUDatasetEval, self).__init__()
-        self._kaldi_scp = scp_pattern.search(kaldi_stream).group()
-        self._data_generator = kaldi_io.read_mat_ark(kaldi_stream)
+        self._feature = feature
+        self._dataset = None
+        self._keys = []
+        with open(eval_scp, "r") as f:
+            for line in f.readlines():
+                self._keys.append(line.strip())
         self._transform = transform
 
     def __getitem__(self, index):
-        key, feature = next(self._data_generator)
+        if self._dataset is None:
+            self._dataset = h5py.File(self._feature, "r")
+        key = self._keys[index]
+        feature = self._dataset[key][()]
         if self._transform:
             if isinstance(self._transform, (tuple, list)):
                 for tf in self._transform:
@@ -90,9 +98,21 @@ class SJTUDatasetEval(torch.utils.data.Dataset):
         return key, torch.as_tensor(feature)
 
     def __len__(self):
-        with open(self._kaldi_scp, "r") as f:
-            length = len(f.readlines())
-        return length
+        return len(self._keys)
+
+
+class SJTUInstanceDataset(SJTUDataset):
+
+    def __init__(self, feature, caption_df,
+                 vocabulary, transform=None):
+        super(SJTUInstanceDataset, self).__init__(feature,
+            caption_df, vocabulary, transform)
+    
+    def __getitem__(self, index: int):
+        feature, caption, dataid = super(SJTUInstanceDataset, self).__getitem__(index)
+        caption_id = self._caption_df.iloc[index]["caption_index"] - 1
+        caption_id = torch.tensor(caption_id)
+        return feature, caption, caption_id, dataid
 
 
 def collate_fn(length_idxs):
@@ -123,6 +143,7 @@ def collate_fn(length_idxs):
                 elif data[0].size(0) > 1:
                     data_seq, tmp_len = merge_seq(data)
                     if idx in length_idxs:
+                        # print(tmp_len)
                         data_len.append(tmp_len)
             else:
                 data_seq = data
@@ -135,11 +156,11 @@ def collate_fn(length_idxs):
 
 
 def create_dataloader(
-        kaldi_stream, caption_df, vocabulary, transform=None,
+        feature, caption_df, vocabulary, transform=None,
         shuffle=True, batch_size: int = 16, num_workers=1,**kwargs
         ):
     dataset = SJTUDataset(
-        kaldi_stream=kaldi_stream,
+        feature=feature,
         caption_df=caption_df,
         vocabulary=vocabulary,
         transform=transform)
@@ -149,19 +170,19 @@ def create_dataloader(
         shuffle=shuffle, collate_fn=collate_fn([0, 1]), **kwargs)
 
 
-def create_dataloader_train_cv(kaldi_stream,
-                               caption_df,
-                               vocabulary,
-                               transform=None,
-                               batch_size: int = 16,
-                               num_workers=4,
-                               percent=90,
-                               **kwargs):
+def create_dataloader_train_val(feature,
+                                caption_df,
+                                vocabulary,
+                                transform=None,
+                                batch_size: int = 16,
+                                num_workers=4,
+                                percent=90,
+                                **kwargs):
     train_df = caption_df.sample(frac=percent / 100., random_state=0)
-    cv_df = caption_df[~caption_df.index.isin(train_df.index)]
-    cv_key2caps = cv_df.groupby(["key"])["caption"].apply(list).to_dict()
+    val_df = caption_df[~caption_df.index.isin(train_df.index)]
+    val_key2caps = val_df.groupby(["key"])["caption"].apply(list).to_dict()
 
-    trainloader = create_dataloader(kaldi_stream=kaldi_stream,
+    trainloader = create_dataloader(feature=feature,
                                     caption_df=train_df,
                                     vocabulary=vocabulary,
                                     transform=transform,
@@ -169,15 +190,15 @@ def create_dataloader_train_cv(kaldi_stream,
                                     shuffle=True,
                                     num_workers=num_workers,
                                     **kwargs)
-    cvloader = create_dataloader(kaldi_stream=kaldi_stream,
-                                 caption_df=cv_df,
+    cvloader = create_dataloader(feature=feature,
+                                 caption_df=val_df,
                                  vocabulary=vocabulary,
                                  transform=transform,
                                  batch_size=batch_size,
                                  shuffle=False,
                                  num_workers=num_workers,
                                  **kwargs)
-    return trainloader, cvloader, cv_key2caps
+    return trainloader, cvloader, val_key2caps
     
 
 class SubsetSampler(torch.utils.data.Sampler):
