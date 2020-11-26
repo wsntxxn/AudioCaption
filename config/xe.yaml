@@ -1,42 +1,38 @@
-outputpath: experiments/hospital
+outputpath: experiments/clotho
 
-feature_stream: copy-feats scp:data/hospital/logmel_dev.scp ark:- |
-caption_file: data/hospital/zh_dev.json
-vocab_file: data/hospital/vocab_zh.pth
-zh: True
+#feature_stream: copy-feats scp:data/clotho/logmel_dev.scp ark:- |
+feature_file: data/clotho/logmel.hdf5
+caption_file: data/clotho/dev.json
+vocab_file: data/clotho/vocab.pth
+zh: False
 dataloader_args:
     batch_size: 32
     num_workers: 4
 train_percent: 90
 augments: []
+#augments: [timemask, freqmask]
 
 scaler: StandardScaler # Can be any of sklearn.preprocessing that supports fit_partial
 scaler_args:
     with_std : True
     with_mean : True        
 
-encodermodel: GRUEncoder
+encodermodel: CRNNEncoder
 encodermodel_args:
-    num_layers: 1
-    dropout: 0.0
-    # Enables the passing of the hidden encoder state to the decoder
-    use_hidden: False
-    # Can be time, mean ( for last timestep, mean reduction)
-    representation: mean
-    hidden_size: 512
-decodermodel: GRUDecoder
+    embed_size: 256
+#pretrained_encoder: experiments/pretrained_encoder/CNN10Q_unbalanced.pth
+decodermodel: RNNDecoder
 decodermodel_args:
-    num_layers: 1
-    hidden_size: 512
-model: CaptionModel
-model_args:
     embed_size: 256
     dropout: 0.3
+    rnn_type: GRU
+    num_layers: 1
+    hidden_size: 512
+model: CaptionModel 
+model_args: {}
 #pretrained_word_embedding: data/hospital/embeddings/bert_word_zh.npy
 
 improvecriterion: score # Can be acc | loss | score
-teacher_forcing_ratio: 1.0
-teacher_forcing_on_validation: False
 
 optimizer: Adam
 optimizer_args:
@@ -44,9 +40,14 @@ optimizer_args:
     weight_decay: 0.0
 epochs: 25
 early_stop: 5
+scheduler: ReduceLROnPlateau
 scheduler_args:
     mode: min
     factor: 0.1
     patience: 5
     threshold: 0.001
 
+ss: False
+ss_args:
+    ss_mode: exponential
+    ss_ratio: 1.0

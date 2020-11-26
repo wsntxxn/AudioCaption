@@ -5,6 +5,7 @@ import sys
 import logging
 import datetime
 import yaml
+from pathlib import Path
 import torch
 import numpy as np
 import tableprint as tp
@@ -143,12 +144,57 @@ def save_model_on_improved(engine,
                            save_path):
     if criterion_improved(engine.state.metrics[metric_key]):
         torch.save(dump, save_path)
+    # torch.save(dump, str(Path(save_path).parent / "model.last.pth"))
 
 
 def on_training_ended(engine, n, outputfun=sys.stdout.write):
     outputfun(tp.bottom(n, style="grid"))
 
 
-def update_reduce_on_plateau(engine, scheduler, metric):
-    cv_loss = engine.state.metrics[metric]
-    scheduler.step(cv_loss)
+def update_lr(engine, scheduler, metric):
+    if scheduler.__class__.__name__ == "ReduceLROnPlateau":
+        val_result = engine.state.metrics[metric]
+        scheduler.step(val_result)
+    else:
+        scheduler.step()
+
+
+def update_ss_ratio(engine, config, num_iter):
+    num_epoch = config["epochs"]
+    mode = config["ss_args"]["ss_mode"]
+    if mode == "exponential":
+        config["ss_args"]["ss_ratio"] = 0.01 ** (1.0 / num_epoch / num_iter)
+    elif mode == "linear":
+        config["ss_args"]["ss_ratio"] -= (1.0 - config["ss_args"]["final_ss_ratio"]) / num_epoch / num_iter
+
+
+def mean_with_lens(features, lens):
+    """
+    features: [N, T, ...] (assume the second dimension represents length)
+    lens: [N,]
+    """
+    lens = torch.as_tensor(lens)
+    N, T = features.size(0), features.size(1)
+    idxs = torch.arange(T).repeat(N).view(N, T)
+    mask = (idxs < lens.view(-1, 1)).to(features.device) # [N, T]
+
+    feature_mean = features * mask.unsqueeze(-1)
+    feature_mean = feature_mean.sum(1) / lens.unsqueeze(1).to(features.device)
+    return feature_mean
+
+
+def max_with_lens(features, lens):
+    """
+    features: [N, T, ...] (assume the second dimension represents length)
+    lens: [N,]
+    """
+    lens = torch.as_tensor(lens)
+    N, T = features.size(0), features.size(1)
+    idxs = torch.arange(T).repeat(N).view(N, T)
+    mask = (idxs < lens.view(-1, 1)).to(features.device) # [N, T]
+
+    feature_max = features
+    feature_max[~mask] = float("-inf")
+    feature_max, _ = feature_max.max(1)
+    return feature_max
+

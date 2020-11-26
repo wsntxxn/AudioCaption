@@ -1,18 +1,23 @@
-outputpath: experiments/hospital
+outputpath: experiments/clotho
 
-feature_stream: copy-feats scp:data/hospital/fbank_dev.scp ark:- |
-caption_file: data/hospital/zh_dev.json
-vocab_file: data/hospital/vocab_zh.pth
+#feature_stream: copy-feats scp:data/clotho/logmel_dev.scp ark:- |
+feature_file: data/clotho/logmel.hdf5
+caption_file: data/clotho/dev.json
+vocab_file: data/clotho/vocab.pth
+zh: False
 dataloader_args:
     batch_size: 32
     num_workers: 4
+train_percent: 90
+#augments: [timemask, freqmask]
+augments: []
 
 scaler: StandardScaler # Can be any of sklearn.preprocessing that supports fit_partial
 scaler_args:
     with_std : True
     with_mean : True        
 
-encodermodel: GRUEncoder
+encodermodel: CNN10QEncoder
 encodermodel_args:
     num_layers: 1
     dropout: 0.0
@@ -21,19 +26,25 @@ encodermodel_args:
     # Can be time, mean ( for last timestep, mean reduction)
     representation: mean
     hidden_size: 512
-decodermodel: GRUDecoder
+decodermodel: RNNDecoder
 decodermodel_args:
     num_layers: 1
     hidden_size: 512
-model: ScstModel
-model_args:
-    embed_size: 256
+    #attn_hidden_size: 512
+basemodel: CaptionModel
+basemodel_args:
+    embed_size: 512
     dropout: 0.3
+modelwrapper: ScstWrapper
+
+load_pretrained: True
+pretrained: experiments/clotho/CaptionModel/pretrainCNN10Q/saved.pth
 
 improvecriterion: score
 
 optimizer: Adam
 optimizer_args:
     lr: 0.00005
-epochs: 25
+    weight_decay: 0.0
+epochs: 100
 

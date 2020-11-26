@@ -1,10 +1,54 @@
 # -*- coding: utf-8 -*-
 
 import copy
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from utils.train_util import mean_with_lens, max_with_lens
+
+class E2EASREncoder(nn.Module):
+    
+    def __init__(self, model): 
+        super(E2EASREncoder, self).__init__()
+        self.model = model
+        self.embed_size = 320
+
+    def forward(self, *input):
+        x, lens = input
+        output, lens, _ = self.model(x, lens)
+        # output: [N, T, E]
+        N = x.size(0)
+        idxs = torch.arange(output.size(1), device="cpu").repeat(N).view(N, output.size(1))
+        mask = (idxs < lens.view(-1, 1)).to(output.device)
+        # mask: [N, T]
+
+        out_mean_time = output * mask.unsqueeze(-1)
+        out_mean = out_mean_time.sum(1) / lens.unsqueeze(1).to(x.device)
+
+        return {
+            "audio_embeds": out_mean,
+            "audio_embeds_time": out_mean_time,
+            "state": None,
+            "audio_embeds_lens": lens
+        }
+
+
+def load_espnet_encoder(model_path, pretrained=True):
+    import json
+    import argparse
+    from pathlib import Path
+    from espnet.nets.pytorch_backend.e2e_asr import E2E
+    
+    model_dir = (Path(model_path).parent)
+    with open(str(Path(model_dir)/"model.json"), "r") as f:
+        idim, odim, conf = json.load(f)
+    model = E2E(idim, odim, argparse.Namespace(**conf))
+    if pretrained:
+        model.load_state_dict(torch.load(model_path, map_location="cpu"))
+    encoder = E2EASREncoder(model.enc)
+    return encoder
 
 class BaseEncoder(nn.Module):
     
@@ -131,6 +175,7 @@ class PreTrainedCNN(BaseEncoder):
 
 
 class Block2D(nn.Module):
+
     def __init__(self, cin, cout, kernel_size=3, padding=1):
         super().__init__()
         self.block = nn.Sequential(
@@ -163,6 +208,7 @@ class LinearSoftPool(nn.Module):
 
 
 class MeanPool(nn.Module):
+
     def __init__(self, pooldim=1):
         super().__init__()
         self.pooldim = pooldim
@@ -192,6 +238,16 @@ class AttentionPool(nn.Module):
         return detect
 
 
+class MMPool(nn.Module):
+
+    def __init__(self, dims):
+        super().__init__()
+        self.avgpool = nn.AvgPool2d(dims)
+        self.maxpool = nn.MaxPool2d(dims)
+
+    def forward(self, x):
+        return self.avgpool(x) + self.maxpool(x)
+
 def parse_poolingfunction(poolingfunction_name='mean', **kwargs):
     """parse_poolingfunction
     A heler function to parse any temporal pooling
@@ -215,6 +271,7 @@ class CRNNEncoder(BaseEncoder):
         super(CRNNEncoder, self).__init__(inputdim, embed_size)
         features = nn.ModuleList()
         self.use_hidden = False
+        assert embed_size == 256, "CRNN10 only supports output feature dimension 512"
         self.features = nn.Sequential(
             Block2D(1, 32),
             nn.LPPool2d(4, (2, 4)),
@@ -232,7 +289,7 @@ class CRNNEncoder(BaseEncoder):
             rnn_input_dim = rnn_input_dim[1] * rnn_input_dim[-1]
 
         self.gru = nn.GRU(rnn_input_dim,
-                          embed_size // 2,
+                          128,
                           bidirectional=True,
                           batch_first=True)
         self.features.apply(self.init_weights)
@@ -251,7 +308,93 @@ class CRNNEncoder(BaseEncoder):
             # T,
             # mode='linear',
             # align_corners=False).transpose(1, 2)
-        
+        lens /= 4
+
+        # idxs = torch.arange(x.size(1), device="cpu").repeat(N).view(N, x.size(1))
+        # mask = (idxs < lens.view(-1, 1)).to(x.device)
+        # # mask: [N, T]
+
+        # x_mean_time = x * mask.unsqueeze(-1)
+        # x_mean = x_mean_time.sum(1) / lens.unsqueeze(1).to(x.device)
+
+        # # x_max = x
+        # # x_max[~mask] = float("-inf")
+        # # x_max, _ = x_max.max(1)
+        # # out = x_mean + x_max
+
+        # out = x_mean
+
+        # return {
+            # "audio_embeds": out,
+            # "audio_embeds_time": x_mean_time,
+            # "state": None,
+            # "audio_embeds_lens": lens
+        # }
+        return {
+            "audio_embeds": x, # [N, T, E]
+            "audio_embeds_lens": lens,
+            "state": None
+        }
+
+
+class CRNN8_Sub4(BaseEncoder):
+    
+    def __init__(self, inputdim, embed_size, **kwargs):
+        super(CRNN8_Sub4, self).__init__(inputdim, embed_size)
+
+        def _block(in_channel, out_channel):
+            return nn.Sequential(
+                nn.Conv2d(in_channel,
+                          out_channel,
+                          kernel_size=3,
+                          bias=False,
+                          padding=1),
+                nn.BatchNorm2d(out_channel),
+                nn.ReLU(True),
+                nn.Conv2d(out_channel,
+                          out_channel,
+                          kernel_size=3,
+                          bias=False,
+                          padding=1),
+                nn.BatchNorm2d(out_channel),
+                nn.ReLU(True),
+            )
+
+        self.features = nn.Sequential(
+            _block(1, 64),
+            MMPool((2, 2)),
+            nn.Dropout(0.2, True),
+            _block(64, 128),
+            MMPool((2, 2)),
+            nn.Dropout(0.2, True),
+            _block(128, 256),
+            MMPool((1, 2)),
+            nn.Dropout(0.2, True),
+            _block(256, 512),
+            MMPool((1, 2)),
+            nn.Dropout(0.2, True),
+            nn.AdaptiveAvgPool2d((None, 1)),
+        )
+        self.init_bn = nn.BatchNorm2d(inputdim)
+        self.embedding = nn.Linear(512, 512)
+        self.features.apply(self.init_weights)
+        self.gru = nn.GRU(512, 256, bidirectional=True, batch_first=True)
+
+    def forward(self, *input):
+        x, lens = input
+        lens = copy.deepcopy(lens)
+        lens = torch.as_tensor(lens)
+        N, T, _ = x.shape
+        x = x.unsqueeze(1)  # B x 1 x T x D
+        x = x.transpose(1, 3)
+        x = self.init_bn(x)
+        x = x.transpose(1, 3)
+        x = self.features(x)
+        x = x.transpose(1, 2).contiguous().flatten(-2)
+        x = F.dropout(x, p=0.5, training=self.training)
+        x = F.relu_(self.embedding(x))
+        x, _ = self.gru(x)
+
         lens /= 4
         # x: [N, T, E]
         idxs = torch.arange(x.size(1), device="cpu").repeat(N).view(N, x.size(1))
@@ -325,34 +468,35 @@ class CNN10QEncoder(BaseEncoder):
         lens = copy.deepcopy(lens)
         lens = torch.as_tensor(lens)
         N = x.size(0)
-        x = x.unsqueeze(1)  # N x 1 x T x D
+        x = x.unsqueeze(1)  # x: [N, 1, T, D]
         x = x.transpose(1, 3)
         x = self.init_bn(x)
         x = x.transpose(1, 3)
-        x = self.features(x)
-        x = x.transpose(1, 2).contiguous().flatten(-2)
+        x = self.features(x) # x: [N, 512, T/16, D/16]
+        x = x.transpose(1, 2).contiguous().flatten(-2) # x: [N, T/16, 512*T/16]
         # x = x.mean(1) + x.max(1)[0]
 
         lens /= 16
-        idxs = torch.arange(x.size(1), device="cpu").repeat(N).view(N, x.size(1))
-        mask = (idxs < lens.view(-1, 1)).to(x.device)
+        # idxs = torch.arange(x.size(1), device="cpu").repeat(N).view(N, x.size(1))
+        # mask = (idxs < lens.view(-1, 1)).to(x.device)
 
-        x_mean = x * mask.unsqueeze(-1)
-        x_mean = x_mean.sum(1) / lens.unsqueeze(1).to(x.device)
+        # x_mean = x * mask.unsqueeze(-1)
+        # x_mean = x_mean.sum(1) / lens.unsqueeze(1).to(x.device)
 
-        x_max = x.clone()
-        x_max[~mask] = float("-inf")
-        x_max, _ = x_max.max(1)
-        out = x_mean + x_max
+        # x_max = x.clone()
+        # x_max[~mask] = float("-inf")
+        # x_max, _ = x_max.max(1)
+        # out = x_mean + x_max
 
-        out = F.dropout(out, p=0.5, training=self.training)
-        out = self.embedding(out)
+        # out = F.dropout(out, p=0.5, training=self.training)
+        # out = self.embedding(out)
         return {
-            "audio_embeds": out,
-            "audio_embeds_time": x,
+            "audio_embeds": x,
+            # "audio_embeds_time": x,
             "state": None,
             "audio_embeds_lens": lens
         }
+
 
 class CNN10Encoder(BaseEncoder):
 
@@ -475,7 +619,7 @@ class RNNEncoder(BaseEncoder):
             out = out_time * mask.unsqueeze(-1)
             out = out.sum(1) / lens.unsqueeze(1).to(x.device)
         elif self.representation == 'time':
-            indices = (lens - 1).reshape(-1, 1, 1).expand(-1, 1, out.size(-1))
+            indices = (lens - 1).reshape(-1, 1, 1).expand(-1, 1, out_time.size(-1))
             # indices: [N, 1, hidden]
             out = torch.gather(out_time, 1, indices).squeeze(1)
 

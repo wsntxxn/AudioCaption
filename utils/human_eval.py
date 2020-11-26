@@ -32,8 +32,40 @@ def coco_score(refs, scorer):
     score = scores / num_cap_per_audio
     return score
 
+def embedding_score(refs, zh):
+    from audiocaptioneval.sentbert.sentencebert import SentenceBert
+    scorer = SentenceBert(zh=zh)
+
+    num_cap_per_audio = len(refs[list(refs.keys())[0]])
+    scores = 0
+
+    for i in range(num_cap_per_audio):
+        res = {key: [refs[key][i],] for key in refs.keys() if len(refs[key]) == num_cap_per_audio}
+        refs_i = {key: np.concatenate([refs[key][:i], refs[key][i+1:]]) for key in refs.keys() if len(refs[key]) == num_cap_per_audio}
+        score, _ = scorer.compute_score(refs_i, res)    
+        scores += score
+    
+    score = scores / num_cap_per_audio
+    return score
+
+def diversity_score(refs, zh):
+    from utils.diverse_eval import diversity_evaluate
+
+    np.random.seed(1)
+    part_df = []
+    for key, tokens in refs.items():
+        if len(tokens) > 1:
+            indice = np.random.choice(len(tokens), 1)[0]
+            token = tokens[indice]
+        else:
+            token = tokens[0]
+        if not zh:
+            token = token.split(" ")
+        part_df.append({"tokens": token})
+    part_df = pd.DataFrame(part_df)
+    return diversity_evaluate(part_df)
    
-def main(eval_caption_file, output, zh=False):
+def main(eval_caption_file, output, zh=False, embedding_path=None):
     df = pd.read_json(eval_caption_file)
     if zh:
         refs = df.groupby("key")["tokens"].apply(list).to_dict()
@@ -46,10 +78,13 @@ def main(eval_caption_file, output, zh=False):
 
     scorer = Bleu(zh=zh)
     bleu_scores = coco_score(copy.deepcopy(refs), scorer)
+    print(bleu_scores)
     scorer = Cider(zh=zh)
     cider_score = coco_score(copy.deepcopy(refs), scorer)
+    print(cider_score)
     scorer = Rouge(zh=zh)
     rouge_score = coco_score(copy.deepcopy(refs), scorer)
+    print(rouge_score)
 
     if not zh:
         from pycocoevalcap.meteor.meteor import Meteor
@@ -60,6 +95,12 @@ def main(eval_caption_file, output, zh=False):
         scorer = Spice()
         spice_score = coco_score(copy.deepcopy(refs), scorer)
     
+    diverse_score = diversity_score(refs, zh)
+
+    with open(embedding_path, "rb") as f:
+        ref_embeddings = pickle.load(f)
+
+    bert_score = embedding_score(ref_embeddings, zh)
 
     with open(output, "w") as f:
         for n in range(4):
@@ -69,6 +110,8 @@ def main(eval_caption_file, output, zh=False):
         if not zh:
             f.write("Meteor: {:6.3f}\n".format(meteor_score))
             f.write("SPICE: {:6.3f}\n".format(spice_score))
+        f.write("SentenceBert: {:6.3f}\n".format(bert_score))
+        f.write("Diversity: {:6.3f}\n".format(diverse_score))
 
 
 if __name__ == "__main__":

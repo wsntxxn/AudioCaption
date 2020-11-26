@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 import sys
 import numpy as np
 import pandas as pd
@@ -21,6 +22,8 @@ class BaseRunner(object):
         np.random.seed(seed)
         torch.manual_seed(seed)
         device = "cpu"
+        # if torch.cuda.is_available() and "SLURM_JOB_PARTITION" in os.environ and \
+            # "gpu" in os.environ["SLURM_JOB_PARTITION"]:
         if torch.cuda.is_available():
             device = "cuda"
             torch.backends.cudnn.deterministic = True
@@ -33,41 +36,51 @@ class BaseRunner(object):
             pre, config["scaler"])(
             **config["scaler_args"])
         inputdim = -1
-        caption_df = pd.read_json(config["caption_file"], dtype={"key": str})
+        if "caption_file" in config:
+            caption_df = pd.read_json(config["caption_file"], dtype={"key": str})
+            train_keys = np.random.choice(
+                caption_df["key"].unique(), 
+                int(len(caption_df["key"].unique()) * (config["train_percent"] / 100.)), 
+                replace=False
+            )
+            train_df = caption_df[caption_df["key"].apply(lambda x: x in train_keys)]
+            val_df = caption_df[~caption_df.index.isin(train_df.index)]
+        else:
+            train_df = pd.read_json(config["caption_file_train"], dtype={"key": str})
+            val_df = pd.read_json(config["caption_file_val"], dtype={"key": str})
+            caption_df = pd.concat((train_df, val_df))
 
         for batch in tqdm(
             torch.utils.data.DataLoader(
                 SJTUDataset(
-                    kaldi_stream=config["feature_stream"],
+                    feature=config["feature_file"],
                     caption_df=caption_df,
                     vocabulary=vocabulary,
                 ),
                 collate_fn=collate_fn([0, 1]),
                 **config["dataloader_args"]
             ),
-            ascii=True
+            ascii=True,
+            ncols=100
         ):
             feat = batch[0]
-            feat = feat.reshape(-1, feat.shape[-1])
-            scaler.partial_fit(feat)
+            feat_lens = batch[-2]
+            # feat = feat.reshape(-1, feat.shape[-1])
+            packed_feat = torch.nn.utils.rnn.pack_padded_sequence(
+                feat, feat_lens, batch_first=True, enforce_sorted=False).data
+            scaler.partial_fit(packed_feat)
             inputdim = feat.shape[-1]
         assert inputdim > 0, "Reading inputstream failed"
 
         augments = train_util.parse_augments(config["augments"])
-        cv_keys = np.random.choice(
-            caption_df["key"].unique(), 
-            int(len(caption_df["key"].unique()) * (1 - config["train_percent"] / 100.)), 
-            replace=False
-        )
-        cv_df = caption_df[caption_df["key"].apply(lambda x: x in cv_keys)]
-        train_df = caption_df[~caption_df.index.isin(cv_df.index)]
 
-        trainloader = torch.utils.data.DataLoader(
+        train_loader = torch.utils.data.DataLoader(
             SJTUDataset(
-                kaldi_stream=config["feature_stream"],
+                feature=config["feature_file"],
                 caption_df=train_df,
                 vocabulary=vocabulary,
-                transform=[scaler.transform, augments]
+                transform=[augments, scaler.transform]
+                # transform=[augments]
             ),
             shuffle=True,
             collate_fn=collate_fn([0, 1]),
@@ -76,14 +89,14 @@ class BaseRunner(object):
 
         if config["zh"]:
             train_key2refs = train_df.groupby("key")["tokens"].apply(list).to_dict()
-            cv_key2refs = cv_df.groupby("key")["tokens"].apply(list).to_dict()
+            val_key2refs = val_df.groupby("key")["tokens"].apply(list).to_dict()
         else:
             train_key2refs = train_df.groupby("key")["caption"].apply(list).to_dict()
-            cv_key2refs = cv_df.groupby("key")["caption"].apply(list).to_dict()
-        cvloader = torch.utils.data.DataLoader(
+            val_key2refs = val_df.groupby("key")["caption"].apply(list).to_dict()
+        val_loader = torch.utils.data.DataLoader(
             SJTUDataset(
-                kaldi_stream=config["feature_stream"],
-                caption_df=cv_df,
+                feature=config["feature_file"],
+                caption_df=val_df,
                 vocabulary=vocabulary,
                 transform=scaler.transform
             ),
@@ -91,9 +104,9 @@ class BaseRunner(object):
             collate_fn=collate_fn([0, 1]),
             **config["dataloader_args"])
 
-        return trainloader, cvloader, {
+        return train_loader, val_loader, {
             "scaler": scaler, "inputdim": inputdim, 
-            "train_key2refs": train_key2refs, "cv_key2refs": cv_key2refs
+            "train_key2refs": train_key2refs, "val_key2refs": val_key2refs
         }
 
     @staticmethod
@@ -122,7 +135,8 @@ class BaseRunner(object):
 
     def sample(self,
                experiment_path: str,
-               kaldi_stream,
+               feature_file: str,
+               predict_scp: str,
                output: str="output_word.txt",
                **kwargs):
         """Generate captions given experiment model"""
@@ -140,7 +154,8 @@ class BaseRunner(object):
         zh = config["zh"]
         model = model.to(self.device)
         dataset = SJTUDatasetEval(
-            kaldi_stream=kaldi_stream,
+            feature=feature_file,
+            eval_scp=predict_scp,
             transform=scaler.transform)
         dataloader = torch.utils.data.DataLoader(
             dataset,
@@ -152,7 +167,7 @@ class BaseRunner(object):
         if max_length is None:
             max_length = model.max_length
         width_length = max_length * 4
-        pbar = ProgressBar(persist=False, ascii=True)
+        pbar = ProgressBar(persist=False, ascii=True, ncols=100)
         writer = open(os.path.join(experiment_path, output), "w")
         writer.write(
             tp.header(
@@ -184,33 +199,41 @@ class BaseRunner(object):
 
     def evaluate(self,
                  experiment_path: str,
-                 kaldi_stream: str,
+                 feature_file: str,
+                 feature_scp: str,
                  caption_file: str,
+                 caption_embedding_path=None,
                  caption_output: str = "eval_output.json",
                  score_output: str = "scores.txt",
                  **kwargs):
         """kwargs: {'max_length': int, 'method': str, 'beam_size': int}"""
 
-        dump = torch.load(os.path.join(experiment_path, "saved.pth"),
+        dump = torch.load(str(Path(experiment_path) / "saved.pth"),
                           map_location="cpu")
-        model = dump["model"]
         # Some scaler (sklearn standardscaler)
         scaler = dump["scaler"]
         # Also load previous training config
         config = dump["config"]
+
         vocabulary = torch.load(config["vocab_file"])
+        model = self._get_model(config, len(vocabulary))
+        model.load_state_dict(dump["model"])
+
         zh = config["zh"]
         model = model.to(self.device)
 
         dataset = SJTUDatasetEval(
-            kaldi_stream=kaldi_stream,
-            transform=scaler.transform)
+            feature=feature_file,
+            eval_scp=feature_scp,
+            transform=scaler.transform
+        )
         dataloader = torch.utils.data.DataLoader(
             dataset,
             shuffle=False,
             collate_fn=collate_fn((1,)),
             batch_size=32,
-            num_workers=0)
+            num_workers=0
+        )
 
         caption_df = pd.read_json(caption_file, dtype={"key": str})
         if zh:
@@ -226,14 +249,14 @@ class BaseRunner(object):
             with torch.no_grad():
                 model.eval()
                 keys = batch[0]
-                output = self._forward(model, batch, mode="sample", **kwargs)
+                output = self._forward(model, batch, mode="eval", **kwargs)
                 seqs = output["seqs"].cpu().numpy()
 
                 for idx, seq in enumerate(seqs):
                     caption = self._convert_idx2sentence(seq, vocabulary, zh)
                     key2pred[keys[idx]] = [caption,]
 
-        pbar = ProgressBar(persist=False, ascii=True)
+        pbar = ProgressBar(persist=False, ascii=True, ncols=100)
         sampler = Engine(_sample)
         pbar.attach(sampler)
         sampler.run(dataloader)
@@ -248,11 +271,36 @@ class BaseRunner(object):
         pred_df = pd.DataFrame(pred_df)
         pred_df.to_json(os.path.join(experiment_path, caption_output))
 
+        refs4eval = {}
+        for key, refs in key2refs.items():
+            refs4eval[key] = []
+            for idx, ref in enumerate(refs):
+                refs4eval[key].append({
+                    "audio_id": key,
+                    "id": idx,
+                    "caption": ref
+                })
+
+        preds4eval = {}
+        for key, preds in key2pred.items():
+            preds4eval[key] = []
+            for idx, pred in enumerate(preds):
+                preds4eval[key].append({
+                    "audio_id": key,
+                    "id": idx,
+                    "caption": pred
+                })
+
         from pycocoevalcap.bleu.bleu import Bleu
         from pycocoevalcap.rouge.rouge import Rouge
         from pycocoevalcap.cider.cider import Cider
         from pycocoevalcap.meteor.meteor import Meteor
         from pycocoevalcap.spice.spice import Spice
+        from pycocoevalcap.tokenizer.ptbtokenizer import PTBTokenizer
+
+        tokenizer = PTBTokenizer()
+        key2refs = tokenizer.tokenize(refs4eval)
+        key2pred = tokenizer.tokenize(preds4eval)
 
         f = open(os.path.join(experiment_path, score_output), "w")
 
@@ -278,18 +326,30 @@ class BaseRunner(object):
             score, scores = scorer.compute_score(key2refs, key2pred)
             f.write("Spice: {:6.3f}\n".format(score))
 
+        from audiocaptioneval.sentbert.sentencebert import SentenceBert
+        scorer = SentenceBert(zh=zh)
+        if caption_embedding_path is not None:
+            key2ref_embeds = np.load(caption_embedding_path, allow_pickle=True)
+            score, scores = scorer.compute_score(key2ref_embeds, key2pred)
+        else:
+            score, scores = scorer.compute_score(key2refs, key2pred)
+        f.write("SentenceBert: {:6.3f}\n".format(score))
+
+        from utils.diverse_eval import diversity_evaluate
+        score = diversity_evaluate(pred_df)
+        f.write("Diversity: {:6.3f}\n".format(score))
 
         f.close()
 
     def dcase_predict(self,
                       experiment_path: str,
-                      kaldi_stream,
-                      output: str="predition.csv",
+                      feature_file: str,
+                      predict_scp: str,
+                      output: str="prediction.csv",
                       **kwargs):
         """kwargs: {'max_length': int, 'method': str, 'beam_size': int}"""
 
-        dump = torch.load(os.path.join(experiment_path, "saved.pth"),
-                          map_location="cpu")
+        dump = torch.load(str(Path(experiment_path) / "saved.pth"), map_location="cpu")
         model = dump["model"]
         # Some scaler (sklearn standardscaler)
         scaler = dump["scaler"]
@@ -299,7 +359,8 @@ class BaseRunner(object):
         zh = config["zh"]
         model = model.to(self.device)
         dataset = SJTUDatasetEval(
-            kaldi_stream=kaldi_stream,
+            feature=feature_file,
+            eval_scp=predict_scp,
             transform=scaler.transform)
         dataloader = torch.utils.data.DataLoader(
             dataset,
@@ -308,7 +369,7 @@ class BaseRunner(object):
             batch_size=32,
             num_workers=0)
 
-        pbar = ProgressBar(persist=False, ascii=True)
+        pbar = ProgressBar(persist=False, ascii=True, ncols=100)
         predictions = []
 
         def _sample(engine, batch):
@@ -316,7 +377,7 @@ class BaseRunner(object):
             with torch.no_grad():
                 model.eval()
                 keys = batch[0]
-                output = self._forward(model, batch, None, mode="sample", **kwargs)
+                output = self._forward(model, batch, mode="sample", **kwargs)
                 seqs = output["seqs"].cpu().numpy()
                 for idx, seq in enumerate(seqs):
                     caption = self._convert_idx2sentence(seq, vocabulary, zh=zh)

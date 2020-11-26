@@ -11,10 +11,11 @@ class BaseDecoder(nn.Module):
     All decoders should inherit from this class
     """
 
-    def __init__(self, input_size, vocab_size):
+    def __init__(self, embed_size, vocab_size, enc_mem_size):
         super(BaseDecoder, self).__init__()
-        self.input_size = input_size
+        self.embed_size = embed_size
         self.vocab_size = vocab_size
+        self.enc_mem_size = enc_mem_size
 
     def forward(self, x):
         raise NotImplementedError
@@ -22,60 +23,67 @@ class BaseDecoder(nn.Module):
 
 class RNNDecoder(BaseDecoder):
 
-    def __init__(self, input_size, vocab_size, **kwargs):
-        super(RNNDecoder, self).__init__(input_size, vocab_size)
+    def __init__(self, vocab_size, enc_mem_size, **kwargs):
+        embed_size = kwargs.get("embed_size", 256)
+        super(RNNDecoder, self).__init__(embed_size, vocab_size, enc_mem_size)
+        dropout_p = kwargs.get("dropout", 0.0)
         hidden_size = kwargs.get('hidden_size', 256)
         num_layers = kwargs.get('num_layers', 1)
         bidirectional = kwargs.get('bidirectional', False)
         rnn_type = kwargs.get('rnn_type', "GRU")
+        self.word_embeddings = nn.Embedding(vocab_size, embed_size)
+        self.dropoutlayer = nn.Dropout(dropout_p)
         self.model = getattr(nn, rnn_type)(
-            input_size=input_size,
+            input_size=embed_size + enc_mem_size,
             hidden_size=hidden_size,
             num_layers=num_layers,
             batch_first=True,
             bidirectional=bidirectional)
         self.classifier = nn.Linear(
             hidden_size * (bidirectional + 1), vocab_size)
+        nn.init.kaiming_uniform_(self.word_embeddings.weight)
         nn.init.kaiming_uniform_(self.classifier.weight)
+
+    def load_word_embeddings(self, embeddings, tune=True, **kwargs):
+        assert embeddings.shape[0] == self.vocab_size, "vocabulary size mismatch!"
+        
+        embeddings = torch.as_tensor(embeddings).float()
+        self.word_embeddings.weight = nn.Parameter(embeddings)
+        for para in self.word_embeddings.parameters():
+            para.requires_grad = tune
+
+        if embeddings.shape[1] != self.embed_size:
+            assert "projection" in kwargs, "embedding size mismatch!"
+            if kwargs["projection"]:
+                self.word_embeddings = nn.Sequential(
+                    self.word_embeddings,
+                    nn.Linear(embeddings.shape[1], self.embed_size)
+                )
     
-    def forward(self, *input, **kwargs):
+    def forward(self, **kwargs):
         """
         RNN-style decoder must implement `forward` like this:
-            accept a word embedding input and last time hidden state, return the word
+            accept a word input and last time hidden state, return the word
             logits output and hidden state of this timestep
         the return dict must contain at least `logits` and `states`
         """
-        if len(input) == 1:
-            x = input # x: input word embedding/feature at timestep t
-            states = None
-        elif len(input) == 2:
-            x, states = input
-        else:
-            raise Exception("unknown input type for rnn decoder")
+        w = kwargs["word"]
+        states = kwargs["state"]
+        enc_mem = kwargs["enc_mem"]
 
-        out, states = self.model(x, states)
-        # out: [N, 1, hs], states: [num_layers * num_directionals, N, hs]
+        w = w.to(enc_mem.device)
+        embed = self.dropoutlayer(self.word_embeddings(w))
+        # embed: [N, T, embed_size]
+        embed = torch.cat((embed, enc_mem), dim=-1)
+
+        out, states = self.model(embed, states)
+        # out: [N, T, hs], states: [num_layers * num_dire, N, hs]
 
         output = {
             "states": states,
+            "output": out,
             "logits": self.classifier(out)
         }
-
-        # if "seq_output" in kwargs and kwargs["seq_output"]:
-            # if isinstance(out, nn.utils.rnn.PackedSequence):
-                # padded_out, lens = nn.utils.rnn.pad_packed_sequence(
-                    # out, batch_first=True)
-                # N, T, _ = padded_out.shape
-                # idxs = torch.arange(T, device="cpu").repeat(N).view(N, T)
-                # mask = (idxs < lens.view(-1, 1)).to(padded_out.device)
-                # # mask: [N, T]
-                # seq_outputs = padded_out * mask.unsqueeze(-1)
-                # seq_outputs = seq_outputs.sum(1)
-                # seq_outputs = seq_outputs / lens.unsqueeze(1).to(padded_out.device)
-                # # seq_outputs: [N, E]
-                # output["seq_outputs"] = seq_outputs
-            # else:
-                # output["hidden"] = out
 
         return output
 
@@ -117,61 +125,33 @@ class RNNLuongAttnDecoder(RNNDecoder):
 class RNNBahdanauAttnDecoder(RNNDecoder):
 
     def __init__(self, 
-                 input_size, 
                  vocab_size,
+                 enc_mem_size,
                  **kwargs):
-        super(RNNBahdanauAttnDecoder, self).__init__(input_size, vocab_size, **kwargs)
-        self.classifier = nn.Linear(self.model.hidden_size, vocab_size)
-        nn.init.kaiming_uniform_(self.classifier.weight)
-    
-    def forward(self, *rnn_input, **attn_args):
-        x, h = rnn_input
-        attn = attn_args["attn"]
-        h_enc = attn_args["h_enc"]
-        src_lens = attn_args["src_lens"]
+        from models.AttnModel import Seq2SeqAttention
+        super(RNNBahdanauAttnDecoder, self).__init__(vocab_size, enc_mem_size, **kwargs)
+        attn_size = kwargs.get("attn_size", self.model.hidden_size)
+        self.attn = Seq2SeqAttention(enc_mem_size, self.model.hidden_size, attn_size)
 
-        c, attn_weight = attn(h.squeeze(0), h_enc, src_lens)
-        rnn_input = torch.cat((x, c), dim=-1).unsqueeze(1)
-        out, h = self.model(rnn_input, h)
-        logits = self.classifier(out.squeeze(1))
+    def forward(self, **kwargs):
+        w = kwargs["word"]
+        states = kwargs["state"]
+        enc_mem = kwargs["enc_mem"]
+        enc_mem_lens = kwargs["enc_mem_lens"]
 
-        # print(logits.shape)
-        return {"states": h, "logits": logits, "weights": attn_weight}
+        w = w.to(enc_mem.device)
+        embed = self.dropoutlayer(self.word_embeddings(w))
+        # embed: [N, 1, embed_size]
+        c, attn_weight = self.attn(states.squeeze(0), enc_mem, enc_mem_lens)
+        rnn_input = torch.cat((embed, c.unsqueeze(1)), dim=-1)
 
-# class GRUDecoder(RNNDecoder):
+        out, states = self.model(rnn_input, states)
 
-    # def __init__(self, embed_size, vocab_size, **kwargs):
-        # super(GRUDecoder, self).__init__(embed_size, vocab_size)
-        # hidden_size = kwargs.get('hidden_size', 256)
-        # num_layers = kwargs.get('num_layers', 1)
-        # bidirectional = kwargs.get('bidirectional', False)
-        # self.model = nn.GRU(
-            # input_size=embed_size,
-            # hidden_size=hidden_size,
-            # num_layers=num_layers,
-            # batch_first=True,
-            # bidirectional=bidirectional)
-        # self.classifier = nn.Linear(
-            # hidden_size * (bidirectional + 1), vocab_size)
-        # nn.init.kaiming_uniform_(self.classifier.weight)
-
-
-# class LSTMDecoder(RNNDecoder):
-
-    # def __init__(self, embed_size, vocab_size, **kwargs):
-        # super(LSTMDecoder, self).__init__(embed_size, vocab_size)
-        # hidden_size = kwargs.get('hidden_size', 256)
-        # num_layers = kwargs.get('num_layers', 1)
-        # bidirectional = kwargs.get('bidirectional', False)
-        # self.model = nn.LSTM(
-            # input_size=embed_size,
-            # hidden_size=hidden_size,
-            # num_layers=num_layers,
-            # batch_first=True,
-            # bidirectional=bidirectional)
-        # self.classifier = nn.Linear(
-            # hidden_size * (bidirectional + 1), vocab_size)
-        # nn.init.kaiming_uniform_(self.classifier.weight)
-
-
+        output = {
+            "states": states,
+            "output": out,
+            "logits": self.classifier(out),
+            "weights": attn_weight
+        }
+        return output
 

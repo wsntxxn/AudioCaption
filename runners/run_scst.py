@@ -22,19 +22,11 @@ from ignite.contrib.handlers import ProgressBar
 from ignite.metrics import Accuracy, Loss, RunningAverage, Average
 
 sys.path.append(os.getcwd())
-# sys.path.append("/mnt/lustre/sjtu/home/xnx98/utils")
 import models
 import utils.train_util as train_util
 from utils.build_vocab import Vocabulary
 from datasets.SJTUDataSet import SJTUDataset, collate_fn
 from runners.base_runner import BaseRunner
-
-device = "cpu"
-if torch.cuda.is_available() and "SLURM_JOB_PARTITION" in os.environ and \
-    "gpu" in os.environ["SLURM_JOB_PARTITION"]:
-    device = "cuda"
-    torch.backends.cudnn.deterministic = True
-device = torch.device(device)
 
 
 class ScstRunner(BaseRunner):
@@ -42,30 +34,36 @@ class ScstRunner(BaseRunner):
 
     @staticmethod
     def _get_model(config, vocabulary):
-        embed_size = config["model_args"]["embed_size"]
+        embed_size = config["basemodel_args"]["embed_size"]
         encodermodel = getattr(
             models.encoder, config["encodermodel"])(
             inputdim=config["inputdim"], 
             embed_size=embed_size,
             **config["encodermodel_args"])
+        if config["decodermodel"] == "RNNBahdanauAttnDecoder":
+            input_size = embed_size * 2
+        else:
+            input_size = embed_size
         decodermodel = getattr(
             models.decoder, config["decodermodel"])(
             vocab_size=len(vocabulary),
-            embed_size=embed_size,
+            input_size=input_size,
             **config["decodermodel_args"])
-        model = getattr(models.SeqTrainModel, config["model"])(
-            encodermodel, decodermodel, vocabulary, **config["model_args"])
+
+        basemodel = getattr(models, config["basemodel"])(
+            encodermodel, decodermodel, **config["basemodel_args"])
 
         if config["load_pretrained"]:
             dump = torch.load(
-                config["pretrained"],
-                map_location=lambda storage, loc: storage)
-            model.load_state_dict(dump["model"].state_dict(), strict=False)
+                config["pretrained"], map_location="cpu")
+            basemodel.load_state_dict(dump["model"].state_dict(), strict=False)
+
+        model = getattr(models.SeqTrainModel, config["modelwrapper"])(
+                basemodel, vocabulary)
 
         return model
 
-    @staticmethod
-    def _forward(model, batch, mode, **kwargs):
+    def _forward(self, model, batch, mode, **kwargs):
         assert mode in ("train", "sample")
 
         if mode == "sample":
@@ -74,7 +72,7 @@ class ScstRunner(BaseRunner):
             feat_lens = batch[-1]
 
             feats = convert_tensor(feats.float(),
-                                   device=device,
+                                   device=self.device,
                                    non_blocking=True)
             sampled = model(feats, feat_lens, mode="sample", **kwargs)
             return sampled
@@ -89,35 +87,17 @@ class ScstRunner(BaseRunner):
         feat_lens = batch[-2]
         cap_lens = batch[-1]
         feats = convert_tensor(feats.float(),
-                               device=device,
+                               device=self.device,
                                non_blocking=True)
         caps = convert_tensor(caps.long(),
-                              device=device,
+                              device=self.device,
                               non_blocking=True)
 
         
-        if kwargs["train_mode"] == "XE":
-            # trained by cross entropy loss
-            assert "tf" in kwargs, "need to know whether to use teacher forcing"
-            ce = torch.nn.CrossEntropyLoss()
-            # pack labels to remove padding from caption labels
-            targets = torch.nn.utils.rnn.pack_padded_sequence(
-                caps, cap_lens, batch_first=True).data
-            if kwargs["tf"]:
-                probs = model(feats, feat_lens, caps, cap_lens, mode="forward")
-            else:
-                sampled = model(feats, feat_lens, mode="sample", max_length=max(cap_lens))
-                probs = torch.nn.utils.rnn.pack_padded_sequence(
-                    sampled["probs"], cap_lens, batch_first=True).data
-                probs = convert_tensor(probs, device=device, non_blocking=True)
-            loss = ce(probs, targets)
-            output = {"loss": loss}
-        else:
-            # trained by self critical reward (reinforcement learning)
-            assert "key2refs" in kwargs, "missing references"
-            scorer = kwargs.get("scorer", None)
-            output = model(feats, feat_lens, keys, kwargs["key2refs"], 
-                           mode="scst", max_length=max(cap_lens), scorer=scorer)
+        assert "key2refs" in kwargs, "missing references"
+        output = model(feats, feat_lens, keys, kwargs["key2refs"], 
+        # output = model(feats, feat_lens, keys, caps, 
+                       max_length=max(cap_lens), scorer=kwargs["scorer"])
         
         return output
 
@@ -133,7 +113,7 @@ class ScstRunner(BaseRunner):
         config_parameters["seed"] = self.seed
         zh = config_parameters["zh"]
         outputdir = os.path.join(
-            config_parameters["outputpath"], config_parameters["model"],
+            config_parameters["outputpath"], config_parameters["modelwrapper"],
             "{}_{}".format(
                 datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%m'),
                 uuid.uuid1().hex))
@@ -154,19 +134,19 @@ class ScstRunner(BaseRunner):
         train_util.pprint_dict(config_parameters, logger.info)
 
         vocabulary = torch.load(config_parameters["vocab_file"])
-        trainloader, cvloader, info = self._get_dataloaders(config_parameters, vocabulary)
+        train_loader, val_loader, info = self._get_dataloaders(config_parameters, vocabulary)
         config_parameters["inputdim"] = info["inputdim"]
         logger.info("<== Estimating Scaler ({}) ==>".format(info["scaler"].__class__.__name__))
         logger.info(
-                "Stream: {} Input dimension: {} Vocab Size: {}".format(
-                config_parameters["feature_stream"], info["inputdim"], len(vocabulary)))
+                "Feature: {} Input dimension: {} Vocab Size: {}".format(
+                config_parameters["feature_file"], info["inputdim"], len(vocabulary)))
         train_key2refs = info["train_key2refs"]
         # train_scorer = BatchCider(train_key2refs)
-        cv_key2refs = info["cv_key2refs"]
+        val_key2refs = info["val_key2refs"]
         # cv_scorer = BatchCider(cv_key2refs)
 
         model = self._get_model(config_parameters, vocabulary)
-        model = model.to(device)
+        model = model.to(self.device)
         train_util.pprint_dict(model, logger.info, formatter="pretty")
         optimizer = getattr(
             torch.optim, config_parameters["optimizer"]
@@ -201,7 +181,7 @@ class ScstRunner(BaseRunner):
             with torch.no_grad():
                 cv_scorer = Cider(zh=zh)
                 output = self._forward(model, batch, "train", train_mode="scst",
-                                       key2refs=cv_key2refs, scorer=cv_scorer)
+                                       key2refs=val_key2refs, scorer=cv_scorer)
                 seqs = output["sampled_seqs"].cpu().numpy()
                 for idx, seq in enumerate(seqs):
                     if keys[idx] in key2pred:
@@ -216,6 +196,7 @@ class ScstRunner(BaseRunner):
         metrics = {
             "loss": Average(output_transform=lambda x: x["loss"]),
             "reward": Average(output_transform=lambda x: x["reward"].reshape(-1, 1)),
+            # "score": Average(output_transform=lambda x: x["score"].reshape(-1, 1)),
         }
 
         for name, metric in metrics.items():
@@ -232,19 +213,16 @@ class ScstRunner(BaseRunner):
 
 
         trainer.add_event_handler(
-              Events.EPOCH_COMPLETED, train_util.log_results, evaluator, cvloader,
-              logger.info, metrics.keys(), ["loss", "reward", "score"])
+              Events.EPOCH_COMPLETED, train_util.log_results, evaluator, val_loader,
+              logger.info, ["loss", "reward"], ["loss", "reward", "score"])
 
         def eval_cv(engine, key2pred, key2refs, scorer):
-            # if len(cv_key2refs) == 0:
-                # for key, _ in key2pred.items():
-                    # cv_key2refs[key] = key2refs[key]
             score, scores = scorer.compute_score(key2refs, key2pred)
             engine.state.metrics["score"] = score
             key2pred.clear()
 
         evaluator.add_event_handler(
-            Events.EPOCH_COMPLETED, eval_cv, key2pred, cv_key2refs, Cider(zh=zh))
+            Events.EPOCH_COMPLETED, eval_cv, key2pred, val_key2refs, Cider(zh=zh))
 
         evaluator.add_event_handler(
             Events.EPOCH_COMPLETED, train_util.save_model_on_improved, crtrn_imprvd,
@@ -260,7 +238,7 @@ class ScstRunner(BaseRunner):
             }
         )
 
-        trainer.run(trainloader, max_epochs=config_parameters["epochs"])
+        trainer.run(train_loader, max_epochs=config_parameters["epochs"])
         return outputdir
 
 

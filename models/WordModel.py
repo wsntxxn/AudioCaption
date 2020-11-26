@@ -7,10 +7,11 @@ import torch
 import torch.nn as nn
 
 import utils.score_util as score_util
+from utils.train_util import mean_with_lens
 
 class CaptionModel(nn.Module):
     """
-    Encoder-decoder captioning model, with RNN-style decoder.
+    Encoder-decoder captioning model.
     """
 
     start_idx = 1
@@ -21,6 +22,7 @@ class CaptionModel(nn.Module):
         super(CaptionModel, self).__init__()
         self.encoder = encoder
         self.decoder = decoder
+        self.vocab_size = decoder.vocab_size
 
         if hasattr(encoder, "use_hidden") and encoder.use_hidden:
             assert encoder.network.hidden_size == decoder.model.hidden_size, \
@@ -29,128 +31,126 @@ class CaptionModel(nn.Module):
                 """number of layers not compatible while use hidden!
                 please either set use_hidden as False or use the same number of layers"""
 
-        dropout_p = kwargs.get("dropout", 0.0)
-        self.embed_size = encoder.embed_size
-        self.vocab_size = decoder.vocab_size
-        self.word_embeddings = nn.Embedding(self.vocab_size, self.embed_size)
-        self.dropoutlayer = nn.Dropout(dropout_p)
-        nn.init.kaiming_uniform_(self.word_embeddings.weight)
-
     @classmethod
     def set_index(cls, start_idx, end_idx):
         cls.start_idx = start_idx
         cls.end_idx = end_idx
 
-    def load_word_embeddings(self, embeddings, tune=True, **kwargs):
-        assert embeddings.shape[0] == self.vocab_size, "vocabulary size mismatch!"
-        
-        embeddings = torch.as_tensor(embeddings).float()
-        self.word_embeddings.weight = nn.Parameter(embeddings)
-        for para in self.word_embeddings.parameters():
-            para.requires_grad = tune
-
-        if embeddings.shape[1] != self.embed_size:
-            assert "projection" in kwargs, "embedding size mismatch!"
-            if kwargs["projection"]:
-                self.word_embeddings = nn.Sequential(
-                    self.word_embeddings,
-                    nn.Linear(embeddings.shape[1], self.embed_size)
-                )
-
     def forward(self, *input, **kwargs):
-        # input sanity check
-        if len(input) != 4 and len(input) != 2:
-            raise Exception("number of input should be either 4 (feats, feat_lens, caps, cap_lens) or 2 (feats, feat_lens)!")
-
+        """
+        an encoder first encodes audio feature into an embedding sequence, obtaining `encoded`: {
+            audio_embeds: [N, enc_mem_max_len, enc_mem_size]
+            state: rnn style hidden states, [num_dire * num_layers, N, hs_enc]
+            audio_embeds_lens: [N,] 
+        }
+        """
         if len(input) == 4:
             feats, feat_lens, caps, cap_lens = input
-        else:
+            encoded = self.encoder(feats, feat_lens)
+            output = self.train_forward(encoded, caps, cap_lens, **kwargs)
+        elif len(input) == 2:
             feats, feat_lens = input
-            caps = None
-            cap_lens = None
+            encoded = self.encoder(feats, feat_lens)
+            output = self.inference_forward(encoded, **kwargs)
+        else:
+            raise Exception("Number of input should be either 4 (feats, feat_lens, caps, cap_lens) or 2 (feats, feat_lens)")
 
-        encoded = self.encoder(feats, feat_lens)
-        # encoded: {
-        #     audio_embeds: [N, emb_dim]
-        #     audio_embeds_time: [N, src_max_len, emb_dim]
-        #     state: rnn style hidden states, [num_dire * num_layers, N, hs_enc]
-        #     audio_embeds_lens: [N, ]
-        output = self.sample(encoded, caps, cap_lens, **kwargs)
         return output
-    
-    def sample(self, encoded, caps, cap_lens, **kwargs):
-        # optional keyword arguments
+
+    def prepare_output(self, encoded, output, max_length):
+        N = encoded["audio_embeds"].size(0)
+        seqs = torch.empty(N, max_length, dtype=torch.long).fill_(self.end_idx)
+        logits = torch.empty(N, max_length, self.vocab_size).to(encoded["audio_embeds"].device)
+        # sampled_logprobs = torch.zeros(N, max_length)
+        output["seqs"] = seqs
+        output["logits"] = logits
+        # output["sampled_logprobs"] = sampled_logprobs
+
+    def train_forward(self, encoded, caps, cap_lens, **kwargs):
+        if kwargs["ss_ratio"] != 1: # scheduled sampling training
+            return self.stepwise_forward(encoded, caps, cap_lens, **kwargs)
+        N, cap_max_len = caps.size(0), caps.size(1)
+        output = {}
+        self.prepare_output(encoded, output, cap_max_len - 1)
+        enc_mem = mean_with_lens(encoded["audio_embeds"], 
+                                 encoded["audio_embeds_lens"]) # [N, src_emb_dim]
+        enc_mem = enc_mem.unsqueeze(1).repeat(1, cap_max_len - 1, 1) # [N, cap_max_len-1, src_emb_dim]
+        decoder_output = self.decoder(word=caps[:, :-1], state=encoded["state"], enc_mem=enc_mem)
+        self.train_process(output, decoder_output, cap_lens)
+        return output
+
+    def train_process(self, output, decoder_output, cap_lens):
+        output.update(decoder_output)
+
+    def inference_forward(self, encoded, **kwargs):
+        # optional sampling keyword arguments
         method = kwargs.get("method", "greedy")
-        temp = kwargs.get("temperature", 1.0)
         max_length = kwargs.get("max_length", self.max_length)
-        ss_ratio = kwargs.get("ss_ratio", 1.0)
-
-        if cap_lens is not None:
-            max_length = max(cap_lens)
-
-        assert method in ("greedy", "sample", "beam"), "unknown sampling method"
-
         if method == "beam":
             beam_size = kwargs.get("beam_size", 5)
-            return self.sample_beam(
-                encoded, max_length=max_length, beam_size=beam_size)
+            return self.beam_search(encoded, max_length, beam_size)
+        return self.stepwise_forward(encoded, None, None) 
 
-        audio_embeds = encoded["audio_embeds"]
-        h_t = encoded["state"]
-
-        N = audio_embeds.size(0)
-        seqs = torch.empty(N, max_length, dtype=torch.long).fill_(self.end_idx)
-        logits = torch.empty(N, max_length, self.vocab_size).to(audio_embeds.device)
-        sampled_logprobs = torch.zeros(N, max_length)
-
+    def stepwise_forward(self, encoded, caps, cap_lens, **kwargs):
+        if cap_lens is not None: # scheduled sampling training
+            max_length = max(cap_lens) - 1
+        else: # inference
+            max_length = kwargs.get("max_length", self.max_length)
+        decoder_input = {}
+        output = {}
+        self.prepare_output(encoded, output, max_length)
         # start sampling
         for t in range(max_length):
-            # prepare input word/audio embedding
-            if t == 0:
-                e_t = audio_embeds
-            else:
-                e_t = self.word_embeddings(w_t)
-                e_t = self.dropoutlayer(e_t)
-            # e_t: [N, emb_dim]
-            e_t = e_t.unsqueeze(1)
-
-            # feed to the decoder to get states and logits
-            output_t = self.decoder(e_t, h_t)
-            h_t = output_t["states"]
-
-            # outputs["logits"]: [N, 1, vocab_size]
-            logits_t = output_t["logits"].squeeze(1)
-            logits[:, t, :] = logits_t
-
-            # sample the next input word and get the corresponding logits
-            sampled = self.sample_next_word(logits_t, method, temp)
-            w_t = sampled["w_t"]
-            sampled_logprobs[:, t] = sampled["probs"]
-            seqs[:, t] = w_t
-
-            if kwargs["mode"] != "train": # decide whether to stop when sampling
+            self.decode_step(decoder_input, encoded, caps, output, t, **kwargs)
+            if caps is None: # decide whether to stop when sampling
+                unfinished_t = output["seqs"][:, t] != self.end_idx
                 if t == 0:
-                    unfinished = w_t != self.end_idx
+                    unfinished = unfinished_t
                 else:
-                    unfinished = unfinished * (w_t != self.end_idx)
-                seqs[:, t][~unfinished] = self.end_idx
+                    unfinished *= unfinished_t
+                output["seqs"][:, t][~unfinished] = self.end_idx
                 if unfinished.sum() == 0:
                     break
-            else:
-                # training, scheduled sampling
-                if random.random() < ss_ratio:
-                    w_t = caps[:, t]
-
-        output = {
-            "seqs": seqs, 
-            "logits": logits, 
-            "sampled_logprobs": sampled_logprobs
-        }
+        self.stepwise_process(output)
         return output
 
-    def sample_next_word(self, logits, method, temp=1):
-        """Sample the next word, given probs output by rnn
+    def decode_step(self, decoder_input, encoded, caps, output, t, **kwargs):
+        self.prepare_decoder_input(decoder_input, encoded, caps, output, t, **kwargs)
+        # feed to the decoder to get states and logits
+        output_t = self.decoder(**decoder_input)
+        decoder_input["state"] = output_t["states"]
+        logits_t = output_t["logits"].squeeze(1)
+        # sample the next input word and get the corresponding logits
+        sampled = self.sample_next_word(logits_t, **kwargs)
+        self.stepwise_process_step(output, output_t, t, sampled)
+    
+    def prepare_decoder_input(self, decoder_input, encoded, caps, output, t, **kwargs):
+        # prepare input word
+        if t == 0:
+            decoder_input["state"] = encoded["state"]
+            decoder_input["enc_mem"] = mean_with_lens(
+                encoded["audio_embeds"], encoded["audio_embeds_lens"]).unsqueeze(1) # [N, 1, src_emb_dim]
+            w_t = torch.tensor([self.start_idx,] * output["seqs"].size(0)).long()
+        else:
+            w_t = output["seqs"][:, t - 1]
+            if caps is not None and random.random() < kwargs["ss_ratio"]: # training, scheduled sampling
+                w_t = caps[:, t]
+        # w_t: [N,]
+        decoder_input["word"] = w_t.unsqueeze(1)
+    
+    def stepwise_process_step(self, output, output_t, t, sampled):
+        output["logits"][:, t, :] = output_t["logits"].squeeze(1)
+        output["seqs"][:, t] = sampled["w_t"]
+        # output["sampled_logprobs"][:, t] = sampled["probs"]
+
+    def stepwise_process(self, output):
+        pass
+
+    def sample_next_word(self, logits, **kwargs):
+        """Sample the next word, given probs output by the decoder
         """
+        method = kwargs.get("method", "greedy")
+        temp = kwargs.get("temp", 1)
         logprobs = torch.log_softmax(logits, dim=1)
         if method == "greedy":
             sampled_logprobs, w_t = torch.max(logprobs.detach(), 1)
@@ -165,80 +165,67 @@ class CaptionModel(nn.Module):
         # sampled_logprobs: [N,], w_t: [N,]
         return {"w_t": w_t, "probs": sampled_logprobs}
 
-    def sample_beam(self, encoded, **kwargs):
-        # encoded: {"audio_embeds", "state"}
-        audio_embeds = encoded["audio_embeds"]
-        states = encoded["state"]
-        seqs = torch.zeros(audio_embeds.size(0), kwargs["max_length"], dtype=torch.long)
-        # beam search sentence by sentence
-        for i in range(audio_embeds.size(0)):
-            encoded_i = audio_embeds[i]
-            states_i = states if states is None else states[:, i, :]
-            seq_i = self.sample_beam_core(encoded_i, states_i, **kwargs)
-            seqs[i] = seq_i
+    def beam_search(self, encoded, max_length, beam_size):
+        output = {}
+        self.prepare_output(encoded, output, max_length)
+        # instance by instance beam seach
+        for i in range(encoded["audio_embeds"].size(0)):
+            output_i = {}
+            self.prepare_beamsearch_output(output_i, beam_size, encoded, max_length)
+            decoder_input = {}
+            for t in range(max_length):
+                output_t = self.beamsearch_decode_step(decoder_input, encoded, output_i, i, t, beam_size)
+                logits_t = output_t["logits"].squeeze(1)
+                logprobs_t = torch.log_softmax(logits_t, dim=1)
+                logprobs_t = output_i["top_k_logprobs"].unsqueeze(1).expand_as(logprobs_t) + logprobs_t
+                if t == 0: # for the first step, all k seqs will have the same probs
+                    top_k_logprobs, top_k_words = logprobs_t[0].topk(beam_size, 0, True, True)
+                else: # unroll and find top logprobs, and their unrolled indices
+                    top_k_logprobs, top_k_words = logprobs_t.view(-1).topk(beam_size, 0, True, True)
+                output_i["top_k_logprobs"] = top_k_logprobs
+                output_i["prev_word_inds"] = top_k_words / self.vocab_size  # [beam_size,]
+                output_i["next_word_inds"] = top_k_words % self.vocab_size  # [beam_size,]
+                if t == 0:
+                    output_i["seqs"] = output_i["next_word_inds"].unsqueeze(1)
+                else:
+                    output_i["seqs"] = torch.cat([output_i["seqs"][output_i["prev_word_inds"]], 
+                                                  output_i["next_word_inds"].unsqueeze(1)], dim=1)
+                self.beamsearch_process_step(output_i)
+            self.beamsearch_process(output, output_i, i)
+        return output
 
-        return {"seqs": seqs}
+    def prepare_beamsearch_output(self, output, beam_size, encoded, max_length):
+        output["top_k_logprobs"] = torch.zeros(beam_size).to(encoded["audio_embeds"].device)
 
-    def sample_beam_core(self, encoded, state, **kwargs):
-        """
-        Beam search decoding of a single sentence
-        Params:
-            encoded: [emb_dim,]
-            state: [num_layers, enc_hid_dim]
-            beam_size: int
-        """
-        k = kwargs["beam_size"]
-        max_length = kwargs["max_length"]
-        top_k_logprobs = torch.zeros(k).to(encoded.device)
+    def beamsearch_decode_step(self, decoder_input, encoded, output, i, t, beam_size):
+        self.prepare_beamsearch_decoder_input(decoder_input, encoded, output, i, t, beam_size)
+        output_t = self.decoder(**decoder_input)
+        decoder_input["state"] = output_t["states"]
+        return output_t
 
-        if state is not None:
-            state = state.reshape(state.size(0), 1, -1).expand(state.size(0), k, -1)
-            state = state.contiguous()
-            # state: [num_layers, k, enc_hid_dim]
-        
-        for t in range(max_length):
-            if t == 0:
-                e_t = encoded.reshape(1, -1).expand(k, -1)
-            else:
-                e_t = self.word_embeddings(next_word_inds)
-                e_t = self.dropoutlayer(e_t)
+    def prepare_beamsearch_decoder_input(self, decoder_input, encoded, output, i, t, beam_size):
+        if t == 0:
+            enc_mem = torch.mean(encoded["audio_embeds"][i, :encoded["audio_embeds_lens"][i], :], dim=0)
+            enc_mem = enc_mem.reshape(1, -1).repeat(beam_size, 1)
+            enc_mem = enc_mem.unsqueeze(1) # [beam_size, 1, enc_mem_size]
+            decoder_input["enc_mem"] = enc_mem
 
-            # e_t: [k, emb_dim]
-            e_t = e_t.unsqueeze(1)
+            state = encoded["state"]
+            if state is not None: # state: [num_layers, N, enc_hid_size]
+                state = state[:, i, :].unsqueeze(1).repeat(1, beam_size, 1)
+                state = state.contiguous() # [num_layers, beam_size, enc_hid_size]
+            decoder_input["state"] = state
+            w_t = torch.tensor([self.start_idx,] * beam_size).long()
+        else:
+            w_t = output["next_word_inds"]
+            decoder_input["state"] = decoder_input["state"][:, output["prev_word_inds"], :].contiguous()
+        decoder_input["word"] = w_t.unsqueeze(1)
             
-            # feed to the decoder to get state
-            output = self.decoder(e_t, state)
-            state = output["states"]
-            # state: [num_layers, k, enc_hid_dim]
-            # output["logits"]: [k, 1, vocab_size]
-            logits_t = output["logits"].squeeze(1)
-            logprobs_t = torch.log_softmax(logits_t, dim=1)
-            # logprobs_t: [k, vocab_size]
+    def beamsearch_process_step(self, output):
+        pass
 
-            # calculate the joint probability up to the timestep t
-            logprobs_t = top_k_logprobs.unsqueeze(1).expand_as(logprobs_t) + logprobs_t
-            
-            if t == 0:
-                # for the first step, all k seqs will have the same probs
-                top_k_logprobs, top_k_words = logprobs_t[0].topk(k, 0, True, True)
-            else:
-                # unroll and find top logprobs, and their unrolled indices
-                top_k_logprobs, top_k_words = logprobs_t.view(-1).topk(k, 0, True, True)
-
-            # convert unrolled indices to actual indices of scores
-            prev_word_inds = top_k_words / self.vocab_size  # [k,]
-            next_word_inds = top_k_words % self.vocab_size  # [k,]
-
-            # add new words to sequences
-            if t == 0:
-                seqs = next_word_inds.unsqueeze(1)
-                # seqs: [k, 1]
-            else:
-                seqs = torch.cat([seqs[prev_word_inds], next_word_inds.unsqueeze(1)], dim=1)  # [k, t + 1]
-
-            state = state[:, prev_word_inds, :].contiguous()
-
-        return seqs[0] # since logprobs have been sorted, the first sequence is the most probabale result
+    def beamsearch_process(self, output, output_i, i):
+        output["seqs"][i] = output_i["seqs"][0]
 
 
 class CaptionSentenceModel(CaptionModel):
@@ -249,139 +236,28 @@ class CaptionSentenceModel(CaptionModel):
         if decoder.model.hidden_size != seq_output_size:
             self.output_transform = nn.Linear(decoder.model.hidden_size, seq_output_size)
 
-    def sample(self, encoded, caps, cap_lens, **kwargs):
-        # optional keyword arguments
-        method = kwargs.get("method", "greedy")
-        temp = kwargs.get("temperature", 1.0)
-        max_length = kwargs.get("max_length", self.max_length)
-        if cap_lens is not None:
-            max_length = max(cap_lens)
-        assert method in ("greedy", "sample", "beam"), "unknown sampling method"
+    def prepare_output(self, encoded, output, max_length):
+        super(CaptionSentenceModel, self).prepare_output(encoded, output, max_length)
+        output["hiddens"] = torch.zeros(output["seqs"].size(0), max_length, self.decoder.model.hidden_size).to(encoded["audio_embeds"].device)
 
-        if method == "beam":
-            beam_size = kwargs.get("beam_size", 5)
-            return self.sample_beam(
-                encoded, max_length=max_length, beam_size=beam_size)
+    def train_process(self, output, decoder_output, cap_lens):
+        super(CaptionSentenceModel, self).train_process(output, decoder_output, cap_lens)
+        # obtain sentence outputs
+        seq_outputs = mean_with_lens(output["output"], cap_lens - 1)
+        # seq_outputs: [N, dec_hid_size]
+        seq_outputs = self.output_transform(seq_outputs)
+        output["seq_outputs"] = seq_outputs
 
-        audio_embeds = encoded["audio_embeds"]
-        h_t = encoded["state"]
+    def stepwise_process_step(self, output, output_t, t, sampled):
+        super(CaptionSentenceModel, self).stepwise_process_step(output, output_t, t, sampled)
+        output["hiddens"][:, t, :] = output_t["output"].squeeze(1)
 
-        N = encoded.size(0)
-        lens = torch.zeros(N)
-        seqs = torch.zeros(N, max_length, dtype=torch.long).fill_(self.end_idx)
-        logits = torch.zeros(N, max_length, self.vocab_size)
-        hiddens = torch.zeros(N, max_length, self.decoder.model.hidden_size).to(audio_embeds.device)
-        sampled_logprobs = torch.zeros(N, max_length)
-
-        # start sampling
-        for t in range(max_length):
-            # prepare input word/audio embedding
-            if t == 0:
-                e_t = audio_embeds
-            else:
-                e_t = self.word_embeddings(w_t)
-                e_t = self.dropoutlayer(e_t)
-            # e_t: [N, emb_dim]
-            e_t = e_t.unsqueeze(1)
-
-            # feed to the decoder to get states and logits
-            output_t = self.decoder(e_t, h_t, seq_output=True)
-            h_t = output_t["states"]
-            # outputs: 
-            # "logits": [N, 1, vocab_size]
-            # "hidden": [N, 1, hidden_size]
-            logits_t = output_t["logits"].squeeze(1)
-            logits[:, t, :] = logits_t
-            hiddens[:, t, :] = output_t["hidden"].squeeze(1)
-
-            # sample the next input word and get the corresponding logits
-            sampled = self.sample_next_word(logits_t, method, temp)
-            w_t = sampled["w_t"]
-            sampled_logprobs[:, t] = sampled["probs"]
-
-            seqs[:, t] = w_t
-            # decide whether to stop
-            if t == 0:
-                unfinished = w_t != self.end_idx
-            else:
-                unfinished = unfinished * (w_t != self.end_idx)
-            seqs[:, t][~unfinished] = self.end_idx
-            lens[unfinished] += 1
-            if unfinished.sum() == 0 and caps is not None:
-                break
-
-            # teacher forcing training
-            if caps is not None:
-                w_t = caps[:, t]
-            
-            # obtain sentence outputs
-            idxs = torch.arange(max_length, device="cpu").repeat(N).view(N, max_length)
-            if cap_lens is not None:
-                mask = (idxs < cap_lens.view(-1, 1)).to(encoded.device)
-            else:
-                mask = (idxs < lens.view(-1, 1)).to(encoded.device)
-            # mask: [N, T]
-            seq_outputs = hiddens * mask.unsqueeze(-1)
-            seq_outputs = seq_outputs.sum(1)
-            seq_outputs = seq_outputs / lens.unsqueeze(1).to(encoded.device)
-            # seq_outputs: [N, E]
-            seq_outputs = self.output_transform(seq_outputs)
-
-        output = {"seqs": seqs, "logits": logits, "seq_outputs": seq_outputs,
-                  "sampled_logprobs": sampled_logprobs}
-        return output
-
-
-class SentenceDecoderModel(CaptionModel):
-
-    def __init__(self, encoder, decoder, **kwargs):
-        super(SentenceDecoderModel, self).__init__(encoder, decoder, **kwargs)
-
-    def forward(self, *input, **kwargs):
-        if len(input) != 3 and len(input) != 1:
-            raise Exception("number of input should be either 3 (sent_embeds, caps, cap_lens) or 1 (sent_embeds)!")
-
-        mode = kwargs.get("mode", "forward")
-        assert mode in ("forward", "sample"), "unknown running mode"
-        # "forward" means teacher forcing training, "sample" means sampling
-
-        if len(input) == 1 and mode == "forward":
-            raise Exception("missing caption labels for training!")
-
-        return getattr(self, "_" + mode)(*input, **kwargs)
-
-    def _forward(self, *input, **kwargs):
-        """Decode sentence embeddings and generates captions.
-           With sentence embeddings and captions as input, i.e., teacher forcing
-        """
-        sent_embeds, caps, cap_lens = input
-
-        # prepare input to the decoder: encoder output + label embeddings
-        embeds = self.word_embeddings(caps)
-        embeds = self.dropoutlayer(embeds)
-        # embeds: [N, max_len, emb_dim]
-        embeds = torch.cat((sent_embeds.unsqueeze(1), embeds), 1)
-        # embeds: [N, max_len + 1, emb_dim]
-
-        # prepare packed input to the decoder for efficient training (remove padded zeros)
-        # audio feature and the first (max_len - 1) word embeddings are packed
-        packed = nn.utils.rnn.pack_padded_sequence(
-            embeds, cap_lens, batch_first=True)
-        output = self.decoder(packed, None)
-
-        return output
-
-    def _sample(self, *input, **kwargs):
-        if len(input) == 3:
-            sent_embeds, _, _ = input
-        else:
-            sent_embeds, = input
-
-        # sent_embeds: [N, emb_dim]
-        output = self.sample_core(sent_embeds, None, **kwargs)
-
-        return output
-
+    def stepwise_process(self, output):
+        seqs = output["seqs"]
+        lens = torch.where(seqs == self.end_idx, torch.zeros_like(seqs), torch.ones_like(seqs)).sum(dim=1)
+        seq_outputs = mean_with_lens(output["hiddens"], lens)
+        seq_outputs = self.output_transform(seq_outputs)
+        output["seq_outputs"] = seq_outputs
 
 # class CaptionInstanceModel(CaptionModel):
 

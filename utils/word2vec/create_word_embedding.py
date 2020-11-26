@@ -24,10 +24,11 @@ def create_embedding(caption_file: str,
     sentences = list(caption_df["tokens"].values)
     vocabulary = torch.load(vocab_file, map_location="cpu")
 
-    model = Word2Vec(sentences=sentences,
-                     size=embed_size,
-                     min_count=1,
-                     **word2vec_kwargs)
+    epochs = word2vec_kwargs.get("epochs", 10)
+    del word2vec_kwargs["epochs"]
+    model = Word2Vec(size=embed_size, min_count=1, **word2vec_kwargs)
+    model.build_vocab(sentences=sentences)
+    model.train(sentences=sentences, total_examples=len(sentences), epochs=epochs)
     
     word_embeddings = np.zeros((len(vocabulary), embed_size))
     
