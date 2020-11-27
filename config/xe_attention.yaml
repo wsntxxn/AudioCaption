@@ -1,0 +1,68 @@
+# outputpath: experiments/clotho
+
+# feature_file: data/clotho/logmel.hdf5
+# caption_file: data/clotho/dev.json
+# vocab_file: data/clotho/vocab.pth
+outputpath: experiments/audiocaps
+
+feature_file: data/audiocaps/logmel_dev.hdf5
+caption_file_train: data/audiocaps/train.json
+caption_file_val: data/audiocaps/val.json
+vocab_file: data/audiocaps/vocab.pth
+zh: False
+dataloader_args:
+    batch_size: 32
+    num_workers: 4
+inputdim: 64
+train_percent: 90
+# augments: [timemask, freqmask]
+augments: []
+
+scaler: StandardScaler # Can be any of sklearn.preprocessing that supports fit_partial
+scaler_args:
+    with_std : True
+    with_mean : True        
+
+encodermodel: CNN10QEncoder
+encodermodel_args: 
+    # Enables the passing of the hidden encoder state to the decoder
+    embed_size: 512
+pretrained_encoder: experiments/pretrained_encoder/CNN10Q_unbalanced.pth
+#load_encoder_params: True
+decodermodel: RNNBahdanauAttnDecoder
+#decodermodel: RNNLuongAttnDecoder
+decodermodel_args:
+    embed_size: 512
+    rnn_type: GRU
+    num_layers: 1
+    hidden_size: 512
+    attn_hidden_size: 512 # only for Luong attention
+    dropout: 0.3
+model: Seq2SeqAttnModel
+model_args: {}
+#pretrained_word_embedding: data/clotho/embeddings/word2vec_word_512.npy
+#tune_word_embedding: True
+
+improvecriterion: score # Can be acc | loss | score
+
+optimizer: Adam
+optimizer_args:
+    lr: 0.0005
+    weight_decay: 0.0
+epochs: 25
+early_stop: 5
+#scheduler: StepLR
+scheduler: ReduceLROnPlateau
+scheduler_args:
+    mode: min
+    factor: 0.1
+    patience: 5
+    threshold: 0.001
+    #step_size: 4
+    #gamma: 0.5
+
+ss: False
+ss_args:
+    ss_mode: linear
+    ss_ratio: 1.0
+    final_ss_ratio: 0.7

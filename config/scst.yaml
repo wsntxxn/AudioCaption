@@ -1,6 +1,5 @@
 outputpath: experiments/clotho
 
-#feature_stream: copy-feats scp:data/clotho/logmel_dev.scp ark:- |
 feature_file: data/clotho/logmel.hdf5
 caption_file: data/clotho/dev.json
 vocab_file: data/clotho/vocab.pth
@@ -19,26 +18,21 @@ scaler_args:
 
 encodermodel: CNN10QEncoder
 encodermodel_args:
-    num_layers: 1
-    dropout: 0.0
-    # Enables the passing of the hidden encoder state to the decoder
-    use_hidden: True
-    # Can be time, mean ( for last timestep, mean reduction)
-    representation: mean
-    hidden_size: 512
-decodermodel: RNNDecoder
-decodermodel_args:
-    num_layers: 1
-    hidden_size: 512
-    #attn_hidden_size: 512
-basemodel: CaptionModel
-basemodel_args:
     embed_size: 512
+decodermodel: RNNBahdanauAttnDecoder
+decodermodel_args:
+    embed_size: 256
     dropout: 0.3
+    rnn_type: GRU
+    num_layers: 1
+    hidden_size: 512
+    # attn_hidden_size: 512
+model: Seq2SeqAttnModel
+model_args: {}
 modelwrapper: ScstWrapper
 
 load_pretrained: True
-pretrained: experiments/clotho/CaptionModel/pretrainCNN10Q/saved.pth
+pretrained: experiments/clotho/Seq2SeqAttnModel/2020-11-26_00-54-11_ec02e7922f3e11eb955f69e9a1a7a162/saved.pth
 
 improvecriterion: score
 
