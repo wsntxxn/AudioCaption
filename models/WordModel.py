@@ -59,17 +59,14 @@ class CaptionModel(nn.Module):
 
     def prepare_output(self, encoded, output, max_length):
         N = encoded["audio_embeds"].size(0)
-        seqs = torch.empty(N, max_length, dtype=torch.long).fill_(self.end_idx)
-        logits = torch.empty(N, max_length, self.vocab_size).to(encoded["audio_embeds"].device)
-        # sampled_logprobs = torch.zeros(N, max_length)
-        output["seqs"] = seqs
-        output["logits"] = logits
-        # output["sampled_logprobs"] = sampled_logprobs
+        output["seqs"] = torch.empty(N, max_length, dtype=torch.long).fill_(self.end_idx)
+        output["logits"] = torch.empty(N, max_length, self.vocab_size).to(encoded["audio_embeds"].device)
+        output["sampled_logprobs"] = torch.zeros(output["seqs"].size(0), max_length)
 
     def train_forward(self, encoded, caps, cap_lens, **kwargs):
         if kwargs["ss_ratio"] != 1: # scheduled sampling training
             return self.stepwise_forward(encoded, caps, cap_lens, **kwargs)
-        N, cap_max_len = caps.size(0), caps.size(1)
+        cap_max_len = caps.size(1)
         output = {}
         self.prepare_output(encoded, output, cap_max_len - 1)
         enc_mem = mean_with_lens(encoded["audio_embeds"], 
@@ -89,9 +86,10 @@ class CaptionModel(nn.Module):
         if method == "beam":
             beam_size = kwargs.get("beam_size", 5)
             return self.beam_search(encoded, max_length, beam_size)
-        return self.stepwise_forward(encoded, None, None) 
+        return self.stepwise_forward(encoded, None, None, **kwargs) 
 
     def stepwise_forward(self, encoded, caps, cap_lens, **kwargs):
+        """Step-by-step decoding, when `caps` is provided, it means teacher forcing training"""
         if cap_lens is not None: # scheduled sampling training
             max_length = max(cap_lens) - 1
         else: # inference
@@ -115,6 +113,7 @@ class CaptionModel(nn.Module):
         return output
 
     def decode_step(self, decoder_input, encoded, caps, output, t, **kwargs):
+        """Decoding operation of timestep t"""
         self.prepare_decoder_input(decoder_input, encoded, caps, output, t, **kwargs)
         # feed to the decoder to get states and logits
         output_t = self.decoder(**decoder_input)
@@ -125,7 +124,7 @@ class CaptionModel(nn.Module):
         self.stepwise_process_step(output, output_t, t, sampled)
     
     def prepare_decoder_input(self, decoder_input, encoded, caps, output, t, **kwargs):
-        # prepare input word
+        """Prepare the input dict `decoder_input` for the decoder and timestep t"""
         if t == 0:
             decoder_input["state"] = encoded["state"]
             decoder_input["enc_mem"] = mean_with_lens(
@@ -139,11 +138,13 @@ class CaptionModel(nn.Module):
         decoder_input["word"] = w_t.unsqueeze(1)
     
     def stepwise_process_step(self, output, output_t, t, sampled):
+        """Postprocessing (save output values) after each timestep t"""
         output["logits"][:, t, :] = output_t["logits"].squeeze(1)
         output["seqs"][:, t] = sampled["w_t"]
-        # output["sampled_logprobs"][:, t] = sampled["probs"]
+        output["sampled_logprobs"][:, t] = sampled["probs"]
 
     def stepwise_process(self, output):
+        """Postprocessing after the whole step-by-step autoregressive decoding"""
         pass
 
     def sample_next_word(self, logits, **kwargs):
@@ -174,7 +175,7 @@ class CaptionModel(nn.Module):
             self.prepare_beamsearch_output(output_i, beam_size, encoded, max_length)
             decoder_input = {}
             for t in range(max_length):
-                output_t = self.beamsearch_decode_step(decoder_input, encoded, output_i, i, t, beam_size)
+                output_t = self.beamsearch_step(decoder_input, encoded, output_i, i, t, beam_size)
                 logits_t = output_t["logits"].squeeze(1)
                 logprobs_t = torch.log_softmax(logits_t, dim=1)
                 logprobs_t = output_i["top_k_logprobs"].unsqueeze(1).expand_as(logprobs_t) + logprobs_t
@@ -197,7 +198,7 @@ class CaptionModel(nn.Module):
     def prepare_beamsearch_output(self, output, beam_size, encoded, max_length):
         output["top_k_logprobs"] = torch.zeros(beam_size).to(encoded["audio_embeds"].device)
 
-    def beamsearch_decode_step(self, decoder_input, encoded, output, i, t, beam_size):
+    def beamsearch_step(self, decoder_input, encoded, output, i, t, beam_size):
         self.prepare_beamsearch_decoder_input(decoder_input, encoded, output, i, t, beam_size)
         output_t = self.decoder(**decoder_input)
         decoder_input["state"] = output_t["states"]
@@ -258,40 +259,4 @@ class CaptionSentenceModel(CaptionModel):
         seq_outputs = mean_with_lens(output["hiddens"], lens)
         seq_outputs = self.output_transform(seq_outputs)
         output["seq_outputs"] = seq_outputs
-
-# class CaptionInstanceModel(CaptionModel):
-
-    # def __init__(self, encoder, decoder, num_instance, instance_embed_size, **kwargs):
-        # super(CaptionInstanceModel, self).__init__(encoder, decoder, **kwargs)
-        # self.word_embeddings = nn.Embedding(self.vocab_size, self.decoder.model.input_size)
-        # nn.init.kaiming_uniform_(self.word_embeddings.weight)
-        # self.instance_embedding = nn.Embedding(num_instance, instance_embed_size)
-        # nn.init.kaiming_uniform_(self.instance_embedding.weight)
-
-    # def forward(self, *input, **kwargs):
-        # if len(input) != 5 and len(input) != 3:
-            # raise Exception("number of input should be either 5 (feats, feat_lens, caps, cap_lens, cap_idxs) or 3 (feats, feat_lens, instance_labels)!")
-
-        # if len(input) == 5:
-            # train_mode = kwargs.get("train_mode", "tf")
-            # assert train_mode in ("tf", "sample"), "unknown training mode"
-            # kwargs["train_mode"] = train_mode
-            # # "tf": teacher forcing training, "sample": no teacher forcing training
-            # feats, feat_lens, caps, cap_lens, cap_idxs = input
-            # instance_embeds = self.instance_embedding(cap_idxs)
-        # else:
-            # feats, feat_lens, instance_labels = input
-            # instance_embeds = torch.matmul(instance_labels, self.instance_embedding.weight)
-            # caps = None
-            # cap_lens = None
-
-        # encoded = self.encoder(feats, feat_lens)
-        # # encoded: {
-        # #     audio_embeds: [N, emb_dim]
-        # #     audio_embeds_time: [N, src_max_len, emb_dim]
-        # #     state: rnn style hidden states, [num_dire * num_layers, N, hs_enc]
-        # #     audio_embeds_lens: [N, ]
-        # encoded["audio_embeds"] = torch.cat((encoded["audio_embeds"], instance_embeds), dim=-1)
-        # output = self.sample(encoded, caps, cap_lens, **kwargs)
-        # return output
 

@@ -26,8 +26,8 @@ from datasets.SJTUDataSet import SJTUDataset, SJTUDatasetEval, collate_fn
 
 class Runner(BaseRunner):
 
-    @staticmethod
-    def _get_model(config, vocab_size):
+    def _get_model(self, config, vocabulary):
+        vocab_size = len(vocabulary)
         if config["encodermodel"] == "E2EASREncoder":
             encodermodel = models.encoder.load_espnet_encoder(config["pretrained_encoder"], pretrained=config["load_encoder_params"])
         else:
@@ -55,6 +55,9 @@ class Runner(BaseRunner):
             )
         model = getattr(
             models, config["model"])(encodermodel, decodermodel, **config["model_args"])
+        if "load_pretrained" in config and config["load_pretrained"]:
+            pretrained_state_dict = torch.load(config["pretrained"], map_location="cpu")["model"]
+            model.load_state_dict(pretrained_state_dict)
         return model
 
     def _forward(self, model, batch, mode, **kwargs):

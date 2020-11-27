@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 
 from utils import score_util
-
+from models.WordModel import CaptionModel
 
 class ScstWrapper(nn.Module):
 
@@ -24,19 +24,14 @@ class ScstWrapper(nn.Module):
             feats, feat_lens, keys, key2refs = input
         else:
             feats, feat_lens = input
-        encoded = self.model.encoder(feats, feat_lens)
-        # encoded: 
-        #     audio_embeds: [N, emb_dim]
-        #     audio_embeds_time: [N, src_max_len, emb_dim]
-        #     state: rnn style encoder states
-        #     audio_embeds_lens: [N, ]
+
         if len(input) == 2:
-            output = self.model.sample(encoded, None, None, **kwargs)
+            output = self.model(*input, **kwargs)
         else:
-            output = self.scst(encoded, keys, key2refs, **kwargs)
+            output = self.scst(*input, **kwargs)
         return output
 
-    def scst(self, encoded, keys, key2refs, **kwargs):
+    def scst(self, feats, feat_lens, keys, key2refs, **kwargs):
         output = {}
 
         sample_kwargs = {
@@ -45,14 +40,13 @@ class ScstWrapper(nn.Module):
         }
 
         # prepare baseline
-        self.eval()
+        self.model.eval()
         with torch.no_grad():
-            sampled_greedy = self.model.sample(
-                encoded, None, None, method="greedy", **sample_kwargs)
+            sampled_greedy = self.model(feats, feat_lens, method="greedy", **sample_kwargs)
         output["greedy_seqs"] = sampled_greedy["seqs"]
 
-        self.train()
-        sampled = self.model.sample(encoded, None, None, method="sample", **sample_kwargs)
+        self.model.train()
+        sampled = self.model(feats, feat_lens, method="sample", **sample_kwargs)
         output["sampled_seqs"] = sampled["seqs"]
 
         reward_score = self.get_self_critical_reward(sampled_greedy["seqs"],
@@ -70,7 +64,7 @@ class ScstWrapper(nn.Module):
         mask = torch.cat([torch.ones(mask.size(0), 1), mask[:, :-1]], 1)
         mask = torch.as_tensor(mask).float()
         loss = - sampled["sampled_logprobs"] * reward * mask
-        loss = loss.to(encoded["audio_embeds"].device)
+        loss = loss.to(feats.device)
         # loss: [N, max_length]
         loss = torch.sum(loss, dim=1).mean()
         # loss = torch.sum(loss) / torch.sum(mask)

@@ -216,7 +216,7 @@ class BaseRunner(object):
         config = dump["config"]
 
         vocabulary = torch.load(config["vocab_file"])
-        model = self._get_model(config, len(vocabulary))
+        model = self._get_model(config, vocabulary)
         model.load_state_dict(dump["model"])
 
         zh = config["zh"]
