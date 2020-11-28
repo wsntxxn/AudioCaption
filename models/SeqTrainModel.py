@@ -5,7 +5,6 @@ import torch
 import torch.nn as nn
 
 from utils import score_util
-from models.WordModel import CaptionModel
 
 class ScstWrapper(nn.Module):
 
@@ -18,7 +17,7 @@ class ScstWrapper(nn.Module):
         """Decode audio feature vectors and generates captions.
         """
         if len(input) != 4 and len(input) != 2:
-            raise Exception("number of input should be either 4 (feats, feat_lens, keys, caps) or 2 (feats, feat_lens)!")
+            raise Exception("number of input should be either 4 (feats, feat_lens, keys, key2refs) or 2 (feats, feat_lens)!")
 
         if len(input) == 4:
             feats, feat_lens, keys, key2refs = input
