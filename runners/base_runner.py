@@ -326,19 +326,6 @@ class BaseRunner(object):
             score, scores = scorer.compute_score(key2refs, key2pred)
             f.write("Spice: {:6.3f}\n".format(score))
 
-        from audiocaptioneval.sentbert.sentencebert import SentenceBert
-        scorer = SentenceBert(zh=zh)
-        if caption_embedding_path is not None:
-            key2ref_embeds = np.load(caption_embedding_path, allow_pickle=True)
-            score, scores = scorer.compute_score(key2ref_embeds, key2pred)
-        else:
-            score, scores = scorer.compute_score(key2refs, key2pred)
-        f.write("SentenceBert: {:6.3f}\n".format(score))
-
-        from utils.diverse_eval import diversity_evaluate
-        score = diversity_evaluate(pred_df)
-        f.write("Diversity: {:6.3f}\n".format(score))
-
         f.close()
 
     def dcase_predict(self,
