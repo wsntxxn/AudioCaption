@@ -3,3 +3,4 @@ from .decoder import *
 from .WordModel import *
 from .SeqTrainModel import *
 from .AttnModel import *
+from .TransformerModel import *

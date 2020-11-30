@@ -82,12 +82,12 @@ class Runner(BaseRunner):
                                   non_blocking=True)
             # pack labels to remove padding from caption labels
             targets = torch.nn.utils.rnn.pack_padded_sequence(
-                caps[:, 1:], cap_lens - 1, batch_first=True).data
+                caps, cap_lens, batch_first=True).data
 
             output = model(feats, feat_lens, caps, cap_lens, **kwargs)
 
             packed_logits = torch.nn.utils.rnn.pack_padded_sequence(
-                output["logits"], cap_lens - 1, batch_first=True).data
+                output["logits"], cap_lens, batch_first=True).data
             packed_logits = convert_tensor(
                 packed_logits, device=self.device, non_blocking=True)
 
@@ -138,7 +138,7 @@ class Runner(BaseRunner):
             "Feature: {} Input dimension: {} Vocab Size: {}".format(
                 conf["feature_file"], info["inputdim"], len(vocabulary)))
 
-        model = self._get_model(conf, len(vocabulary))
+        model = self._get_model(conf, vocabulary)
         model = model.to(self.device)
         train_util.pprint_dict(model, logger.info, formatter="pretty")
         optimizer = getattr(
@@ -231,12 +231,6 @@ class Runner(BaseRunner):
                 "model": model,
             }
         )
-
-        # early_stop_handler = EarlyStopping(
-            # patience=config_parameters["early_stop"],
-            # score_function=lambda engine: engine.state.metrics["score"],
-            # trainer=trainer)
-        # evaluator.add_event_handler(Events.COMPLETED, early_stop_handler)
 
         trainer.run(train_loader, max_epochs=conf["epochs"])
         return outputdir

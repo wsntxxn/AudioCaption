@@ -54,7 +54,8 @@ class BaseRunner(object):
             torch.utils.data.DataLoader(
                 SJTUDataset(
                     feature=config["feature_file"],
-                    caption_df=caption_df,
+                    # caption_df=caption_df,
+                    caption_df=train_df,
                     vocabulary=vocabulary,
                 ),
                 collate_fn=collate_fn([0, 1]),
@@ -65,7 +66,6 @@ class BaseRunner(object):
         ):
             feat = batch[0]
             feat_lens = batch[-2]
-            # feat = feat.reshape(-1, feat.shape[-1])
             packed_feat = torch.nn.utils.rnn.pack_padded_sequence(
                 feat, feat_lens, batch_first=True, enforce_sorted=False).data
             scaler.partial_fit(packed_feat)
@@ -325,6 +325,19 @@ class BaseRunner(object):
             scorer = Spice()
             score, scores = scorer.compute_score(key2refs, key2pred)
             f.write("Spice: {:6.3f}\n".format(score))
+
+        from audiocaptioneval.sentbert.sentencebert import SentenceBert
+        scorer = SentenceBert(zh=zh)
+        if caption_embedding_path is not None:
+            key2ref_embeds = np.load(caption_embedding_path, allow_pickle=True)
+            score, scores = scorer.compute_score(key2ref_embeds, key2pred)
+        else:
+            score, scores = scorer.compute_score(key2refs, key2pred)
+        f.write("SentenceBert: {:6.3f}\n".format(score))
+
+        from utils.diverse_eval import diversity_evaluate
+        score = diversity_evaluate(pred_df)
+        f.write("Diversity: {:6.3f}\n".format(score))
 
         f.close()
 

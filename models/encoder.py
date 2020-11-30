@@ -323,6 +323,7 @@ class CRNNEncoder(BaseEncoder):
         # # out = x_mean + x_max
 
         # out = x_mean
+        out = mean_with_lens(x, lens)
 
         # return {
             # "audio_embeds": out,
@@ -332,6 +333,7 @@ class CRNNEncoder(BaseEncoder):
         # }
         return {
             "audio_embeds": x, # [N, T, E]
+            "audio_embeds_pooled": out,
             "audio_embeds_lens": lens,
             "state": None
         }
@@ -472,27 +474,21 @@ class CNN10QEncoder(BaseEncoder):
         x = x.transpose(1, 3)
         x = self.init_bn(x)
         x = x.transpose(1, 3)
-        x = self.features(x) # x: [N, 512, T/16, D/16]
-        x = x.transpose(1, 2).contiguous().flatten(-2) # x: [N, T/16, 512*T/16]
+        x = self.features(x) # x: [N, 512, T/16, 1]
+        x = x.transpose(1, 2).contiguous().flatten(-2) # x: [N, T/16, 512]
         # x = x.mean(1) + x.max(1)[0]
 
         lens /= 16
-        # idxs = torch.arange(x.size(1), device="cpu").repeat(N).view(N, x.size(1))
-        # mask = (idxs < lens.view(-1, 1)).to(x.device)
 
-        # x_mean = x * mask.unsqueeze(-1)
-        # x_mean = x_mean.sum(1) / lens.unsqueeze(1).to(x.device)
+        x_mean = mean_with_lens(x, lens)
+        x_max = max_with_lens(x, lens)
+        out = x_mean + x_max
 
-        # x_max = x.clone()
-        # x_max[~mask] = float("-inf")
-        # x_max, _ = x_max.max(1)
-        # out = x_mean + x_max
-
-        # out = F.dropout(out, p=0.5, training=self.training)
-        # out = self.embedding(out)
+        out = F.dropout(out, p=0.5, training=self.training)
+        out = self.embedding(out)
         return {
             "audio_embeds": x,
-            # "audio_embeds_time": x,
+            "audio_embeds_pooled": out,
             "state": None,
             "audio_embeds_lens": lens
         }

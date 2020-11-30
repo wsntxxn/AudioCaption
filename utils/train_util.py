@@ -3,6 +3,7 @@
 import os
 import sys
 import logging
+import copy
 import datetime
 import yaml
 from pathlib import Path
@@ -168,15 +169,22 @@ def update_ss_ratio(engine, config, num_iter):
         config["ss_args"]["ss_ratio"] -= (1.0 - config["ss_args"]["final_ss_ratio"]) / num_epoch / num_iter
 
 
+def generate_length_mask(lens):
+    lens = torch.as_tensor(lens)
+    N = lens.size(0)
+    T = max(lens)
+    idxs = torch.arange(T).repeat(N).view(N, T)
+    mask = (idxs < lens.view(-1, 1))
+    return mask
+
+
 def mean_with_lens(features, lens):
     """
     features: [N, T, ...] (assume the second dimension represents length)
     lens: [N,]
     """
     lens = torch.as_tensor(lens)
-    N, T = features.size(0), features.size(1)
-    idxs = torch.arange(T).repeat(N).view(N, T)
-    mask = (idxs < lens.view(-1, 1)).to(features.device) # [N, T]
+    mask = generate_length_mask(lens).to(features.device) # [N, T]
 
     feature_mean = features * mask.unsqueeze(-1)
     feature_mean = feature_mean.sum(1) / lens.unsqueeze(1).to(features.device)
@@ -189,11 +197,9 @@ def max_with_lens(features, lens):
     lens: [N,]
     """
     lens = torch.as_tensor(lens)
-    N, T = features.size(0), features.size(1)
-    idxs = torch.arange(T).repeat(N).view(N, T)
-    mask = (idxs < lens.view(-1, 1)).to(features.device) # [N, T]
+    mask = generate_length_mask(lens).to(features.device) # [N, T]
 
-    feature_max = features
+    feature_max = features.clone()
     feature_max[~mask] = float("-inf")
     feature_max, _ = feature_max.max(1)
     return feature_max

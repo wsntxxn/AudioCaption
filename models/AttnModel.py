@@ -70,6 +70,7 @@ class Seq2SeqAttnModel(CaptionModel):
                 state = self.decoder.init_hidden(output["seqs"].size(0))
                 state = state.to(encoded["audio_embeds"].device)
                 decoder_input["state"] = state
+
         # decoder_input: { "word": ..., "state": ..., "enc_mem": ..., "enc_mem_lens": ... }
 
     def stepwise_process_step(self, output, output_t, t, sampled):
