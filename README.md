@@ -4,8 +4,8 @@ This repository provides a recipe for audio captioning with sequence to sequence
 
 It supports:
 * Models:
-  * Audio encoder (most are from Sound Event Detection research): CRNN, CNN10, …
-  * Text decoder: RNN, RNN with attention, …
+  * Audio encoder (most are from Sound Event Detection research): CRNN, CNN10
+  * Text decoder: RNN, RNN with attention, Transformer
 * Training methods:
   * Vanilla cross entropy (XE) training
   * [Scheduled sampling](https://arxiv.org/abs/1506.03099)
@@ -55,7 +55,7 @@ All configurations are stored in `config/*.yaml`, where parameters like model ty
 python runners/run.py train config/xe.yaml
 ```
 The training script will use all configurations specified in `config/xe.yaml`.
-The training logs and model checkpoints will be stored in `OUTPUTPATH/MODEL/TIMESTEP`.
+The training logs and model checkpoints will be stored in `OUTPUTPATH/MODEL/TIMESTAMP`.
 They can also be switched by passing `--ARG VALUE`, e.g., if you want to use scheduled sampling, you can run:
 ```bash
 python runners/run.py train config/xe.yaml --ss True
@@ -66,11 +66,23 @@ python runners/run.py train config/xe.yaml --ss True
 Evaluation is done by running function `evaluate` in `runners/run.py`. For example:
 ```bash
 export EXP_PATH=experiments/***
-python runners/run.py evaluate $EXP_PATH data/clotho/logmel.hdf5 data/clotho/logmel_eval.scp data/clotho/eval.json
+python runners/run.py \
+    evaluate \
+    $EXP_PATH \
+    data/clotho/logmel.hdf5 \
+    data/clotho/logmel_eval.scp \
+    data/clotho/eval.json
 ```
 To use beam search (for example with a beam size of 3), use:
 ```bash
-python runners/run.py evaluate $EXP_PATH data/clotho/logmel.hdf5 data/clotho/logmel_eval.scp data/clotho/eval.json --method beam --beam-size 3
+python runners/run.py \
+    evaluate \
+    $EXP_PATH \
+    data/clotho/logmel.hdf5 \
+    data/clotho/logmel_eval.scp \
+    data/clotho/eval.json \
+    --method beam \
+    --beam-size 3
 ```
 
 Standard captioning metrics (BLEU@1-4, ROUGE-L, CIDEr, METEOR and SPICE) will be calculated.
