@@ -1,4 +1,5 @@
 outputpath: experiments/clotho
+remark: val_no_scst
 
 feature_file: data/clotho/logmel.hdf5
 caption_file: data/clotho/dev.json
@@ -10,6 +11,7 @@ dataloader_args:
 train_percent: 90
 #augments: [timemask, freqmask]
 augments: []
+distributed: False
 
 scaler: StandardScaler # Can be any of sklearn.preprocessing that supports fit_partial
 scaler_args:
@@ -21,8 +23,8 @@ encodermodel_args:
     embed_size: 512
 decodermodel: RNNBahdanauAttnDecoder
 decodermodel_args:
-    embed_size: 256
-    dropout: 0.3
+    embed_size: 512 # 256
+    dropout: 0.5 # 0.3
     rnn_type: GRU
     num_layers: 1
     hidden_size: 512
@@ -32,7 +34,7 @@ model_args: {}
 modelwrapper: ScstWrapper
 
 load_pretrained: True
-pretrained: experiments/clotho/Seq2SeqAttnModel/2020-11-26_00-54-11_ec02e7922f3e11eb955f69e9a1a7a162/saved.pth
+pretrained: experiments/clotho/Seq2SeqAttnModel/BahdanauAttn_pretrainCNN10Q_unbalanced_refactored/saved.pth
 
 improvecriterion: score
 

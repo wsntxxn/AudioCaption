@@ -74,22 +74,8 @@ class RNNDecoder(BaseDecoder):
         states = kwargs["state"]
         enc_mem = kwargs["enc_mem"]
 
-
-        if isinstance(w, torch.Tensor):
-            if isinstance(w.cpu(), torch.LongTensor):
-                w = w.to(enc_mem.device)
-                embed = self.dropoutlayer(self.word_embeddings(w))
-            elif isinstance(w.cpu(), torch.FloatTensor):
-                embed = w
-        elif isinstance(w, list):
-            w_list = []
-            for word in w:
-                if isinstance(word.cpu(), torch.LongTensor):
-                    word = word.to(enc_mem.device)
-                    w_list.append(self.dropoutlayer(self.word_embeddings(word)))
-                elif isinstance(word.cpu(), torch.FloatTensor):
-                    w_list.append(word)
-            embed = torch.cat(w_list, dim=1)
+        w = w.to(enc_mem.device)
+        embed = self.dropoutlayer(self.word_embeddings(w))
         
         # embed: [N, T, embed_size]
         embed = torch.cat((embed, enc_mem), dim=-1)
@@ -146,7 +132,7 @@ class RNNBahdanauAttnDecoder(RNNDecoder):
                  vocab_size,
                  enc_mem_size,
                  **kwargs):
-        from models.AttnModel import Seq2SeqAttention
+        from models.attn_model import Seq2SeqAttention
         super(RNNBahdanauAttnDecoder, self).__init__(vocab_size, enc_mem_size, **kwargs)
         attn_size = kwargs.get("attn_size", self.model.hidden_size)
         self.attn = Seq2SeqAttention(enc_mem_size, self.model.hidden_size, attn_size)
@@ -157,11 +143,8 @@ class RNNBahdanauAttnDecoder(RNNDecoder):
         enc_mem = kwargs["enc_mem"]
         enc_mem_lens = kwargs["enc_mem_lens"]
 
-        if isinstance(w.cpu(), torch.LongTensor):
-            w = w.to(enc_mem.device)
-            embed = self.dropoutlayer(self.word_embeddings(w))
-        elif isinstance(w.cpu(), torch.FloatTensor):
-            embed = w
+        w = w.to(enc_mem.device)
+        embed = self.dropoutlayer(self.word_embeddings(w))
 
         # embed: [N, 1, embed_size]
         c, attn_weight = self.attn(states.squeeze(0), enc_mem, enc_mem_lens)
@@ -204,7 +187,7 @@ class TransformerDecoder(BaseDecoder):
     def __init__(self, vocab_size, enc_mem_size, **kwargs):
         embed_size = kwargs.get("embed_size", 256)
         super(TransformerDecoder, self).__init__(embed_size, vocab_size, enc_mem_size)
-        self.nhead = kwargs.get("nhead", 2)
+        self.nhead = kwargs.get("nhead", 4)
         self.dropout_p = kwargs.get("dropout", 0.5)
         self.nlayers = kwargs.get("nlayers", 2)
 
@@ -228,17 +211,10 @@ class TransformerDecoder(BaseDecoder):
         tgt_key_padding_mask = kwargs["caps_padding_mask"]
 
 
-        w_list = []
-        for word in words:
-            if isinstance(word.cpu(), torch.LongTensor):
-                word = word.to(enc_mem.device)
-                emb = self.dropoutlayer(self.word_embeddings(word)) * math.sqrt(self.embed_size)
-                w_list.append(emb)
-            elif isinstance(word.cpu(), torch.FloatTensor):
-                w_list.append(word)
-        embed = torch.cat(w_list, dim=1)
-
-        embed = embed.transpose(0, 1) # [T, N, hid_size]
+        enc_mem = enc_mem.transpose(0, 1) # [T_src, N, emb_size]
+        words = words.to(enc_mem.device)
+        embed = self.dropoutlayer(self.word_embeddings(words)) * math.sqrt(self.embed_size) # [N, T, emb_size]
+        embed = embed.transpose(0, 1) # [T, N, emb_size]
         embed = self.pos_encoder(embed)
 
         tgt_mask = self.generate_square_subsequent_mask(embed.size(0)).to(enc_mem.device)

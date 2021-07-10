@@ -1,5 +1,8 @@
+# Utils
 
-### (Optional) BERT Pretrained Embeddings
+Scripts in this directory are used as utility functions.
+
+## BERT Pretrained Embeddings
 
 You can load pretrained word embeddings in Google [BERT](https://github.com/google-research/bert#pre-trained-models) instead of training word embeddings from scratch. The scripts in `utils/bert` need a BERT server in the background. We use BERT server from [bert-as-service](https://github.com/hanxiao/bert-as-service).
 
@@ -13,4 +16,4 @@ bash scripts/prepare_bert_server.sh <path-to-server> <num-workers> zh
 
 By default, server based on BERT base Chinese model is running in the background. You can change to other models by changing corresponding model name and path in `scripts/prepare_bert_server.sh`.
 
-To extract BERT word embeddings, you need to execute `utils/bert/create_word_embedding.py`, where the usage is shown.
+To extract BERT word embeddings, you need to execute `utils/bert/create_word_embedding.py`.

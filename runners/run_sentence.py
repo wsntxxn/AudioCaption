@@ -255,14 +255,14 @@ class Runner(XeRunner):
 
         evaluator = Engine(_inference)
 
-        def eval_cv(engine, key2pred, key2refs):
+        def eval_val(engine, key2pred, key2refs):
             scorer = Cider(zh=zh)
             score, scores = scorer.compute_score(key2refs, key2pred)
             engine.state.metrics["score"] = score
             key2pred.clear()
 
         evaluator.add_event_handler(
-            Events.EPOCH_COMPLETED, eval_cv, key2pred, val_key2refs)
+            Events.EPOCH_COMPLETED, eval_val, key2pred, val_key2refs)
 
         for name, metric in metrics.items():
             metric.attach(trainer, name)
@@ -297,11 +297,6 @@ class Runner(XeRunner):
                 "model": model,
             }
         )
-        # early_stop_handler = EarlyStopping(
-            # patience=config_parameters["early_stop"],
-            # score_function=lambda engine: engine.state.metrics["score"],
-            # trainer=trainer)
-        # evaluator.add_event_handler(Events.COMPLETED, early_stop_handler)
 
         trainer.run(train_loader, max_epochs=conf["epochs"])
         return outputdir

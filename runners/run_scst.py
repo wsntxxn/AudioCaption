@@ -1,6 +1,7 @@
 # coding=utf-8
 #!/usr/bin/env python3
 import os
+import pdb
 import re
 import sys
 import logging
@@ -25,17 +26,16 @@ sys.path.append(os.getcwd())
 import models
 import utils.train_util as train_util
 from utils.build_vocab import Vocabulary
-from datasets.SJTUDataSet import SJTUDataset, collate_fn
+from datasets.caption_dataset import SJTUDataset, collate_fn
 from runners.run import Runner as XeRunner
 
 
 class ScstRunner(XeRunner):
     """Main class to run experiments"""
 
-    def _get_model(self, config, vocabulary):
-        basemodel = super(ScstRunner, self)._get_model(config, vocabulary)
-        model = getattr(models.SeqTrainModel, config["modelwrapper"])(
-                basemodel, vocabulary)
+    def _get_model(self, config, vocab_size):
+        basemodel = super()._get_model(config, vocab_size)
+        model = getattr(models.seq_train_model, config["modelwrapper"])(basemodel)
         return model
 
     def _forward(self, model, batch, mode, **kwargs):
@@ -51,6 +51,16 @@ class ScstRunner(XeRunner):
                                    non_blocking=True)
             output = model(feats, feat_lens, **kwargs)
             return output
+        
+        if mode == "validation":
+            feats = batch[0]
+            feat_lens = batch[-2]
+            feats = convert_tensor(feats.float(),
+                                   device=self.device,
+                                   non_blocking=True)
+            output = model(feats, feat_lens, **kwargs)
+            return output
+
 
         feats = batch[0]
         keys = batch[2]
@@ -60,8 +70,9 @@ class ScstRunner(XeRunner):
                                device=self.device,
                                non_blocking=True)
         
-        assert "key2refs" in kwargs, "missing references"
-        output = model(feats, feat_lens, keys, kwargs["key2refs"], 
+        assert "key2refs" in kwargs, "missing references in scst"
+        assert "vocabulary" in kwargs, "missing vocabulary in scst"
+        output = model(feats, feat_lens, keys, kwargs["key2refs"], kwargs["vocabulary"],
                        max_length=max(cap_lens)-1, scorer=kwargs["scorer"])
         
         return output
@@ -73,15 +84,18 @@ class ScstRunner(XeRunner):
         """
 
         from pycocoevalcap.cider.cider import Cider
+        from pycocoevalcap.spider.spider import Spider
 
         conf = train_util.parse_config_or_kwargs(config, **kwargs)
         conf["seed"] = self.seed
         zh = conf["zh"]
         outputdir = os.path.join(
             conf["outputpath"], conf["modelwrapper"],
-            "{}_{}".format(
-                datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%m'),
-                uuid.uuid1().hex))
+            # "{}_{}".format(
+                # datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%m'),
+                # uuid.uuid1().hex))
+            conf["remark"], "seed_{}".format(self.seed)
+        )
 
         # Early init because of creating dir
         checkpoint_handler = ModelCheckpoint(
@@ -90,8 +104,8 @@ class ScstRunner(XeRunner):
             n_saved=1,
             require_empty=False,
             create_dir=True,
-            score_function=lambda engine: -engine.state.metrics["loss"],
-            score_name="loss")
+            score_function=lambda engine: engine.state.metrics["score"],
+            score_name="score")
 
         logger = train_util.genlogger(os.path.join(outputdir, "train.log"))
         # print passed config parameters
@@ -118,13 +132,21 @@ class ScstRunner(XeRunner):
 
         crtrn_imprvd = train_util.criterion_improver(conf["improvecriterion"])
 
+        scorer_dict = {"cider": Cider(zh=zh), "spider": Spider()}
+        if "train_scorer" not in conf:
+            conf["train_scorer"] = "cider"
+        train_scorer = scorer_dict[conf["train_scorer"]]
         def _train_batch(engine, batch):
+            # import pdb; pdb.set_trace()
+            # set num batch tracked?
             model.train()
             with torch.enable_grad():
                 optimizer.zero_grad()
-                train_scorer = Cider(zh=zh)
+                # train_scorer = scorer_dict[conf["train_scorer"]]
                 output = self._forward(model, batch, "train", 
-                                       key2refs=train_key2refs, scorer=train_scorer)
+                                       key2refs=train_key2refs, 
+                                       scorer=train_scorer,
+                                       vocabulary=vocabulary)
                 output["loss"].backward()
                 optimizer.step()
                 return output
@@ -140,10 +162,12 @@ class ScstRunner(XeRunner):
             model.eval()
             keys = batch[2]
             with torch.no_grad():
-                val_scorer = Cider(zh=zh)
-                output = self._forward(model, batch, "train", 
-                                       key2refs=val_key2refs, scorer=val_scorer)
-                seqs = output["greedy_seqs"].cpu().numpy()
+                # val_scorer = Cider(zh=zh)
+                # output = self._forward(model, batch, "train", 
+                                       # key2refs=val_key2refs, scorer=val_scorer)
+                # seqs = output["greedy_seqs"].cpu().numpy()
+                output = self._forward(model, batch, "validation")
+                seqs = output["seqs"].cpu().numpy()
                 for idx, seq in enumerate(seqs):
                     if keys[idx] in key2pred:
                         continue
@@ -162,22 +186,23 @@ class ScstRunner(XeRunner):
 
         for name, metric in metrics.items():
             metric.attach(trainer, name)
-            metric.attach(evaluator, name)
+            # metric.attach(evaluator, name)
 
-        RunningAverage(output_transform=lambda x: x["loss"]).attach(evaluator, "running_loss")
-        pbar.attach(evaluator, ["running_loss"])
+        # RunningAverage(output_transform=lambda x: x["loss"]).attach(evaluator, "running_loss")
+        # pbar.attach(evaluator, ["running_loss"])
+        pbar.attach(evaluator) 
 
         trainer.add_event_handler(
               Events.EPOCH_COMPLETED, train_util.log_results, evaluator, val_loader,
-              logger.info, ["loss", "reward"], ["loss", "reward", "score"])
+              logger.info, metrics.keys(), ["score"])
 
-        def eval_cv(engine, key2pred, key2refs, scorer):
+        def eval_val(engine, key2pred, key2refs, scorer):
             score, scores = scorer.compute_score(key2refs, key2pred)
             engine.state.metrics["score"] = score
             key2pred.clear()
 
         evaluator.add_event_handler(
-            Events.EPOCH_COMPLETED, eval_cv, key2pred, val_key2refs, Cider(zh=zh))
+            Events.EPOCH_COMPLETED, eval_val, key2pred, val_key2refs, Cider(zh=zh))
 
         evaluator.add_event_handler(
             Events.EPOCH_COMPLETED, train_util.save_model_on_improved, crtrn_imprvd,

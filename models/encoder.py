@@ -397,7 +397,7 @@ class CRNN8_Sub4(BaseEncoder):
         x = F.relu_(self.embedding(x))
         x, _ = self.gru(x)
 
-        lens /= 4
+        lens //= 4
         # x: [N, T, E]
         idxs = torch.arange(x.size(1), device="cpu").repeat(N).view(N, x.size(1))
         mask = (idxs < lens.view(-1, 1)).to(x.device)
@@ -426,7 +426,6 @@ class CNN10QEncoder(BaseEncoder):
     def __init__(self, inputdim, embed_size, **kwargs):
         super(CNN10QEncoder, self).__init__(inputdim, embed_size)
         self.use_hidden = False
-        assert embed_size == 512, "pretrained CNN10Q only supports output feature dimension 512"
 
         def _block(in_channel, out_channel):
             return nn.Sequential(
@@ -462,30 +461,32 @@ class CNN10QEncoder(BaseEncoder):
             nn.AdaptiveAvgPool2d((None, 1)),
         )
         self.init_bn = nn.BatchNorm2d(inputdim)
-        # self.outputlayer = nn.Linear(512, outputdim)
+        # self.outputlayer = nn.Linear(512, embed_size)
         self.embedding = nn.Linear(512, 512)
 
     def forward(self, *input):
+        return self._forward(*input)
+
+    def _forward(self, *input):
         x, lens = input
         lens = copy.deepcopy(lens)
         lens = torch.as_tensor(lens)
         N = x.size(0)
-        x = x.unsqueeze(1)  # x: [N, 1, T, D]
+        x = x.unsqueeze(1)  # [N, 1, T, D]
         x = x.transpose(1, 3)
         x = self.init_bn(x)
         x = x.transpose(1, 3)
-        x = self.features(x) # x: [N, 512, T/16, 1]
-        x = x.transpose(1, 2).contiguous().flatten(-2) # x: [N, T/16, 512]
-        # x = x.mean(1) + x.max(1)[0]
+        x = self.features(x) # [N, 512, T/16, 1]
+        x = x.transpose(1, 2).contiguous().flatten(-2) # [N, T/16, 512]
 
-        lens /= 16
+        lens //= 16
 
         x_mean = mean_with_lens(x, lens)
         x_max = max_with_lens(x, lens)
         out = x_mean + x_max
-
         out = F.dropout(out, p=0.5, training=self.training)
         out = self.embedding(out)
+
         return {
             "audio_embeds": x,
             "audio_embeds_pooled": out,
@@ -493,6 +494,21 @@ class CNN10QEncoder(BaseEncoder):
             "audio_embeds_lens": lens
         }
 
+class CNN10DEncoder(CNN10QEncoder):
+
+    def __init__(self, inputdim, embed_size, **kwargs):
+        super(CNN10DEncoder, self).__init__(inputdim, embed_size)
+        self.outputlayer = nn.Linear(512, embed_size)
+
+    def forward(self, *input):
+        output = super(CNN10DEncoder, self)._forward(*input)
+        x = output["audio_embeds"]
+        x = self.embedding(x) # [N, T/16, 512]
+        x = F.relu_(x)
+        x = F.dropout(x, p=0.5, training=self.training)
+        x = self.outputlayer(x)
+        output["audio_embeds"] = x
+        return output
 
 class CNN10Encoder(BaseEncoder):
 
@@ -572,6 +588,126 @@ class CNN10CRNNEncoder(BaseEncoder):
         return out, None
 
 
+def init_layer(layer):
+    """Initialize a Linear or Convolutional layer. """
+    nn.init.xavier_uniform_(layer.weight)
+ 
+    if hasattr(layer, 'bias'):
+        if layer.bias is not None:
+            layer.bias.data.fill_(0.)
+            
+    
+def init_bn(bn):
+    """Initialize a Batchnorm layer. """
+    bn.bias.data.fill_(0.)
+    bn.weight.data.fill_(1.)
+
+
+class ConvBlock(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        
+        super(ConvBlock, self).__init__()
+        
+        self.conv1 = nn.Conv2d(in_channels=in_channels,
+                              out_channels=out_channels,
+                              kernel_size=(3, 3), stride=(1, 1),
+                              padding=(1, 1), bias=False)
+                              
+        self.conv2 = nn.Conv2d(in_channels=out_channels,
+                              out_channels=out_channels,
+                              kernel_size=(3, 3), stride=(1, 1),
+                              padding=(1, 1), bias=False)
+                              
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+
+        self.init_weight()
+        
+    def init_weight(self):
+        init_layer(self.conv1)
+        init_layer(self.conv2)
+        init_bn(self.bn1)
+        init_bn(self.bn2)
+
+        
+    def forward(self, input, pool_size=(2, 2), pool_type='avg'):
+        
+        x = input
+        x = F.relu_(self.bn1(self.conv1(x)))
+        x = F.relu_(self.bn2(self.conv2(x)))
+        if pool_type == 'max':
+            x = F.max_pool2d(x, kernel_size=pool_size)
+        elif pool_type == 'avg':
+            x = F.avg_pool2d(x, kernel_size=pool_size)
+        elif pool_type == 'avg+max':
+            x1 = F.avg_pool2d(x, kernel_size=pool_size)
+            x2 = F.max_pool2d(x, kernel_size=pool_size)
+            x = x1 + x2
+        else:
+            raise Exception('Incorrect argument!')
+        
+        return x
+
+
+class Cnn10(BaseEncoder):
+    def __init__(self, inputdim, embed_size, **kwargs):
+        super(Cnn10, self).__init__(inputdim, embed_size)
+
+        self.bn0 = nn.BatchNorm2d(64)
+
+        self.conv_block1 = ConvBlock(in_channels=1, out_channels=64)
+        self.conv_block2 = ConvBlock(in_channels=64, out_channels=128)
+        self.conv_block3 = ConvBlock(in_channels=128, out_channels=256)
+        self.conv_block4 = ConvBlock(in_channels=256, out_channels=512)
+
+        self.embed_pooled = nn.Linear(512, 256, bias=True)
+        # self.embed = nn.Linear(512, 256, bias=True)
+        
+        self.init_weight()
+
+    def init_weight(self):
+        init_bn(self.bn0)
+        # init_layer(self.embed)
+        init_layer(self.embed_pooled)
+ 
+    def forward(self, input, lens):
+        """
+        Input: (batch_size, data_length)"""
+           
+        x = input.unsqueeze(1) # (batch_size, 1, time_steps, dim)
+        lens = torch.as_tensor(lens)
+        lens //= 16
+        x = x.transpose(1, 3)
+        x = self.bn0(x)
+        x = x.transpose(1, 3)
+        
+        x = self.conv_block1(x, pool_size=(2, 2), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = self.conv_block2(x, pool_size=(2, 2), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = self.conv_block3(x, pool_size=(2, 2), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = self.conv_block4(x, pool_size=(2, 2), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = torch.mean(x, dim=3)
+        
+        (x1, _) = torch.max(x, dim=2)
+        x2 = torch.mean(x, dim=2)
+        out = x1 + x2
+        out = F.dropout(out, p=0.5, training=self.training)
+        out = F.relu_(self.embed_pooled(out))
+        embedding = F.dropout(out, p=0.5, training=self.training)
+        
+        x = x.transpose(1, 2).contiguous()
+        
+        output_dict = {'audio_embeds': x,
+           'audio_embeds_pooled': embedding,
+           'state': None,
+           'audio_embeds_lens': lens}
+
+        return output_dict
+
+
 class RNNEncoder(BaseEncoder):
 
     def __init__(self, inputdim, embed_size, **kwargs):
@@ -626,6 +762,109 @@ class RNNEncoder(BaseEncoder):
             "state": hid,
             "audio_embeds_lens": lens
         }
+
+
+def conv3x3(in_planes, out_planes, stride=1, groups=1, dilation=1):
+    """3x3 convolution with padding"""
+    return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride,
+                     padding=dilation, groups=groups, bias=False, dilation=dilation)
+
+class BasicBlock(nn.Module):
+    expansion = 1
+
+    def __init__(self, inplanes, planes ,stride=1, downsample=None, groups=1,
+                 base_width=64, dilation=1, norm_layer=None):
+        super(BasicBlock, self).__init__()
+        if norm_layer is None:
+            norm_layer = nn.BatchNorm2d
+        if groups != 1 or base_width != 64:
+            raise ValueError('BasicBlock only supports groups=1 and base_width=64')
+        if dilation > 1:
+            raise NotImplementedError("Dilation > 1 not supported in BasicBlock")
+        # Both self.conv1 and self.downsample layers downsample the input when stride != 1
+        self.conv1 = conv3x3(inplanes, planes, stride)
+        self.bn1 = norm_layer(planes)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = conv3x3(planes, planes)
+        self.bn2 = norm_layer(planes)
+        self.downsample = downsample
+        self.stride = stride
+
+    def forward(self, x):
+        identity = x
+
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+        
+        if self.downsample is not None:
+            identity = self.downsample(x)
+
+        out += identity
+        out = self.relu(out)
+
+        return out
+
+
+class ResNetEncoder(BaseEncoder):
+    
+    def __init__(self, inputdim, embed_size, **kwargs):
+        super().__init__(inputdim, embed_size)
+        self.network = nn.Sequential(
+            nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False), # (0)
+            nn.BatchNorm2d(64), # (1)
+            nn.ReLU(inplace=True), # (2)
+            nn.MaxPool2d(kernel_size=3, stride=2, padding=1), # (3)
+            nn.Sequential(
+                BasicBlock(64, 64),
+                BasicBlock(64, 64)
+            ), # (4)
+            nn.Sequential(
+                BasicBlock(64, 128, stride=2, downsample=nn.Sequential(
+                    nn.Conv2d(64, 128, kernel_size=1, stride=2, bias=False),
+                    nn.BatchNorm2d(128)
+                )),
+                BasicBlock(128, 128)
+            ), # (5)
+            nn.Sequential(
+                BasicBlock(128, 256, stride=2, downsample=nn.Sequential(
+                    nn.Conv2d(128, 256, kernel_size=1, stride=2, bias=False),
+                    nn.BatchNorm2d(256)
+                )),
+                BasicBlock(256, 256)
+            ), # (6)
+            nn.Sequential(
+                BasicBlock(256, 512, stride=2, downsample=nn.Sequential(
+                    nn.Conv2d(256, 512, kernel_size=1, stride=2, bias=False),
+                    nn.BatchNorm2d(512)
+                )),
+                BasicBlock(512, 512)
+            ) # (7)
+        )
+        self.layer = nn.AdaptiveAvgPool2d((1, None))
+
+    def forward(self, feats, feat_lens):
+        x = feats
+        x = x.unsqueeze(1)
+        x = x.transpose(2, 3)
+        x = self.network(x)
+        x = self.layer(x)
+        x = x.squeeze(2)
+        x = x.transpose(-1, -2) # [N, T*, 512]
+        embed_lens = copy.deepcopy(feat_lens)
+        embed_lens = torch.as_tensor(embed_lens)
+        for i in range(5):
+            embed_lens = (embed_lens - 1) // 2 + 1
+        output_dict = {
+            "audio_embeds": x,
+            "audio_embeds_pooled": x.mean(1),
+            "state": None,
+            "audio_embeds_lens": embed_lens
+        }
+        return output_dict
 
 
 if __name__ == "__main__":
