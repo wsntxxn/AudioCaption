@@ -2,7 +2,7 @@
 import random
 import torch
 
-from models.WordModel import CaptionModel
+from models.word_model import CaptionModel
 
 class TransformerModel(CaptionModel):
 
@@ -14,10 +14,10 @@ class TransformerModel(CaptionModel):
             return self.stepwise_forward(encoded, caps, cap_lens, **kwargs)
         cap_max_len = caps.size(1)
         output = {}
-        self.prepare_output(encoded, output, cap_max_len)
-        caps_padding_mask = (caps == self.pad_idx)
-        caps_padding_mask = torch.cat([torch.tensor([[False]] * caps.size(0), device=caps.device), caps_padding_mask[:, :-1]], dim=1)
-        decoder_output = self.decoder(words=[encoded["audio_embeds_pooled"].unsqueeze(1), caps[:, :-1]], 
+        self.prepare_output(encoded, output, cap_max_len - 1)
+        caps_padding_mask = (caps == self.pad_idx).to(caps.device)
+        caps_padding_mask = caps_padding_mask[:, :-1]
+        decoder_output = self.decoder(words=caps[:, :-1], 
                                       enc_mem=encoded["audio_embeds"],
                                       enc_mem_lens=encoded["audio_embeds_lens"],
                                       caps_padding_mask=caps_padding_mask)
@@ -41,15 +41,13 @@ class TransformerModel(CaptionModel):
         if t == 0:
             decoder_input["enc_mem"] = encoded["audio_embeds"]
             decoder_input["enc_mem_lens"] = encoded["audio_embeds_lens"]
-            words = [encoded["audio_embeds_pooled"].unsqueeze(1),]
+            words = torch.tensor([self.start_idx,] * output["seqs"].size(0)).unsqueeze(1).long()
         else:
-            words = [encoded["audio_embeds_pooled"].unsqueeze(1), output["seqs"][:, :t]]
+            words = output["seqs"][:, :t]
             if caps is not None and random.random() < kwargs["ss_ratio"]: # training, scheduled sampling
-                words = [encoded["audio_embeds_pooled"].unsqueeze(1), caps[:, :t]]
+                words = caps[:, :t]
         decoder_input["words"] = words
-        caps_padding_mask = torch.tensor([[False]] * output["seqs"].size(0), device=encoded["audio_embeds"].device)
-        if len(words) > 1:
-            caps_padding_mask = torch.cat([caps_padding_mask, (words[1] == self.pad_idx).to(encoded["audio_embeds"].device)], dim=1)
+        caps_padding_mask = (words == self.pad_idx).to(encoded["audio_embeds"].device)
         decoder_input["caps_padding_mask"] = caps_padding_mask
 
     def beamsearch_step(self, decoder_input, encoded, output, i, t, beam_size):
@@ -59,19 +57,15 @@ class TransformerModel(CaptionModel):
         return output_t
 
     def prepare_beamsearch_decoder_input(self, decoder_input, encoded, output, i, t, beam_size):
-        w_0 = encoded["audio_embeds_pooled"][i].reshape(1, -1).repeat(beam_size, 1).unsqueeze(1)
         if t == 0:
             enc_mem_lens = encoded["audio_embeds_lens"][i]
             decoder_input["enc_mem_lens"] = enc_mem_lens.repeat(beam_size)
             enc_mem = encoded["audio_embeds"][i, :enc_mem_lens]
             decoder_input["enc_mem"] = enc_mem.unsqueeze(0).repeat(beam_size, 1, 1)
 
-            # w_t = torch.tensor([self.start_idx,] * beam_size).long()
-            words = [w_0,]
+            words = torch.tensor([self.start_idx,] * beam_size).unsqueeze(1).long()
         else:
-            words = [w_0, output["seqs"]]
+            words = output["seqs"]
         decoder_input["words"] = words
-        caps_padding_mask = torch.tensor([[False]] * beam_size, device=encoded["audio_embeds"].device)
-        if len(words) > 1:
-            caps_padding_mask = torch.cat([caps_padding_mask, (words[1] == self.pad_idx)], dim=1)
+        caps_padding_mask = (words == self.pad_idx).to(encoded["audio_embeds"].device)
         decoder_input["caps_padding_mask"] = caps_padding_mask

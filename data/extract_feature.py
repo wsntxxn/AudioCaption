@@ -1,16 +1,30 @@
 # -*- coding: utf-8 -*-
 # @Author: richman
 # @Date:   2018-03-29
-# @Last Modified by:   richman
-# @Last Modified time: 2018-03-29
-import os
-import sys
+# @Last Modified by:   xuenan xu
+# @Last Modified time: 2021-07-02
 import librosa
+import kaldiio
 import numpy as np
+import pandas as pd
 import argparse
 from pathlib import Path
 from tqdm import tqdm as tqdm
 import h5py
+from pypeln import process as pr
+
+
+def load_audio(specifier: str, mono=True):
+    if specifier.endswith("|"):
+        fd = kaldiio.utils.open_like_kaldi(specifier, "rb")
+        mat = kaldiio.matio._load_mat(fd, None)
+        fd.close()
+        sr, y = mat
+        y = y.copy() / 2 ** 15
+    else:
+        assert Path(specifier).exists(), specifier + " not exists!"
+        y, sr = librosa.load(specifier, sr=None, mono=mono)
+    return y, sr
 
 def extractmfcc(y, fs=44100, **mfcc_params):
     eps = np.spacing(1)
@@ -31,12 +45,26 @@ def extractmfcc(y, fs=44100, **mfcc_params):
                                     htk=mfcc_params['htk'])
     mel_spectrum = np.dot(mel_basis, power_spectrogram)
     if mfcc_params['no_mfcc']:
-        return np.log(mel_spectrum+eps)
+        return np.log(mel_spectrum + eps)
     else:
         S = librosa.power_to_db(mel_spectrum)
         return librosa.feature.mfcc(S=S,
                                     n_mfcc=mfcc_params['n_mfcc'])
 
+def extractlms(y, fs=44100, **lms_params):
+    eps = np.spacing(1)
+    mel_spectrum = np.log(librosa.feature.melspectrogram(
+        y, 
+        sr=fs, 
+        n_fft=lms_params['n_fft'],
+        n_mels=lms_params['n_mels'],
+        hop_length=lms_params['hop_length'],
+        win_length=lms_params['win_length'],
+        fmin=lms_params['fmin'],
+        fmax=lms_params['fmax'],
+        htk=lms_params['htk']
+    ) + eps)
+    return mel_spectrum
 
 def extractstft(y, fs=44100, ** params):
     """Extracts short time fourier transform with either energy or power
@@ -82,16 +110,33 @@ def extractraw(y, fs, **params):
 
 parser = argparse.ArgumentParser()
 """ Arguments: wavfilelist, n_mfcc, n_fft, win_length, hop_length, htk, fmin, fmax """
-parser.add_argument('-config', type=argparse.FileType('r'), default=None)
-parser.add_argument('wavfilelist', type=str, default=sys.stdin)
-parser.add_argument('featureout', type=str, default=sys.stdout)
-parser.add_argument('keyout', type=str, default=sys.stdout)
-
+parser.add_argument('wav_csv', type=str)
+parser.add_argument('feat_h5', type=str)
+parser.add_argument('feat_csv', type=str)
 parser.add_argument('-norm', default='mean')
-# parser.add_argument('-concat', default=1, type=int,
-# help="concatenates samples over time")
 parser.add_argument('-nomono', default=False, action="store_true")
+parser.add_argument('--process_num', type=int, default=4)
 subparsers = parser.add_subparsers(help="subcommand help")
+
+stftparser = subparsers.add_parser('stft')
+stftparser.add_argument('-n_fft', type=int, default=2048)
+stftparser.add_argument('-win_length', type=int, default=2048)
+stftparser.add_argument('-hop_length', type=int, default=1024)
+stftparser.add_argument('-center', default=False, action="store_true")
+stftparser.add_argument('-power', default=False, action="store_true")
+stftparser.set_defaults(extractfeat=extractstft)
+
+lmsparser = subparsers.add_parser('lms')
+lmsparser.add_argument('-n_mels', type=int, default=128)
+lmsparser.add_argument('-n_fft', type=int, default=2048)
+lmsparser.add_argument('-win_length', type=int, default=2048)
+lmsparser.add_argument('-hop_length', type=int, default=1024)
+lmsparser.add_argument('-htk', default=False,
+                        action="store_true", help="Uses htk formula for LMS est.")
+lmsparser.add_argument('-fmin', type=int, default=0)
+lmsparser.add_argument('-fmax', type=int, default=8000)
+lmsparser.set_defaults(extractfeat=extractlms)
+
 mfccparser = subparsers.add_parser('mfcc')
 mfccparser.add_argument('-n_mfcc', type=int, default=20)
 mfccparser.add_argument('-n_mels', type=int, default=128)
@@ -102,41 +147,53 @@ mfccparser.add_argument('-htk', default=True,
                         action="store_true", help="Uses htk formula for MFCC est.")
 mfccparser.add_argument('-fmin', type=int, default=12)
 mfccparser.add_argument('-fmax', type=int, default=8000)
-mfccparser.add_argument('-no_mfcc', default=True, action='store_false', help="Does not extract mfcc, rather logmelspect")
-mfccparser.set_defaults(extractfeat=extractmfcc)
-stftparser = subparsers.add_parser('stft')
-stftparser.add_argument('-n_fft', type=int, default=2048)
-stftparser.add_argument('-win_length', type=int, default=2048)
-stftparser.add_argument('-hop_length', type=int, default=1024)
-stftparser.add_argument('-center', default=False, action="store_true")
-stftparser.add_argument('-power', default=False, action="store_true")
-stftparser.set_defaults(extractfeat=extractstft)
+
 rawparser = subparsers.add_parser('raw')
 rawparser.add_argument('-hop_length', type=int, default=1024)
 rawparser.add_argument('-frame_length', type=int, default=2048)
 rawparser.set_defaults(extractfeat=extractraw)
+
 waveletparser = subparsers.add_parser('wave')
 waveletparser.add_argument('-level', default=10, type=int)
 waveletparser.add_argument('-type', default='db4', type=str)
 waveletparser.set_defaults(extractfeat=extractwavelet)
 
-
 args = parser.parse_args()
+if not hasattr(args, "feat_h5"):
+    args.feat_h5 = Path(args.wav_csv).with_name("feat.h5")
+if not hasattr(args, "feat_csv"):
+    args.feat_csv = Path(args.wav_csv).with_name("feat.csv")
+argsdict = vars(args).copy()
 
-argsdict = vars(args)
+del argsdict["extractfeat"]
 
-# Just for TQDM, usually its not that large anyway
-with h5py.File(args.featureout, "w") as feature_store, open(args.keyout, "w") as key_store, open(args.wavfilelist, "r") as wav_reader:
-    for line in tqdm(wav_reader.readlines(), ascii=True, ncols=100):
-        key, filename = line.strip().split()
-        assert Path(filename).exists(), filename + "not exists!"
-        y, sr = librosa.load(filename, sr=None, mono=not args.nomono)
-        # Stereo
+def pypeln_wrapper(extractfeat, **params):
+    def extract(row):
+        row = row[1]
+        y, sr = load_audio(row["file_name"], mono=not args.nomono)
+        # feature = extractfeat(row["file_name"], sr, **params)
         if y.ndim > 1:
-            feat = np.array([args.extractfeat(i, sr, **argsdict) for i in y])
+            feat = np.array([extractfeat(i, sr, **params) for i in y])
         else:
-            feat = args.extractfeat(y, sr, **argsdict)
+            feat = extractfeat(y, sr, **params)
+        return row["audio_id"], feat
+    return extract
+
+wav_df = pd.read_csv(args.wav_csv, sep="\t")
+feat_csv_data = []
+with h5py.File(args.feat_h5, "w") as feat_store, tqdm(total=wav_df.shape[0]) as pbar:
+    for audio_id, feat in pr.map(pypeln_wrapper(args.extractfeat, **argsdict),
+                                 wav_df.iterrows(),
+                                 workers=args.process_num,
+                                 maxsize=4):
         # Transpose feat, nsamples to nsamples, feat
         feat = np.vstack(feat).transpose()
-        feature_store[key] = feat
-        key_store.write(key + "\n")
+        feat_store[audio_id] = feat
+        feat_csv_data.append({
+            "audio_id": audio_id,
+            "hdf5_path": str(Path(args.feat_h5).absolute())
+        })
+        pbar.update()
+
+pd.DataFrame(feat_csv_data).to_csv(args.feat_csv, sep="\t", index=False)
+

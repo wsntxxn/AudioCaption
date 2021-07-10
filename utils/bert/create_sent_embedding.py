@@ -62,6 +62,25 @@ class EmbeddingExtractor(object):
         with open(output, "wb") as f:
             pickle.dump(embeddings, f)
         
+    def extract_sbert(self, 
+                      input_json: str, 
+                      output: str):
+        from sentence_transformers import SentenceTransformer
+        import torch
+        from h5py import File
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model = SentenceTransformer("bert-base-nli-mean-tokens")
+        model = model.to(device)
+        model.eval()
+
+        df = pd.read_json(input_json)
+
+        with torch.no_grad(), tqdm(total=df.shape[0], ascii=True) as pbar, File(output, "w") as store:
+            for idx, row in df.iterrows():
+                caption = row["caption"]
+                store[row["caption_key"]] = model.encode([caption]).squeeze(0)
+                pbar.update()
+
 
 if __name__ == "__main__":
     fire.Fire(EmbeddingExtractor)

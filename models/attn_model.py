@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 
-from models.WordModel import CaptionModel
+from models.word_model import CaptionModel
 
 class Seq2SeqAttention(nn.Module):
 
@@ -97,10 +97,27 @@ class Seq2SeqAttnModel(CaptionModel):
         output["attn_weights"][:, :, t] = output_t["weights"]
         return output_t
 
-    def beamsearch_process_step(self, output):
+    def beamsearch_process_step(self, output, output_t):
+        super().beamsearch_process_step(output, output_t)
         output["attn_weights"] = output["attn_weights"][output["prev_word_inds"], :, :]
 
     def beamsearch_process(self, output, output_i, i):
         output["seqs"][i] = output_i["seqs"][0]
         output["attn_weights"][i] = output_i["attn_weights"][0]
 
+
+class Seq2SeqAttnEnsemble():
+
+    def __init__(self, models, max_length=20) -> None:
+        self.models = models
+        self.max_length = max_length
+        self.end_idx = models[0].end_idx
+    
+    def inference(self, feats, feat_lens):
+        encoded = []
+        for model in self.models:
+            encoded.append(model.encoder(feats, feat_lens))
+
+        N = feats.size(0)
+        output_seqs = torch.empty(N, self.max_length, dtype=torch.long).fill_(self.end_idx)
+        

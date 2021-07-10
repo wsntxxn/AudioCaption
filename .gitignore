@@ -112,22 +112,11 @@ runs/*
 experiments*/*
 
 # Data files
-data/*/*.scp
-data/*/*.ark
-data/*/*.hdf5
-data/*/vocab*
-data/*/*score*
-data/*.scp
-data/*.ark
-data/*.hdf5
-data/*vocab*
-data/*score*
+data/*
+!data/*.py
 
 # Chinese tokenizer and BERT server
 utils/dataserver/*
-
-# Pretrained embeddings
-data/*/embeddings/*
 
 # Backup files
 .backup/*

@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 
+import pdb
 import random
 
 import numpy as np
@@ -19,7 +20,7 @@ class CaptionModel(nn.Module):
     end_idx = 2
     max_length = 20
 
-    def __init__(self, encoder, decoder, **kwargs):
+    def __init__(self, encoder: nn.Module, decoder: nn.Module, **kwargs):
         super(CaptionModel, self).__init__()
         self.encoder = encoder
         self.decoder = decoder
@@ -31,6 +32,10 @@ class CaptionModel(nn.Module):
             assert encoder.network.num_layers == decoder.model.num_layers, \
                 """number of layers not compatible while use hidden!
                 please either set use_hidden as False or use the same number of layers"""
+
+        if "freeze_encoder" in kwargs and kwargs["freeze_encoder"]:
+            for param in self.encoder.parameters():
+                param.requires_grad = False
 
     @classmethod
     def set_index(cls, start_idx, end_idx):
@@ -69,9 +74,11 @@ class CaptionModel(nn.Module):
             return self.stepwise_forward(encoded, caps, cap_lens, **kwargs)
         cap_max_len = caps.size(1)
         output = {}
-        self.prepare_output(encoded, output, cap_max_len)
-        enc_mem = encoded["audio_embeds_pooled"].unsqueeze(1).repeat(1, cap_max_len, 1) # [N, cap_max_len, src_emb_dim]
-        decoder_output = self.decoder(word=[encoded["audio_embeds_pooled"].unsqueeze(1), caps[:, :-1]], state=encoded["state"], enc_mem=enc_mem)
+        self.prepare_output(encoded, output, cap_max_len - 1)
+        enc_mem = encoded["audio_embeds_pooled"].unsqueeze(1).repeat(1, cap_max_len - 1, 1) # [N, cap_max_len-1, src_emb_dim]
+        init_state = encoded["audio_embeds_pooled"].unsqueeze(0)
+        # decoder_output = self.decoder(word=caps[:, :-1], state=encoded["state"], enc_mem=enc_mem)
+        decoder_output = self.decoder(word=caps[:, :-1], state=init_state, enc_mem=enc_mem)
         self.train_process(output, decoder_output, cap_lens)
         return output
 
@@ -90,8 +97,7 @@ class CaptionModel(nn.Module):
     def stepwise_forward(self, encoded, caps, cap_lens, **kwargs):
         """Step-by-step decoding, when `caps` is provided, it means teacher forcing training"""
         if cap_lens is not None: # scheduled sampling training
-            #  max_length = max(cap_lens) - 1
-            max_length = max(cap_lens)
+            max_length = max(cap_lens) - 1
         else: # inference
             max_length = kwargs.get("max_length", self.max_length)
         decoder_input = {}
@@ -117,7 +123,7 @@ class CaptionModel(nn.Module):
         self.prepare_decoder_input(decoder_input, encoded, caps, output, t, **kwargs)
         # feed to the decoder to get states and logits
         output_t = self.decoder(**decoder_input)
-        decoder_input["state"] = output_t["states"]
+        # decoder_input["state"] = output_t["states"]
         logits_t = output_t["logits"].squeeze(1)
         # sample the next input word and get the corresponding logits
         sampled = self.sample_next_word(logits_t, **kwargs)
@@ -127,14 +133,14 @@ class CaptionModel(nn.Module):
         """Prepare the input dict `decoder_input` for the decoder and timestep t"""
         if t == 0:
             decoder_input["state"] = encoded["state"]
+            # decoder_input["state"] = encoded["audio_embeds_pooled"].unsqueeze(0)
             decoder_input["enc_mem"] = encoded["audio_embeds_pooled"].unsqueeze(1)
-            # w_t = torch.tensor([self.start_idx,] * output["seqs"].size(0)).long()
-            w_t = encoded["audio_embeds_pooled"]
+            w_t = torch.tensor([self.start_idx,] * output["seqs"].size(0)).long()
         else:
             w_t = output["seqs"][:, t - 1]
             if caps is not None and random.random() < kwargs["ss_ratio"]: # training, scheduled sampling
-                # w_t = caps[:, t]
-                w_t = caps[:, t - 1]
+                w_t = caps[:, t]
+            decoder_input["state"] = output["state"]
         # w_t: [N,]
         decoder_input["word"] = w_t.unsqueeze(1)
     
@@ -143,6 +149,7 @@ class CaptionModel(nn.Module):
         output["logits"][:, t, :] = output_t["logits"].squeeze(1)
         output["seqs"][:, t] = sampled["w_t"]
         output["sampled_logprobs"][:, t] = sampled["probs"]
+        output["state"] = output_t["states"]
 
     def stepwise_process(self, output):
         """Postprocessing after the whole step-by-step autoregressive decoding"""
@@ -184,14 +191,14 @@ class CaptionModel(nn.Module):
                 else: # unroll and find top logprobs, and their unrolled indices
                     top_k_logprobs, top_k_words = logprobs_t.view(-1).topk(beam_size, 0, True, True)
                 output_i["top_k_logprobs"] = top_k_logprobs
-                output_i["prev_word_inds"] = top_k_words / self.vocab_size  # [beam_size,]
+                output_i["prev_word_inds"] = top_k_words // self.vocab_size  # [beam_size,]
                 output_i["next_word_inds"] = top_k_words % self.vocab_size  # [beam_size,]
                 if t == 0:
                     output_i["seqs"] = output_i["next_word_inds"].unsqueeze(1)
                 else:
                     output_i["seqs"] = torch.cat([output_i["seqs"][output_i["prev_word_inds"]], 
                                                   output_i["next_word_inds"].unsqueeze(1)], dim=1)
-                self.beamsearch_process_step(output_i)
+                self.beamsearch_process_step(output_i, output_t)
             self.beamsearch_process(output, output_i, i)
         return output
 
@@ -201,30 +208,32 @@ class CaptionModel(nn.Module):
     def beamsearch_step(self, decoder_input, encoded, output, i, t, beam_size):
         self.prepare_beamsearch_decoder_input(decoder_input, encoded, output, i, t, beam_size)
         output_t = self.decoder(**decoder_input)
-        decoder_input["state"] = output_t["states"]
+        # decoder_input["state"] = output_t["states"]
         return output_t
 
     def prepare_beamsearch_decoder_input(self, decoder_input, encoded, output, i, t, beam_size):
         if t == 0:
-            # enc_mem = torch.mean(encoded["audio_embeds"][i, :encoded["audio_embeds_lens"][i], :], dim=0)
             enc_mem = encoded["audio_embeds_pooled"][i].reshape(1, -1).repeat(beam_size, 1)
             enc_mem = enc_mem.unsqueeze(1) # [beam_size, 1, enc_mem_size]
             decoder_input["enc_mem"] = enc_mem
 
+            # state = encoded["audio_embeds_pooled"][i]
+            # decoder_input["state"] = state.reshape(1, -1).repeat(beam_size, 1).unsqueeze(0)
             state = encoded["state"]
             if state is not None: # state: [num_layers, N, enc_hid_size]
                 state = state[:, i, :].unsqueeze(1).repeat(1, beam_size, 1)
                 state = state.contiguous() # [num_layers, beam_size, enc_hid_size]
+
             decoder_input["state"] = state
-            #  w_t = torch.tensor([self.start_idx,] * beam_size).long()
-            w_t = encoded["audio_embeds_pooled"][i].reshape(1, -1).repeat(beam_size, 1)
+
+            w_t = torch.tensor([self.start_idx,] * beam_size).long()
         else:
             w_t = output["next_word_inds"]
-            decoder_input["state"] = decoder_input["state"][:, output["prev_word_inds"], :].contiguous()
+            decoder_input["state"] = output["state"][:, output["prev_word_inds"], :].contiguous()
         decoder_input["word"] = w_t.unsqueeze(1)
             
-    def beamsearch_process_step(self, output):
-        pass
+    def beamsearch_process_step(self, output, output_t):
+        output["state"] = output_t["states"]
 
     def beamsearch_process(self, output, output_i, i):
         output["seqs"][i] = output_i["seqs"][0]

@@ -1,53 +1,71 @@
-outputpath: experiments/clotho
+# outputpath: experiments/clotho
 
-#feature_stream: copy-feats scp:data/clotho/logmel_dev.scp ark:- |
-feature_file: data/clotho/logmel.hdf5
-caption_file: data/clotho/dev.json
-vocab_file: data/clotho/vocab.pth
+# feature_file: data/clotho/logmel.hdf5
+# caption_file: data/clotho/dev.json
+# vocab_file: data/clotho/vocab.pth
+outputpath: experiments/audiocaps
+
+feature_file: data/audiocaps/logmel_dev.hdf5
+caption_file_train: data/audiocaps/train.json
+caption_file_val: data/audiocaps/val.json
+vocab_file: data/audiocaps/vocab.pth
 zh: False
 dataloader_args:
-    batch_size: 32
+    batch_size: 128
     num_workers: 4
 train_percent: 90
 augments: []
-#augments: [timemask, freqmask]
+# augments: [timemask, freqmask]
+distributed: False
 
-scaler: StandardScaler # Can be any of sklearn.preprocessing that supports fit_partial
-scaler_args:
-    with_std : True
-    with_mean : True        
+# scaler: StandardScaler # Can be any of sklearn.preprocessing that supports fit_partial
+# scaler_args:
+    # with_std: True
+    # with_mean: True        
 
-encodermodel: CRNNEncoder
+encodermodel: CNN10DEncoder
 encodermodel_args:
-    embed_size: 256
-#pretrained_encoder: experiments/pretrained_encoder/CNN10Q_unbalanced.pth
-decodermodel: RNNDecoder
+    embed_size: 192
+pretrained_encoder: experiments/pretrained_encoder/CNN10Q_unbalanced.pth
+# decodermodel: RNNDecoder
+decodermodel: TransformerDecoder
 decodermodel_args:
-    embed_size: 256
-    dropout: 0.3
-    rnn_type: GRU
-    num_layers: 1
-    hidden_size: 512
-model: CaptionModel 
-model_args: {}
-#pretrained_word_embedding: data/hospital/embeddings/bert_word_zh.npy
+    embed_size: 192
+    dropout: 0.2
+    nhead: 2
+    nlayers: 4
+    # rnn_type: GRU
+    # num_layers: 1
+    # hidden_size: 512
+model: TransformerModel
+model_args:
+    freeze_encoder: False
+load_pretrained: False
+# pretrained: experiments/audiocaps/TransformerModel/2021-01-19_22-20-01_6a70d84e5a6111eba2c173101c24d571/run_model_score=0.6086.pt
+# pretrained_word_embedding: data/hospital/embeddings/bert_word_zh.npy
 
 improvecriterion: score # Can be acc | loss | score
 
 optimizer: Adam
 optimizer_args:
-    lr: 0.0005
-    weight_decay: 0.0
-epochs: 25
-early_stop: 5
-scheduler: ReduceLROnPlateau
+    lr: 0.0003
+    weight_decay: 0.000001
+max_grad_norm: 2.5
+epochs: 50
+# scheduler: ReduceLROnPlateau
+# scheduler_args:
+    # mode: min
+    # factor: 0.1
+    # patience: 5
+    # threshold: 0.001
+scheduler: ExponentialLR
 scheduler_args:
-    mode: min
-    factor: 0.1
-    patience: 5
-    threshold: 0.001
+    gamma: 0.98
 
 ss: False
 ss_args:
     ss_mode: exponential
     ss_ratio: 1.0
+
+label_smoothing: True
+smoothing: 0.1

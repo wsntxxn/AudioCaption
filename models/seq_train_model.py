@@ -8,21 +8,17 @@ from utils import score_util
 
 class ScstWrapper(nn.Module):
 
-    def __init__(self, model, vocabulary):
+    def __init__(self, model):
         super(ScstWrapper, self).__init__()
         self.model = model
-        self.vocabulary = vocabulary
 
     def forward(self, *input, **kwargs):
         """Decode audio feature vectors and generates captions.
         """
-        if len(input) != 4 and len(input) != 2:
-            raise Exception("number of input should be either 4 (feats, feat_lens, keys, key2refs) or 2 (feats, feat_lens)!")
-
-        if len(input) == 4:
-            feats, feat_lens, keys, key2refs = input
-        else:
-            feats, feat_lens = input
+        if len(input) != 5 and len(input) != 2:
+            raise Exception(
+                "number of input should be either 5 (feats, feat_lens, keys, key2refs, vocabulary) \
+                or 2 (feats, feat_lens)!")
 
         if len(input) == 2:
             output = self.model(*input, **kwargs)
@@ -30,7 +26,7 @@ class ScstWrapper(nn.Module):
             output = self.scst(*input, **kwargs)
         return output
 
-    def scst(self, feats, feat_lens, keys, key2refs, **kwargs):
+    def scst(self, feats, feat_lens, keys, key2refs, vocabulary, **kwargs):
         output = {}
 
         sample_kwargs = {
@@ -52,6 +48,7 @@ class ScstWrapper(nn.Module):
                                                      sampled["seqs"],
                                                      keys,
                                                      key2refs,
+                                                     vocabulary,
                                                      kwargs["scorer"])
         # reward: [N, ]
         output["reward"] = torch.as_tensor(reward_score["reward"])
@@ -71,8 +68,8 @@ class ScstWrapper(nn.Module):
 
         return output
 
-    def get_self_critical_reward(self, greedy_seqs, sampled_seqs, 
-                                 keys, key2refs, scorer):
+    def get_self_critical_reward(self, greedy_seqs, sampled_seqs,
+                                 keys, key2refs, vocabulary, scorer):
         # greedy_seqs, sampled_seqs: [N, max_length]
         greedy_seqs = greedy_seqs.cpu().numpy()
         sampled_seqs = sampled_seqs.cpu().numpy()
@@ -82,14 +79,14 @@ class ScstWrapper(nn.Module):
                                                        keys,
                                                        self.model.start_idx,
                                                        self.model.end_idx,
-                                                       self.vocabulary,
+                                                       vocabulary,
                                                        scorer)
         greedy_score = score_util.compute_batch_score(greedy_seqs, 
                                                       key2refs,
                                                       keys,
                                                       self.model.start_idx,
                                                       self.model.end_idx,
-                                                      self.vocabulary,
+                                                      vocabulary,
                                                       scorer)
         reward = sampled_score - greedy_score
         return {"reward": reward, "score": sampled_score}

@@ -64,27 +64,40 @@ def encode_labels(labels: pd.Series, encoder=None):
 
 
 def parse_config_or_kwargs(config_file, **kwargs):
-    with open(config_file) as con_read:
-        yaml_config = yaml.load(con_read, Loader=yaml.FullLoader)
+    with open(config_file) as con_reader:
+        yaml_config = yaml.load(con_reader, Loader=yaml.FullLoader)
     # passed kwargs will override yaml config
     return dict(yaml_config, **kwargs)
 
 
-def parse_augments(augment_list):
-    """parse_transforms
-    parses the transformation string in configuration file to corresponding methods
+def store_yaml(config, config_file):
+    with open(config_file, "w") as con_writer:
+        yaml.dump(config, con_writer, default_flow_style=False)
 
-    :param transform_list: list
+
+def parse_augments(augment_list):
+    """parse_augments
+    parses the augmentation string in configuration file to corresponding methods
+
+    :param augment_list: list
     """
     from datasets import augment
 
+    specaug_kwargs = {"timemask": False, "freqmask": False, "timewarp": False}
     augments = []
     for transform in augment_list:
         if transform == "timemask":
-            augments.append(augment.TimeMask(1, 50))
+            specaug_kwargs["timemask"] = True
         elif transform == "freqmask":
-            augments.append(augment.FreqMask(1, 10))
-    return torch.nn.Sequential(*augments)
+            specaug_kwargs["freqmask"] = True
+        elif transform == "timewarp":
+            specaug_kwargs["timewarp"] = True
+        elif transform == "randomcrop":
+            augments.append(augment.random_crop)
+        elif transform == "timeroll":
+            augments.append(augment.time_roll)
+    augments.append(augment.spec_augment(**specaug_kwargs))
+    return augments
 
 
 def criterion_improver(mode):
@@ -104,21 +117,17 @@ def criterion_improver(mode):
     return inner
 
 
-def on_training_started(engine, outputfun=sys.stdout.write, header=[]):
-    outputfun("<== Training Started ==>")
-    for line in tp.header(header, style="grid").split("\n"):
-        outputfun(line)
-
-
 def log_results(engine,
-                cv_evaluator, 
-                cv_dataloader, 
+                optimizer,
+                val_evaluator,
+                val_dataloader,
                 outputfun=sys.stdout.write,
-                train_metrics=["loss", "accuracy"], 
-                cv_metrics=["loss", "accuracy"]):
+                train_metrics=["loss", "accuracy"],
+                val_metrics=["loss", "accuracy"],
+                ):
     train_results = engine.state.metrics
-    cv_evaluator.run(cv_dataloader)
-    cv_results = cv_evaluator.state.metrics
+    val_evaluator.run(val_dataloader)
+    val_results = val_evaluator.state.metrics
     output_str_list = [
         "Validation Results - Epoch : {:<4}".format(engine.state.epoch)
     ]
@@ -128,14 +137,20 @@ def log_results(engine,
             output = output.item()
         output_str_list.append("{} {:<5.2g} ".format(
             metric, output))
-    for metric in cv_metrics:
-        output = cv_results[metric]
+    for metric in val_metrics:
+        output = val_results[metric]
         if isinstance(output, torch.Tensor):
             output = output.item()
         output_str_list.append("{} {:5<.2g} ".format(
             metric, output))
+    lr = optimizer.param_groups[0]["lr"]
+    output_str_list.append(f"lr {lr:5<.2g} ")
 
     outputfun(" ".join(output_str_list))
+
+
+def run_val(engine, evaluator, dataloader):
+    evaluator.run(dataloader)
 
 
 def save_model_on_improved(engine,
@@ -148,12 +163,9 @@ def save_model_on_improved(engine,
     # torch.save(dump, str(Path(save_path).parent / "model.last.pth"))
 
 
-def on_training_ended(engine, n, outputfun=sys.stdout.write):
-    outputfun(tp.bottom(n, style="grid"))
-
-
-def update_lr(engine, scheduler, metric):
+def update_lr(engine, scheduler, metric=None):
     if scheduler.__class__.__name__ == "ReduceLROnPlateau":
+        assert metric is not None, "need validation metric for ReduceLROnPlateau"
         val_result = engine.state.metrics[metric]
         scheduler.step(val_result)
     else:
@@ -203,4 +215,28 @@ def max_with_lens(features, lens):
     feature_max[~mask] = float("-inf")
     feature_max, _ = feature_max.max(1)
     return feature_max
+
+
+class LabelSmoothingLoss(torch.nn.Module):
+    def __init__(self, classes, smoothing=0.0, dim=-1):
+        super(LabelSmoothingLoss, self).__init__()
+        self.confidence = 1.0 - smoothing
+        self.smoothing = smoothing
+        self.cls = classes
+        self.dim = dim
+
+    def forward(self, logit, target):
+        pred = logit.log_softmax(dim=self.dim)
+        with torch.no_grad():
+            # true_dist = pred.data.clone()
+            true_dist = torch.zeros_like(pred)
+            true_dist.fill_(self.smoothing / (self.cls - 1))
+            true_dist.scatter_(1, target.data.unsqueeze(1), self.confidence)
+        return torch.mean(torch.sum(-true_dist * pred, dim=self.dim))
+
+
+def fix_batchnorm(model):
+    classname = model.__class__.__name__
+    if classname.find("BatchNorm") != -1:
+        model.eval()
 
