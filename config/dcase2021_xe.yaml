@@ -1,0 +1,51 @@
+outputpath: experiments/clotho_v2/
+remark: pretraincnn10_xe
+
+h5_csv: data/clotho_v2/dev_val/lms.csv
+caption_file: data/clotho_v2/dev_val/text.json
+vocab_file: data/clotho_v2/dev_val/vocab.pkl
+zh: False
+dataloader_args:
+    batch_size: 32
+    num_workers: 4
+train_percent: 90
+augments: [timemask, freqmask]
+distributed: False
+
+encodermodel: CNN10QEncoder
+encodermodel_args: 
+    embed_size: 512
+pretrained_encoder: experiments/pretrained_encoder/cnn10_unbalanced.pth
+decodermodel: RNNBahdanauAttnDecoder
+decodermodel_args:
+    embed_size: 512
+    rnn_type: GRU
+    num_layers: 1
+    hidden_size: 512
+    dropout: 0.5
+model: Seq2SeqAttnModel
+model_args: {}
+
+improvecriterion: score # Can be acc | loss | score
+
+optimizer: Adam
+optimizer_args:
+    lr: 0.0005
+    weight_decay: 0.0
+max_grad_norm: 0.5
+scheduler: ReduceLROnPlateau
+scheduler_args:
+    mode: min
+    factor: 0.1
+    patience: 5
+    threshold: 0.001
+epochs: 25
+
+ss: True
+ss_args:
+    ss_mode: linear
+    ss_ratio: 1.0
+    final_ss_ratio: 0.7
+
+label_smoothing: True
+smoothing: 0.1

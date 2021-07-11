@@ -19,7 +19,6 @@ def process(split: str,
     wav_csv_df = []
     audio_path = audio_path / split
     for _, row in df.iterrows():
-        # audio_id = row["audio_id"]
         raw_file_name = Path(row["file_name"]).stem
         audio_id = hashlib.md5(f"{split}_{raw_file_name}".encode()).hexdigest()
         encoded_file_name = f"{audio_id}.wav"
@@ -36,31 +35,30 @@ def process(split: str,
             })
         data.append(item)
     data = { "audios": data }
-    # wav_scp_writer.close()
     pd.DataFrame(wav_csv_df).to_csv(output_path / "wav.csv", index=False, sep="\t")
     json.dump(data, open(output_path / "text.json", "w"), indent=4)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("clotho_annotation", type=str, help="clotho annotation directory, containing {dev,val,eval}.csv")
-    parser.add_argument("clotho_audio", type=str, help="clotho audio directory, containing at least {dev,val,eval} subdirectory")
-    parser.add_argument("encoded_audio", type=str, help="path used as the new audio directory, where filenames are encoded to remove special characters and soft linked to the original file")
+    parser.add_argument("clotho_root_dir", type=str, help="clotho dataset directory, containing at least `annotation/{dev,eval}.csv` and `audio/{dev/eval}`")
     parser.add_argument("output_path", type=str, default="clotho_v2", help="directory to store processed data files")
+    parser.add_argument("--version", type=int, default=2, help="clotho dataset version, 1 or 2", choices=[1, 2])
     args = parser.parse_args()
 
-    audio_path = args.clotho_audio
-    encoded_audio_path = args.encoded_audio
-    annotation_path = args.clotho_annotation
-    output_path = args.output_path
-    audio_path = Path(audio_path)
-    annotation_path = Path(annotation_path)
-    output_path = Path(output_path)
-    encoded_audio_path = Path(encoded_audio_path)
+    data_root_dir = Path(args.clotho_root_dir)
+    output_path = Path(args.output_path)
+    audio_path = data_root_dir / "audio"
+    annotation_path = data_root_dir / "annotation"
+    encoded_audio_path = output_path / "hashed_audio"
     if encoded_audio_path.exists():
         shutil.rmtree(encoded_audio_path)
     encoded_audio_path.mkdir(parents=True, exist_ok=True)
-    for split in ["dev", "val", "eval"]:
+    if args.version == 1:
+        splits = ["dev", "eval"]
+    else:
+        splits = ["dev", "val", "eval"]
+    for split in splits:
         process(split, annotation_path, audio_path, encoded_audio_path, output_path)
 
 
