@@ -114,6 +114,7 @@ experiments*/*
 # Data files
 data/*
 !data/*.py
+!data/README.md
 
 # Chinese tokenizer and BERT server
 utils/dataserver/*
