@@ -42,10 +42,10 @@ All configurations are stored in `config/*.yaml`, where parameters like model ty
 ```bash
 python runners/run.py train config/clotho_xe.yaml
 ```
-The training script will use all configurations specified in `config/xe.yaml`.
+The training script will use all configurations specified in `config/clotho_xe.yaml`.
 They can also be switched by passing `--ARG VALUE`, e.g., if you want to use scheduled sampling, you can run:
 ```bash
-python runners/run.py train config/xe.yaml --ss True
+python runners/run.py train config/clotho_xe.yaml --ss True
 ```
 
 ## DCASE2021 onfiguration and training
