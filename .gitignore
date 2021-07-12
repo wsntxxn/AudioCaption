@@ -127,3 +127,6 @@ utils/dataserver/*
 
 # Slurm logs
 logs/
+
+# Sed support
+sed/

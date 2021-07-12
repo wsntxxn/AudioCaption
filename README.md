@@ -40,7 +40,7 @@ All configurations are stored in `config/*.yaml`, where parameters like model ty
 
 ## Start training
 ```bash
-python runners/run.py train config/xe.yaml
+python runners/run.py train config/clotho_xe.yaml
 ```
 The training script will use all configurations specified in `config/xe.yaml`.
 They can also be switched by passing `--ARG VALUE`, e.g., if you want to use scheduled sampling, you can run:
