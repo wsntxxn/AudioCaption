@@ -1,71 +1,162 @@
 # -*- coding: utf-8 -*-
 import random
 import torch
+import torch.nn as nn
 
-from models.word_model import CaptionModel
+from captioning.models.base_model import CaptionModel
+from captioning.models.utils import repeat_tensor
+import captioning.models.decoder
 
 class TransformerModel(CaptionModel):
 
-    def __init__(self, encoder, decoder, **kwargs):
-        super(TransformerModel, self).__init__(encoder, decoder, **kwargs)
+    def __init__(self, encoder: nn.Module, decoder: nn.Module, **kwargs):
+        if not hasattr(self, "compatible_decoders"):
+            self.compatible_decoders = (
+                captioning.models.decoder.TransformerDecoder
+            )
+        super().__init__(encoder, decoder, **kwargs)
 
-    def train_forward(self, encoded, caps, cap_lens, **kwargs):
-        if kwargs["ss_ratio"] != 1: # scheduled sampling training
-            return self.stepwise_forward(encoded, caps, cap_lens, **kwargs)
-        cap_max_len = caps.size(1)
-        output = {}
-        self.prepare_output(encoded, output, cap_max_len - 1)
+    def seq_forward(self, input_dict):
+        caps = input_dict["caps"]
         caps_padding_mask = (caps == self.pad_idx).to(caps.device)
         caps_padding_mask = caps_padding_mask[:, :-1]
-        decoder_output = self.decoder(words=caps[:, :-1], 
-                                      enc_mem=encoded["audio_embeds"],
-                                      enc_mem_lens=encoded["audio_embeds_lens"],
-                                      caps_padding_mask=caps_padding_mask)
-        self.train_process(output, decoder_output, cap_lens)
+        output = self.decoder(
+            {
+                "word": caps[:, :-1],
+                "attn_embs": input_dict["attn_embs"],
+                "attn_emb_lens": input_dict["attn_emb_lens"],
+                "caps_padding_mask": caps_padding_mask
+            }
+        )
         return output
 
-    def decode_step(self, decoder_input, encoded, caps, output, t, **kwargs):
-        """Decoding operation of timestep t"""
-        self.prepare_decoder_input(decoder_input, encoded, caps, output, t, **kwargs)
-        # feed to the decoder to get states and logits
-        output_t = self.decoder(**decoder_input)
-        logits_t = output_t["logits"][:, -1, :]
-        output_t["logits"] = logits_t.unsqueeze(1)
-        # sample the next input word and get the corresponding logits
-        sampled = self.sample_next_word(logits_t, **kwargs)
-        self.stepwise_process_step(output, output_t, t, sampled)
-
-    def prepare_decoder_input(self, decoder_input, encoded, caps, output, t, **kwargs):
-        """Prepare the input dict `decoder_input` for the decoder and timestep t"""
-        super(TransformerModel, self).prepare_decoder_input(decoder_input, encoded, caps, output, t, **kwargs)
-        if t == 0:
-            decoder_input["enc_mem"] = encoded["audio_embeds"]
-            decoder_input["enc_mem_lens"] = encoded["audio_embeds_lens"]
-            words = torch.tensor([self.start_idx,] * output["seqs"].size(0)).unsqueeze(1).long()
+    def prepare_decoder_input(self, input_dict, output):
+        decoder_input = {
+            "attn_embs": input_dict["attn_embs"],
+            "attn_emb_lens": input_dict["attn_emb_lens"]
+        }
+        t = input_dict["t"]
+        
+        ###############
+        # determine input word
+        ################
+        if input_dict["mode"] == "train" and random.random() < input_dict["ss_ratio"]: # training, scheduled sampling
+            word = input_dict["caps"][:, :t+1]
         else:
-            words = output["seqs"][:, :t]
-            if caps is not None and random.random() < kwargs["ss_ratio"]: # training, scheduled sampling
-                words = caps[:, :t]
-        decoder_input["words"] = words
-        caps_padding_mask = (words == self.pad_idx).to(encoded["audio_embeds"].device)
+            start_word = torch.tensor([self.start_idx,] * input_dict["attn_embs"].size(0)).unsqueeze(1).long()
+            if t == 0:
+                word = start_word
+            else:
+                word = torch.cat((start_word, output["seqs"][:, :t]), dim=-1)
+        # word: [N, T]
+        decoder_input["word"] = word
+
+        caps_padding_mask = (word == self.pad_idx).to(input_dict["attn_embs"].device)
+        decoder_input["caps_padding_mask"] = caps_padding_mask
+        return decoder_input
+
+    def prepare_beamsearch_decoder_input(self, input_dict, output_i):
+        decoder_input = {}
+        t = input_dict["t"]
+        i = input_dict["sample_idx"]
+        beam_size = input_dict["beam_size"]
+        ###############
+        # prepare attn embeds
+        ################
+        if t == 0:
+            attn_embs = repeat_tensor(input_dict["attn_embs"][i], beam_size)
+            attn_emb_lens = repeat_tensor(input_dict["attn_emb_lens"][i], beam_size)
+            output_i["attn_embs"] = attn_embs
+            output_i["attn_emb_lens"] = attn_emb_lens
+        decoder_input["attn_embs"] = output_i["attn_embs"]
+        decoder_input["attn_emb_lens"] = output_i["attn_emb_lens"]
+        ###############
+        # determine input word
+        ################
+        start_word = torch.tensor([self.start_idx,] * beam_size).unsqueeze(1).long()
+        if t == 0:
+            word = start_word
+        else:
+            word = torch.cat((start_word, output_i["seqs"]), dim=-1)
+        decoder_input["word"] = word
+        caps_padding_mask = (word == self.pad_idx).to(input_dict["attn_embs"].device)
         decoder_input["caps_padding_mask"] = caps_padding_mask
 
-    def beamsearch_step(self, decoder_input, encoded, output, i, t, beam_size):
-        self.prepare_beamsearch_decoder_input(decoder_input, encoded, output, i, t, beam_size)
-        output_t = self.decoder(**decoder_input)
-        output_t["logits"] = output_t["logits"][:, -1, :].unsqueeze(1)
-        return output_t
+        return decoder_input
 
-    def prepare_beamsearch_decoder_input(self, decoder_input, encoded, output, i, t, beam_size):
-        if t == 0:
-            enc_mem_lens = encoded["audio_embeds_lens"][i]
-            decoder_input["enc_mem_lens"] = enc_mem_lens.repeat(beam_size)
-            enc_mem = encoded["audio_embeds"][i, :enc_mem_lens]
-            decoder_input["enc_mem"] = enc_mem.unsqueeze(0).repeat(beam_size, 1, 1)
 
-            words = torch.tensor([self.start_idx,] * beam_size).unsqueeze(1).long()
+class M2TransformerModel(CaptionModel):
+
+    def __init__(self, encoder: nn.Module, decoder: nn.Module, **kwargs):
+        if not hasattr(self, "compatible_decoders"):
+            self.compatible_decoders = (
+                captioning.models.decoder.M2TransformerDecoder
+            )
+        super().__init__(encoder, decoder, **kwargs)
+        self.check_encoder_compatibility()
+
+    def check_encoder_compatibility(self):
+        assert isinstance(self.encoder, captioning.models.encoder.M2TransformerEncoder), \
+            f"only M2TransformerModel is compatible with {self.__class__.__name__}"
+
+
+    def seq_forward(self, input_dict):
+        caps = input_dict["caps"]
+        output = self.decoder(
+            {
+                "word": caps[:, :-1],
+                "attn_embs": input_dict["attn_embs"],
+                "attn_emb_mask": input_dict["attn_emb_mask"],
+            }
+        )
+        return output
+
+    def prepare_decoder_input(self, input_dict, output):
+        decoder_input = {
+            "attn_embs": input_dict["attn_embs"],
+            "attn_emb_mask": input_dict["attn_emb_mask"]
+        }
+        t = input_dict["t"]
+        
+        ###############
+        # determine input word
+        ################
+        if input_dict["mode"] == "train" and random.random() < input_dict["ss_ratio"]: # training, scheduled sampling
+            word = input_dict["caps"][:, :t+1]
         else:
-            words = output["seqs"]
-        decoder_input["words"] = words
-        caps_padding_mask = (words == self.pad_idx).to(encoded["audio_embeds"].device)
-        decoder_input["caps_padding_mask"] = caps_padding_mask
+            start_word = torch.tensor([self.start_idx,] * input_dict["attn_embs"].size(0)).unsqueeze(1).long()
+            if t == 0:
+                word = start_word
+            else:
+                word = torch.cat((start_word, output["seqs"][:, :t]), dim=-1)
+        # word: [N, T]
+        decoder_input["word"] = word
+
+        return decoder_input
+
+    def prepare_beamsearch_decoder_input(self, input_dict, output_i):
+        decoder_input = {}
+        t = input_dict["t"]
+        i = input_dict["sample_idx"]
+        beam_size = input_dict["beam_size"]
+        ###############
+        # prepare attn embeds
+        ################
+        if t == 0:
+            attn_embs = repeat_tensor(input_dict["attn_embs"][i], beam_size)
+            attn_emb_mask = repeat_tensor(input_dict["attn_emb_mask"][i], beam_size)
+            output_i["attn_embs"] = attn_embs
+            output_i["attn_emb_mask"] = attn_emb_mask
+        decoder_input["attn_embs"] = output_i["attn_embs"]
+        decoder_input["attn_emb_mask"] = output_i["attn_emb_mask"]
+        ###############
+        # determine input word
+        ################
+        start_word = torch.tensor([self.start_idx,] * beam_size).unsqueeze(1).long()
+        if t == 0:
+            word = start_word
+        else:
+            word = torch.cat((start_word, output_i["seqs"]), dim=-1)
+        decoder_input["word"] = word
+
+        return decoder_input

@@ -4,14 +4,17 @@ import torch
 
 class ExponentialDecayScheduler(torch.optim.lr_scheduler._LRScheduler):
 
-    def __init__(self, optimizer, total_iters,final_lrs, linear_warmup=False, warmup_iters=3000, last_epoch=-1, verbose=False):
+    def __init__(self, optimizer, total_iters, final_lrs, warmup_iters=3000, last_epoch=-1, verbose=False):
         self.total_iters = total_iters
         self.final_lrs = final_lrs
-        self.linear_warmup = linear_warmup
         if not isinstance(self.final_lrs, list) and not isinstance(self.final_lrs, tuple):
             self.final_lrs = [self.final_lrs] * len(optimizer.param_groups)
         self.warmup_iters = warmup_iters
+        self.bases = [0.0,] * len(optimizer.param_groups)
         super().__init__(optimizer, last_epoch, verbose)
+        for i, (base_lr, final_lr) in enumerate(zip(self.base_lrs, self.final_lrs)):
+            base = (final_lr / base_lr) ** (1 / (self.total_iters - self.warmup_iters))
+            self.bases[i] = base
 
     def _get_closed_form_lr(self):
         warmup_coeff = 1.0
@@ -19,17 +22,19 @@ class ExponentialDecayScheduler(torch.optim.lr_scheduler._LRScheduler):
         if current_iter < self.warmup_iters:
             warmup_coeff = current_iter / self.warmup_iters
         current_lrs = []
-        if not self.linear_warmup:
-            for base_lr, final_lr in zip(self.base_lrs, self.final_lrs):
-                current_lr = warmup_coeff * base_lr * math.exp(((current_iter - self.warmup_iters) / self.total_iters) * math.log(final_lr / base_lr))
-                current_lrs.append(current_lr)
-        else:
-            for base_lr, final_lr in zip(self.base_lrs, self.final_lrs):
-                if current_iter <= self.warmup_iters:
-                    current_lr = warmup_coeff * base_lr
-                else:
-                    current_lr = warmup_coeff * base_lr * math.exp(((current_iter - self.warmup_iters) / self.total_iters) * math.log(final_lr / base_lr))
-                current_lrs.append(current_lr)
+        # if not self.linear_warmup:
+            # for base_lr, final_lr, base in zip(self.base_lrs, self.final_lrs, self.bases):
+                # # current_lr = warmup_coeff * base_lr * math.exp(((current_iter - self.warmup_iters) / self.total_iters) * math.log(final_lr / base_lr))
+                # current_lr = warmup_coeff * base_lr * (base ** (current_iter - self.warmup_iters))
+                # current_lrs.append(current_lr)
+        # else:
+        for base_lr, final_lr, base in zip(self.base_lrs, self.final_lrs, self.bases):
+            if current_iter <= self.warmup_iters:
+                current_lr = warmup_coeff * base_lr
+            else:
+                # current_lr = warmup_coeff * base_lr * math.exp(((current_iter - self.warmup_iters) / self.total_iters) * math.log(final_lr / base_lr))
+                current_lr = base_lr * (base ** (current_iter - self.warmup_iters))
+            current_lrs.append(current_lr)
         return current_lrs
 
     def get_lr(self):
@@ -38,17 +43,20 @@ class ExponentialDecayScheduler(torch.optim.lr_scheduler._LRScheduler):
 
 class NoamScheduler(torch.optim.lr_scheduler._LRScheduler):
 
-    def __init__(self, optimizer, model_size=512, warmup_iters=3000, last_epoch=-1, verbose=False):
+    def __init__(self, optimizer, model_size=512, factor=1, warmup_iters=3000, last_epoch=-1, verbose=False):
         self.model_size = model_size
         self.warmup_iters = warmup_iters
-        self.factors = [group["lr"] / (self.model_size ** (-0.5) * self.warmup_iters ** (-0.5)) for group in optimizer.param_groups]
+        # self.factors = [group["lr"] / (self.model_size ** (-0.5) * self.warmup_iters ** (-0.5)) for group in optimizer.param_groups]
+        self.factor = factor
         super().__init__(optimizer, last_epoch, verbose)
 
     def _get_closed_form_lr(self):
         current_iter = self._step_count
         current_lrs = []
-        for factor in self.factors:
-            current_lr = factor * self.model_size ** (-0.5) * min(current_iter ** (-0.5), current_iter * self.warmup_iters ** (-1.5))
+        for _ in self.base_lrs:
+            current_lr = self.factor * \
+                (self.model_size ** (-0.5) * 
+                min(current_iter ** (-0.5), current_iter * self.warmup_iters ** (-1.5)))
             current_lrs.append(current_lr)
         return current_lrs
 
@@ -60,8 +68,8 @@ if __name__ == "__main__":
     model = torch.nn.Linear(10, 5)
     optimizer = torch.optim.Adam(model.parameters(), 0.0005)
     epochs = 25
-    iters = 687
-    scheduler = ExponentialDecayScheduler(optimizer, 687 * 26, 5e-6, True)
+    iters = 600
+    scheduler = ExponentialDecayScheduler(optimizer, 600 * 25, 5e-6)
     criterion = torch.nn.MSELoss()
     lrs = []
     for epoch in range(1, epochs + 1):
@@ -74,7 +82,8 @@ if __name__ == "__main__":
             optimizer.step()
             scheduler.step()
             # print(f"lr: {scheduler.get_last_lr()}")
-            lrs.append(scheduler.get_last_lr())
+            # lrs.append(scheduler.get_last_lr())
+            lrs.append(optimizer.param_groups[0]["lr"])
     import matplotlib.pyplot as plt
     plt.plot(list(range(1, len(lrs) + 1)), lrs, '-o', markersize=1)
     plt.legend(loc="best")

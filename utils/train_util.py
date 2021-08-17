@@ -10,8 +10,6 @@ import pandas as pd
 import sklearn.preprocessing as pre
 from pprint import pformat
 
-sys.path.append(os.getcwd())
-
 def genlogger(outputfile, level="INFO"):
     formatter = logging.Formatter(
         "[ %(levelname)s : %(asctime)s ] - %(message)s")
@@ -27,7 +25,6 @@ def genlogger(outputfile, level="INFO"):
     # logger.addHandler(stdhandler)
     return logger
 
-
 def pprint_dict(in_dict, outputfun=sys.stdout.write, formatter='yaml'):
     """pprint_dict
 
@@ -40,7 +37,6 @@ def pprint_dict(in_dict, outputfun=sys.stdout.write, formatter='yaml'):
         format_fun = pformat
     for line in format_fun(in_dict).split('\n'):
         outputfun(line)
-
 
 def encode_labels(labels: pd.Series, encoder=None):
     """encode_labels
@@ -58,18 +54,23 @@ def encode_labels(labels: pd.Series, encoder=None):
     labels_encoded = encoder.transform(labels)
     return labels_encoded.tolist(), encoder
 
-
 def parse_config_or_kwargs(config_file, **kwargs):
+    default_args = {
+        "distributed": False,
+        "swa": True,
+        "swa_start": 21
+    }
     with open(config_file) as con_reader:
         yaml_config = yaml.load(con_reader, Loader=yaml.FullLoader)
     # passed kwargs will override yaml config
-    return dict(yaml_config, **kwargs)
-
+    args = dict(yaml_config, **kwargs)
+    for key, value in default_args.items():
+        args.setdefault(key, value)
+    return args
 
 def store_yaml(config, config_file):
     with open(config_file, "w") as con_writer:
         yaml.dump(config, con_writer, default_flow_style=False)
-
 
 def parse_augments(augment_list):
     """parse_augments
@@ -77,7 +78,7 @@ def parse_augments(augment_list):
 
     :param augment_list: list
     """
-    from datasets import augment
+    from captioning.datasets import augment
 
     specaug_kwargs = {"timemask": False, "freqmask": False, "timewarp": False}
     augments = []
@@ -95,7 +96,6 @@ def parse_augments(augment_list):
     augments.append(augment.spec_augment(**specaug_kwargs))
     return augments
 
-
 def criterion_improver(mode):
     assert mode in ("loss", "acc", "score")
     best_value = np.inf if mode == "loss" else 0
@@ -112,127 +112,65 @@ def criterion_improver(mode):
         return False
     return inner
 
-
-def log_results(engine,
-                optimizer,
-                val_evaluator,
-                val_dataloader,
-                outputfun=sys.stdout.write,
-                train_metrics=["loss", "accuracy"],
-                val_metrics=["loss", "accuracy"],
-                ):
-    train_results = engine.state.metrics
-    val_evaluator.run(val_dataloader)
-    val_results = val_evaluator.state.metrics
-    output_str_list = [
-        "Validation Results - Epoch : {:<4}".format(engine.state.epoch)
-    ]
-    for metric in train_metrics:
-        output = train_results[metric]
-        if isinstance(output, torch.Tensor):
-            output = output.item()
-        output_str_list.append("{} {:<5.2g} ".format(
-            metric, output))
-    for metric in val_metrics:
-        output = val_results[metric]
-        if isinstance(output, torch.Tensor):
-            output = output.item()
-        output_str_list.append("{} {:5<.2g} ".format(
-            metric, output))
-    lr = optimizer.param_groups[0]["lr"]
-    output_str_list.append(f"lr {lr:5<.2g} ")
-
-    outputfun(" ".join(output_str_list))
-
-
 def run_val(engine, evaluator, dataloader):
     evaluator.run(dataloader)
 
+# def generate_length_mask(lens):
+    # lens = torch.as_tensor(lens)
+    # N = lens.size(0)
+    # T = max(lens)
+    # idxs = torch.arange(T).repeat(N).view(N, T)
+    # mask = (idxs < lens.view(-1, 1))
+    # return mask
 
-def save_model_on_improved(engine,
-                           criterion_improved, 
-                           metric_key,
-                           dump,
-                           save_path):
-    if criterion_improved(engine.state.metrics[metric_key]):
-        torch.save(dump, save_path)
-    # torch.save(dump, str(Path(save_path).parent / "model.last.pth"))
+# def mean_with_lens(features, lens):
+    # """
+    # features: [N, T, ...] (assume the second dimension represents length)
+    # lens: [N,]
+    # """
+    # lens = torch.as_tensor(lens)
+    # mask = generate_length_mask(lens).to(features.device) # [N, T]
 
+    # feature_mean = features * mask.unsqueeze(-1)
+    # feature_mean = feature_mean.sum(1) / lens.unsqueeze(1).to(features.device)
+    # return feature_mean
 
-def update_lr(engine, scheduler, metric=None):
-    if scheduler.__class__.__name__ == "ReduceLROnPlateau":
-        assert metric is not None, "need validation metric for ReduceLROnPlateau"
-        val_result = engine.state.metrics[metric]
-        scheduler.step(val_result)
-    else:
-        scheduler.step()
+# def max_with_lens(features, lens):
+    # """
+    # features: [N, T, ...] (assume the second dimension represents length)
+    # lens: [N,]
+    # """
+    # lens = torch.as_tensor(lens)
+    # mask = generate_length_mask(lens).to(features.device) # [N, T]
 
+    # feature_max = features.clone()
+    # feature_max[~mask] = float("-inf")
+    # feature_max, _ = feature_max.max(1)
+    # return feature_max
 
-def update_ss_ratio(engine, config, num_iter):
-    num_epoch = config["epochs"]
-    mode = config["ss_args"]["ss_mode"]
-    if mode == "exponential":
-        config["ss_args"]["ss_ratio"] = 0.01 ** (1.0 / num_epoch / num_iter)
-    elif mode == "linear":
-        config["ss_args"]["ss_ratio"] -= (1.0 - config["ss_args"]["final_ss_ratio"]) / num_epoch / num_iter
+def fix_batchnorm(model: torch.nn.Module):
+    # classname = model.__class__.__name__
+    # if classname.find("BatchNorm") != -1:
+        # model.eval()
+    def inner(module):
+        class_name = module.__class__.__name__
+        if class_name.find("BatchNorm") != -1:
+            module.eval()
+    model.apply(inner)
 
+def load_pretrained_model(model: torch.nn.Module, pretrained, outputfun):
+    if not os.path.exists(pretrained):
+        outputfun(f"Loading pretrained model from {pretrained} failed!")
+        return
+    state_dict = torch.load(pretrained, map_location="cpu")
+    if "model" in state_dict:
+        state_dict = state_dict["model"]
+    model_dict = model.state_dict()
+    pretrained_dict = {
+        k: v for k, v in state_dict.items() if (k in model_dict) and (
+            model_dict[k].shape == v.shape)
+    }
+    model_dict.update(pretrained_dict)
+    model.load_state_dict(model_dict, strict=True)
 
-def generate_length_mask(lens):
-    lens = torch.as_tensor(lens)
-    N = lens.size(0)
-    T = max(lens)
-    idxs = torch.arange(T).repeat(N).view(N, T)
-    mask = (idxs < lens.view(-1, 1))
-    return mask
-
-
-def mean_with_lens(features, lens):
-    """
-    features: [N, T, ...] (assume the second dimension represents length)
-    lens: [N,]
-    """
-    lens = torch.as_tensor(lens)
-    mask = generate_length_mask(lens).to(features.device) # [N, T]
-
-    feature_mean = features * mask.unsqueeze(-1)
-    feature_mean = feature_mean.sum(1) / lens.unsqueeze(1).to(features.device)
-    return feature_mean
-
-
-def max_with_lens(features, lens):
-    """
-    features: [N, T, ...] (assume the second dimension represents length)
-    lens: [N,]
-    """
-    lens = torch.as_tensor(lens)
-    mask = generate_length_mask(lens).to(features.device) # [N, T]
-
-    feature_max = features.clone()
-    feature_max[~mask] = float("-inf")
-    feature_max, _ = feature_max.max(1)
-    return feature_max
-
-
-class LabelSmoothingLoss(torch.nn.Module):
-    def __init__(self, classes, smoothing=0.0, dim=-1):
-        super(LabelSmoothingLoss, self).__init__()
-        self.confidence = 1.0 - smoothing
-        self.smoothing = smoothing
-        self.cls = classes
-        self.dim = dim
-
-    def forward(self, logit, target):
-        pred = logit.log_softmax(dim=self.dim)
-        with torch.no_grad():
-            # true_dist = pred.data.clone()
-            true_dist = torch.zeros_like(pred)
-            true_dist.fill_(self.smoothing / (self.cls - 1))
-            true_dist.scatter_(1, target.data.unsqueeze(1), self.confidence)
-        return torch.mean(torch.sum(-true_dist * pred, dim=self.dim))
-
-
-def fix_batchnorm(model):
-    classname = model.__class__.__name__
-    if classname.find("BatchNorm") != -1:
-        model.eval()
 

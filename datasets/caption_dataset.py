@@ -1,47 +1,65 @@
 import math
-import gc
 import random
-import sys
 from typing import List, Optional, Dict, Tuple
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import torch
 import h5py
 
-sys.path.append(str(Path.cwd()))
-from utils.build_vocab import Vocabulary
+from captioning.utils.build_vocab import Vocabulary
 
 class CaptionEvalDataset(torch.utils.data.Dataset):
     
     def __init__(self,
-                 h5file_dict: Dict,
+                 raw_audio_to_h5: Dict,
+                 fc_audio_to_h5: Dict,
+                 attn_audio_to_h5: Dict,
                  transform: Optional[List] = None):
         """audio captioning dataset object for inference and evaluation
 
         Args:
-            h5file_dict (Dict): Dictionary (<audio_id>: <hdf5_path>)
+            raw_audio_to_h5 (Dict): Dictionary (<audio_id>: <hdf5_path>)
+            fc_audio_to_h5 (Dict): Dictionary (<audio_id>: <hdf5_path>)
+            attn_audio_to_h5 (Dict): Dictionary (<audio_id>: <hdf5_path>)
             transform (List, optional): Defaults to None. Transformation onto the data (List of function)
         """
-        self._h5file_dict = h5file_dict
-        self._audio_ids = list(self._h5file_dict.keys())
+        self._raw_audio_to_h5 = raw_audio_to_h5
+        self._fc_audio_to_h5 = fc_audio_to_h5
+        self._attn_audio_to_h5 = attn_audio_to_h5
+        self._audio_ids = list(self._raw_audio_to_h5.keys())
         self._dataset_cache = {}
         self._transform = transform
-        first_audio_id = next(iter(self._h5file_dict.keys()))
-        with h5py.File(self._h5file_dict[first_audio_id], 'r') as store:
-            self.data_dim = store[first_audio_id].shape[-1]
+        first_audio_id = next(iter(self._raw_audio_to_h5.keys()))
+        with h5py.File(self._raw_audio_to_h5[first_audio_id], 'r') as store:
+            self.raw_feat_dim = store[first_audio_id].shape[-1]
+        with h5py.File(self._fc_audio_to_h5[first_audio_id], 'r') as store:
+            self.fc_feat_dim = store[first_audio_id].shape[-1]
+        with h5py.File(self._attn_audio_to_h5[first_audio_id], 'r') as store:
+            self.attn_feat_dim = store[first_audio_id].shape[-1]
 
     def __getitem__(self, index):
         audio_id = self._audio_ids[index]
-        h5_path = self._h5file_dict[audio_id]
-        if not audio_id in self._dataset_cache:
-            self._dataset_cache[audio_id] = h5py.File(h5_path, "r")
-        feature = self._dataset_cache[audio_id][audio_id][()]
+
+        raw_feat_h5 = self._raw_audio_to_h5[audio_id]
+        if not raw_feat_h5 in self._dataset_cache:
+            self._dataset_cache[raw_feat_h5] = h5py.File(raw_feat_h5, "r")
+        raw_feat = self._dataset_cache[raw_feat_h5][audio_id][()]
+
+        fc_feat_h5 = self._fc_audio_to_h5[audio_id]
+        if not fc_feat_h5 in self._dataset_cache:
+            self._dataset_cache[fc_feat_h5] = h5py.File(fc_feat_h5, "r")
+        fc_feat = self._dataset_cache[fc_feat_h5][audio_id][()]
+
+        attn_feat_h5 = self._attn_audio_to_h5[audio_id]
+        if not attn_feat_h5 in self._dataset_cache:
+            self._dataset_cache[attn_feat_h5] = h5py.File(attn_feat_h5, "r")
+        attn_feat = self._dataset_cache[attn_feat_h5][audio_id][()]
+
         if self._transform:
             for transform in self._transform:
-                feature = transform(feature)
-        return audio_id, torch.as_tensor(feature)
+                raw_feat = transform(raw_feat)
+        return audio_id, torch.as_tensor(raw_feat), torch.as_tensor(fc_feat), torch.as_tensor(attn_feat)
 
     def __len__(self):
         return len(self._audio_ids)
@@ -53,16 +71,14 @@ class CaptionEvalDataset(torch.utils.data.Dataset):
                     cache.close()
                 except:
                     pass
-        # for obj in gc.get_objects():
-            # if isinstance(obj, h5py.File):
-                # obj.close()
-        
 
 
 class CaptionDataset(CaptionEvalDataset):
 
     def __init__(self,
-                 h5file_dict: Dict,
+                 raw_audio_to_h5: Dict,
+                 fc_audio_to_h5: Dict,
+                 attn_audio_to_h5: Dict,
                  caption_info: List,
                  vocabulary: Vocabulary,
                  transform: Optional[List] = None):
@@ -73,10 +89,9 @@ class CaptionDataset(CaptionEvalDataset):
             vocabulary (Vocabulary): Preloaded vocabulary object 
             transform (List, optional): Defaults to None. Transformation onto the data (List of function)
         """
-        super().__init__(h5file_dict, transform)
+        super().__init__(raw_audio_to_h5, fc_audio_to_h5, attn_audio_to_h5, transform)
         # Important!!! reset audio id list, otherwise there is problem in matching!
         self._audio_ids = [info["audio_id"] for info in caption_info]
-        self._dataset_cache = {}
         self._caption_info = caption_info
         self._vocabulary = vocabulary
 
@@ -85,7 +100,7 @@ class CaptionDataset(CaptionEvalDataset):
         index: Tuple (<audio_idx>, <cap_idx>)
         """
         audio_idx, cap_idx = index
-        audio_id, feature = super().__getitem__(audio_idx)
+        audio_id, raw_feat, fc_feat, attn_feat = super().__getitem__(audio_idx)
         if "raw_name" in self._caption_info[audio_idx]:
             audio_id = self._caption_info[audio_idx]["raw_name"]
         # cap_id = self._caption_info[audio_idx]["captions"][cap_idx]["cap_id"]
@@ -94,7 +109,7 @@ class CaptionDataset(CaptionEvalDataset):
             [self._vocabulary(token) for token in tokens] + \
             [self._vocabulary('<end>')]
         caption = torch.as_tensor(caption)
-        return feature, caption, audio_id
+        return raw_feat, fc_feat, attn_feat, caption, audio_id
 
     def __len__(self):
         length = 0
@@ -102,35 +117,6 @@ class CaptionDataset(CaptionEvalDataset):
             length += len(audio_item["captions"])
         return length
 
-
-class CaptionSentenceDataset(CaptionDataset):
-
-    def __init__(self, feature: str, caption_df: pd.DataFrame, vocabulary: Vocabulary,
-            sentence_embedding: np.ndarray, transform: Optional[List] = None):
-        super().__init__(feature,
-            caption_df, vocabulary, transform)
-        self.sentence_embedding = sentence_embedding
-
-    def __getitem__(self, index: int):
-        feature, caption, dataid = super().__getitem__(index)
-        caption_id = self._caption_df.iloc[index]["caption_index"]
-        sentence_embedding = self.sentence_embedding["{}_{}".format(dataid, caption_id)]
-        sentence_embedding = torch.as_tensor(sentence_embedding)
-        return feature, caption, sentence_embedding, dataid
-
-
-class CaptionInstanceDataset(CaptionDataset):
-
-    def __init__(self, feature: str, caption_df: pd.DataFrame,
-            vocabulary: Vocabulary, transform: Optional[List] = None):
-        super().__init__(feature,
-            caption_df, vocabulary, transform)
-    
-    def __getitem__(self, index: int):
-        feature, caption, dataid = super().__getitem__(index)
-        caption_id = self._caption_df.iloc[index]["caption_index"] - 1
-        caption_id = torch.tensor(caption_id)
-        return feature, caption, caption_id, dataid
 
 class CaptionSampler(torch.utils.data.Sampler):
 

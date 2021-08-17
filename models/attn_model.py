@@ -1,123 +1,193 @@
+import random
 import torch
-import torch.nn as nn
 
-from models.word_model import CaptionModel
-
-class Seq2SeqAttention(nn.Module):
-
-    def __init__(self, hs_enc, hs_dec, attn_size):
-        """
-        Args:
-            hs_enc: encoder hidden size
-            hs_dec: decoder hidden size
-            attn_size: attention vector size
-        """
-        super(Seq2SeqAttention, self).__init__()
-        self.h2attn = nn.Linear(hs_enc + hs_dec, attn_size)
-        self.v = nn.Parameter(torch.randn(attn_size))
-        nn.init.kaiming_uniform_(self.h2attn.weight)
-
-    def forward(self, h_dec, h_enc, src_lens):
-        """
-        Args:
-            h_dec: decoder hidden state, [N, hs_dec]
-            h_enc: encoder hiddens/outputs, [N, src_max_len, hs_enc]
-            src_lens: source (encoder input) lengths, [N, ]
-        """
-        N = h_enc.size(0)
-        src_max_len = h_enc.size(1)
-        h_dec = h_dec.unsqueeze(1).repeat(1, src_max_len, 1) # [N, src_max_len, hs_dec]
-
-        attn_input = torch.cat((h_dec, h_enc), dim=-1)
-        attn_out = torch.tanh(self.h2attn(attn_input)) # [N, src_max_len, attn_size]
-
-        v = self.v.repeat(N, 1).unsqueeze(1) # [N, 1, attn_size]
-        # score = torch.bmm(v, attn_out.permute(0, 2, 1)).squeeze(1) # [N, src_max_len]
-        score = (v@attn_out.permute(0, 2, 1)).squeeze(1) # [N, src_max_len]
-
-        idxs = torch.arange(src_max_len).repeat(N).view(N, src_max_len)
-        mask = (idxs < src_lens.view(-1, 1)).to(h_dec.device)
-
-        score = score.masked_fill(mask == 0, -1e10)
-        weights = torch.softmax(score, dim=-1) # [N, src_max_len]
-        # ctx = torch.bmm(weights.unsqueeze(1), h_enc).squeeze(1) # [N, hs_enc]
-        ctx = (weights.unsqueeze(1)@h_enc).squeeze(1) # [N, hs_enc]
-
-        return ctx, weights
-
+from captioning.models.base_model import CaptionModel
+from captioning.models.utils import repeat_tensor
+import captioning.models.decoder
 
 class Seq2SeqAttnModel(CaptionModel):
 
     def __init__(self, encoder, decoder, **kwargs):
-        super(Seq2SeqAttnModel, self).__init__(encoder, decoder, **kwargs)
+        if not hasattr(self, "compatible_decoders"):
+            self.compatible_decoders = (
+                captioning.models.decoder.BahAttnDecoder,
+                captioning.models.decoder.BahAttnDecoder2,
+                captioning.models.decoder.BahAttnDecoder3,
+            )
+        super().__init__(encoder, decoder, **kwargs)
 
-    def train_forward(self, encoded, caps, cap_lens, **kwargs):
+
+    def seq_forward(self, input_dict):
         # Bahdanau attention only supports step-by-step implementation, so we implement forward in 
         # step-by-step manner whether in training or evaluation
-        return self.stepwise_forward(encoded, caps, cap_lens, **kwargs)
+        return self.stepwise_forward(input_dict)
 
-    def prepare_output(self, encoded, output, max_length):
-        super(Seq2SeqAttnModel, self).prepare_output(encoded, output, max_length)
-        attn_weights = torch.empty(output["seqs"].size(0), max(encoded["audio_embeds_lens"]), max_length)
+    def prepare_output(self, input_dict):
+        output = super().prepare_output(input_dict)
+        attn_weights = torch.empty(output["seqs"].size(0),
+                                   input_dict["attn_embs"].size(1),
+                                   output["seqs"].size(1))
         output["attn_weights"] = attn_weights
+        return output
 
-    def prepare_decoder_input(self, decoder_input, encoded, caps, output, t, **kwargs):
-        super(Seq2SeqAttnModel, self).prepare_decoder_input(decoder_input, encoded, caps, output, t, **kwargs)
-        if t == 0:
-            decoder_input["enc_mem"] = encoded["audio_embeds"]
-            decoder_input["enc_mem_lens"] = encoded["audio_embeds_lens"]
-            if encoded["state"] is None:
-                state = self.decoder.init_hidden(output["seqs"].size(0))
-                state = state.to(encoded["audio_embeds"].device)
-                decoder_input["state"] = state
+    def prepare_decoder_input(self, input_dict, output):
+        decoder_input = {
+            "fc_embs": input_dict["fc_embs"],
+            "attn_embs": input_dict["attn_embs"],
+            "attn_emb_lens": input_dict["attn_emb_lens"]
+        }
+        t = input_dict["t"]
+        ###############
+        # determine input word
+        ################
+        if input_dict["mode"] == "train" and random.random() < input_dict["ss_ratio"]: # training, scheduled sampling
+            word = input_dict["caps"][:, t]
+        else:
+            if t == 0:
+                word = torch.tensor([self.start_idx,] * input_dict["fc_embs"].size(0)).long()
+            else:
+                word = output["seqs"][:, t-1]
+        # word: [N,]
+        decoder_input["word"] = word.unsqueeze(1)
 
-        # decoder_input: { "word": ..., "state": ..., "enc_mem": ..., "enc_mem_lens": ... }
+        ################
+        # prepare rnn state
+        ################
+        if t > 0:
+            decoder_input["state"] = output["state"]
+        return decoder_input
 
-    def stepwise_process_step(self, output, output_t, t, sampled):
-        super(Seq2SeqAttnModel, self).stepwise_process_step(output, output_t, t, sampled)
+    def stepwise_process_step(self, output, output_t):
+        super().stepwise_process_step(output, output_t)
+        output["state"] = output_t["state"]
+        t = output_t["t"]
         output["attn_weights"][:, :, t] = output_t["weights"]
 
-    def prepare_beamsearch_output(self, output, beam_size, encoded, max_length):
-        super(Seq2SeqAttnModel, self).prepare_beamsearch_output(output, beam_size, encoded, max_length)
-        output["attn_weights"] = torch.empty(beam_size, max(encoded["audio_embeds_lens"]), max_length)
+    def prepare_beamsearch_output(self, input_dict):
+        output = super().prepare_beamsearch_output(input_dict)
+        beam_size = input_dict["beam_size"]
+        max_length = input_dict["max_length"]
+        output["attn_weights"] = torch.empty(beam_size,
+                                             max(input_dict["attn_emb_lens"]),
+                                             max_length)
+        return output
 
-    def prepare_beamsearch_decoder_input(self, decoder_input, encoded, output, i, t, beam_size):
-        super(Seq2SeqAttnModel, self).prepare_beamsearch_decoder_input(decoder_input, encoded, output, i, t, beam_size)
+    def prepare_beamsearch_decoder_input(self, input_dict, output_i):
+        decoder_input = {}
+        t = input_dict["t"]
+        i = input_dict["sample_idx"]
+        beam_size = input_dict["beam_size"]
+        ###############
+        # prepare fc embeds
+        ################
         if t == 0:
-            enc_mem = encoded["audio_embeds"][i]
-            decoder_input["enc_mem"] = enc_mem.unsqueeze(0).repeat(beam_size, 1, 1)
-            enc_mem_lens = encoded["audio_embeds_lens"][i]
-            decoder_input["enc_mem_lens"] = enc_mem_lens.repeat(beam_size)
-            if decoder_input["state"] is None:
-                decoder_input["state"] = self.decoder.init_hidden(beam_size)
-                decoder_input["state"] = decoder_input["state"].to(decoder_input["enc_mem"].device)
+            fc_embs = repeat_tensor(input_dict["fc_embs"][i], beam_size)
+            output_i["fc_embs"] = fc_embs
+        decoder_input["fc_embs"] = output_i["fc_embs"]
 
-    def beamsearch_step(self, decoder_input, encoded, output, i, t, beam_size):
-        output_t = super(Seq2SeqAttnModel, self).beamsearch_step(decoder_input, encoded, output, i, t, beam_size)
-        output["attn_weights"][:, :, t] = output_t["weights"]
-        return output_t
+        ###############
+        # prepare attn embeds
+        ################
+        if t == 0:
+            attn_embs = repeat_tensor(input_dict["attn_embs"][i], beam_size)
+            attn_emb_lens = repeat_tensor(input_dict["attn_emb_lens"][i], beam_size)
+            output_i["attn_embs"] = attn_embs
+            output_i["attn_emb_lens"] = attn_emb_lens
+        decoder_input["attn_embs"] = output_i["attn_embs"]
+        decoder_input["attn_emb_lens"] = output_i["attn_emb_lens"]
 
-    def beamsearch_process_step(self, output, output_t):
-        super().beamsearch_process_step(output, output_t)
-        output["attn_weights"] = output["attn_weights"][output["prev_word_inds"], :, :]
+        ###############
+        # determine input word
+        ################
+        if t == 0:
+            word = torch.tensor([self.start_idx,] * beam_size).long()
+        else:
+            word = output_i["next_word"]
+        decoder_input["word"] = word.unsqueeze(1)
 
-    def beamsearch_process(self, output, output_i, i):
-        output["seqs"][i] = output_i["seqs"][0]
+        ################
+        # prepare rnn state
+        ################
+        if t > 0:
+            if self.decoder.rnn_type == "LSTM":
+                decoder_input["state"] = (output_i["state"][0][:, output_i["prev_words_beam"], :].contiguous(),
+                                          output_i["state"][1][:, output_i["prev_words_beam"], :].contiguous())
+            else:
+                decoder_input["state"] = output_i["state"][:, output_i["prev_words_beam"], :].contiguous()
+
+        return decoder_input
+
+    def beamsearch_process_step(self, output_i, output_t):
+        t = output_t["t"]
+        output_i["state"] = output_t["state"]
+        output_i["attn_weights"][..., t] = output_t["weights"]
+        output_i["attn_weights"] = output_i["attn_weights"][output_i["prev_words_beam"], ...]
+
+    def beamsearch_process(self, output, output_i, input_dict):
+        super().beamsearch_process(output, output_i, input_dict)
+        i = input_dict["sample_idx"]
         output["attn_weights"][i] = output_i["attn_weights"][0]
-
-
-class Seq2SeqAttnEnsemble():
-
-    def __init__(self, models, max_length=20) -> None:
-        self.models = models
-        self.max_length = max_length
-        self.end_idx = models[0].end_idx
-    
-    def inference(self, feats, feat_lens):
-        encoded = []
-        for model in self.models:
-            encoded.append(model.encoder(feats, feat_lens))
-
-        N = feats.size(0)
-        output_seqs = torch.empty(N, self.max_length, dtype=torch.long).fill_(self.end_idx)
         
+
+class Seq2SeqAttnModel2(Seq2SeqAttnModel):
+
+    def __init__(self, encoder, decoder, **kwargs):
+        if not hasattr(self, "compatible_decoders"):
+            self.compatible_decoders = (
+                captioning.models.decoder.BahAttnDecoder3,
+            )
+        super().__init__(encoder, decoder, **kwargs)
+        assert decoder.start_by_fc, "must feed fc when t = 0"
+
+    def prepare_output(self, input_dict):
+        output = {}
+        batch_size = input_dict["fc_embs"].size(0)
+        if input_dict["mode"] == "train":
+            max_length = input_dict["caps"].size(1)
+        elif input_dict["mode"] == "inference":
+            max_length = input_dict["max_length"]
+        else:
+            raise Exception("mode should be either 'train' or 'inference'")
+        device = input_dict["fc_embs"].device
+        output["seqs"] = torch.empty(batch_size, max_length, dtype=torch.long).fill_(self.end_idx)
+        output["logits"] = torch.empty(batch_size, max_length, self.vocab_size).to(device)
+        output["sampled_logprobs"] = torch.zeros(batch_size, max_length)
+        output["embeds"] = torch.empty(batch_size, max_length, self.decoder.d_model).to(device)
+        attn_weights = torch.empty(output["seqs"].size(0),
+                                   input_dict["attn_embs"].size(1),
+                                   output["seqs"].size(1))
+        output["attn_weights"] = attn_weights
+        return output
+
+    def prepare_decoder_input(self, input_dict, output):
+        decoder_input = super().prepare_decoder_input(input_dict, output)
+        t = input_dict["t"]
+        ###############
+        # determine input word
+        ################
+        if input_dict["mode"] == "train" and random.random() < input_dict["ss_ratio"]: # training, scheduled sampling
+            if t == 0:
+                word = input_dict["fc_embs"]
+            else:
+                word = input_dict["caps"][:, t-1].unsqueeze(1)
+        else:
+            if t == 0:
+                word = input_dict["fc_embs"]
+            else:
+                word = output["seqs"][:, t-1].unsqueeze(1)
+        # word: [N,]
+        decoder_input["word"] = word
+        return decoder_input
+
+    def prepare_beamsearch_decoder_input(self, input_dict, output_i):
+        decoder_input = super().prepare_beamsearch_decoder_input(input_dict, output_i)
+        ###############
+        # determine input word
+        ################
+        if input_dict["t"] == 0:
+            word = decoder_input["fc_embs"]
+        else:
+            word = output_i["next_word"].unsqueeze(1)
+        decoder_input["word"] = word
+        return decoder_input
+

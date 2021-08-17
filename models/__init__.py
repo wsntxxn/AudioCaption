@@ -1,6 +1,6 @@
-from .encoder import *
-from .decoder import *
-from .word_model import *
-from .seq_train_model import *
+from .base_model import *
+from .fc_model import *
 from .attn_model import *
 from .transformer_model import *
+from .rl_model import *
+

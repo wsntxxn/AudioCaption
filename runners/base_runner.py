@@ -1,10 +1,8 @@
 import json
 import pickle
-import os
 import random
 from pathlib import Path
 from typing import List
-import sys
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
@@ -13,10 +11,8 @@ import torch
 from ignite.engine.engine import Engine
 from ignite.contrib.handlers import ProgressBar
 
-sys.path.append(os.getcwd())
-import utils.train_util as train_util
-# from datasets.caption_dataset import CaptionDataset, CaptionEvalDataset, CaptionSampler, collate_fn
-import datasets.caption_dataset as ac_dataset
+import captioning.utils.train_util as train_util
+import captioning.datasets.caption_dataset as ac_dataset
 
 class BaseRunner(object):
     """Main class to run experiments"""
@@ -35,22 +31,30 @@ class BaseRunner(object):
             torch.backends.cudnn.benchmark = False
         self.device = torch.device(device)
 
-    def _get_dataloaders(self, config, vocabulary):
+    def _get_dataloaders(self, config):
         augments = train_util.parse_augments(config["augments"])
         if config["distributed"]:
             config["dataloader_args"]["batch_size"] //= self.world_size
 
-        if "caption_file" in config:
-            h5file_df = pd.read_csv(config["h5_csv"], sep="\t")
-            h5file_dict = dict(zip(h5file_df["audio_id"], h5file_df["hdf5_path"]))
-            caption_info = json.load(open(config["caption_file"], "r"))["audios"]
-            val_size = int(len(caption_info) * (1 - config["train_percent"] / 100.))
+        data_config = config["data"]
+        vocabulary = pickle.load(open(data_config["vocab_file"], "rb"))
+        if "train" not in data_config:
+            raw_feat_df = pd.read_csv(data_config["raw_feat_csv"], sep="\t")
+            raw_audio_to_h5 = dict(zip(raw_feat_df["audio_id"], raw_feat_df["hdf5_path"]))
+            fc_feat_df = pd.read_csv(data_config["fc_feat_csv"], sep="\t")
+            fc_audio_to_h5 = dict(zip(fc_feat_df["audio_id"], fc_feat_df["hdf5_path"]))
+            attn_feat_df = pd.read_csv(data_config["attn_feat_csv"], sep="\t")
+            attn_audio_to_h5 = dict(zip(attn_feat_df["audio_id"], attn_feat_df["hdf5_path"]))
+            caption_info = json.load(open(data_config["caption_file"], "r"))["audios"]
+            val_size = int(len(caption_info) * (1 - data_config["train_percent"] / 100.))
             val_audio_idxs = np.random.choice(len(caption_info), val_size, replace=False)
             train_audio_idxs = [idx for idx in range(len(caption_info)) if idx not in val_audio_idxs]
             train_dataset = ac_dataset.CaptionDataset(
-                h5file_dict=h5file_dict,
-                caption_info=caption_info,
-                vocabulary=vocabulary,
+                raw_audio_to_h5,
+                fc_audio_to_h5,
+                attn_audio_to_h5,
+                caption_info,
+                vocabulary,
                 transform=augments
             )
             # TODO DistributedCaptionSampler
@@ -58,17 +62,19 @@ class BaseRunner(object):
             train_sampler = ac_dataset.CaptionSampler(train_dataset, train_audio_idxs, True)
             train_dataloader = torch.utils.data.DataLoader(
                 train_dataset,
-                collate_fn=ac_dataset.collate_fn([0, 1], 1),
+                collate_fn=ac_dataset.collate_fn([0, 2, 3], 3),
                 sampler=train_sampler,
                 **config["dataloader_args"]
             )
             val_audio_ids = [caption_info[audio_idx]["audio_id"] for audio_idx in val_audio_idxs]
             val_dataset = ac_dataset.CaptionEvalDataset(
-                h5file_dict={audio_id: h5file_dict[audio_id] for audio_id in val_audio_ids}
+                {audio_id: raw_audio_to_h5[audio_id] for audio_id in val_audio_ids},
+                {audio_id: fc_audio_to_h5[audio_id] for audio_id in val_audio_ids},
+                {audio_id: attn_audio_to_h5[audio_id] for audio_id in val_audio_ids},
             )
             val_dataloader = torch.utils.data.DataLoader(
                 val_dataset,
-                collate_fn=ac_dataset.collate_fn([1]),
+                collate_fn=ac_dataset.collate_fn([1, 3]),
                 **config["dataloader_args"]
             )
             train_key2refs = {}
@@ -76,24 +82,32 @@ class BaseRunner(object):
                 audio_id = caption_info[audio_idx]["audio_id"]
                 train_key2refs[audio_id] = []
                 for caption in caption_info[audio_idx]["captions"]:
-                    train_key2refs[audio_id].append(caption["token" if config["zh"] else "caption"])
+                    train_key2refs[audio_id].append(caption["token" if data_config["zh"] else "caption"])
             val_key2refs = {}
             for audio_idx in val_audio_idxs:
                 audio_id = caption_info[audio_idx]["audio_id"]
                 val_key2refs[audio_id] = []
                 for caption in caption_info[audio_idx]["captions"]:
-                    val_key2refs[audio_id].append(caption["token" if config["zh"] else "caption"])
+                    val_key2refs[audio_id].append(caption["token" if data_config["zh"] else "caption"])
         else:
-            train_h5file_df = pd.read_csv(config["train_h5_csv"], sep="\t")
-            train_h5file_dict = dict(zip(train_h5file_df["audio_id"], train_h5file_df["hdf5_path"]))
-            train_caption_info = json.load(open(config["train_caption_file"], "r"))["audios"]
-            val_h5file_df = pd.read_csv(config["val_h5_csv"], sep="\t")
-            val_h5file_dict = dict(zip(val_h5file_df["audio_id"], val_h5file_df["hdf5_path"]))
-            val_caption_info = json.load(open(config["val_caption_file"], "r"))["audios"]
+            data = {"train": {}, "val": {}}
+            for split in ["train", "val"]:
+                conf_split = data_config[split]
+                output = data[split]
+                raw_feat_df = pd.read_csv(conf_split["raw_feat_csv"], sep="\t")
+                output["raw_audio_to_h5"] = dict(zip(raw_feat_df["audio_id"], raw_feat_df["hdf5_path"]))
+                fc_feat_df = pd.read_csv(conf_split["fc_feat_csv"], sep="\t")
+                output["fc_audio_to_h5"] = dict(zip(fc_feat_df["audio_id"], fc_feat_df["hdf5_path"]))
+                attn_feat_df = pd.read_csv(conf_split["attn_feat_csv"], sep="\t")
+                output["attn_audio_to_h5"] = dict(zip(attn_feat_df["audio_id"], attn_feat_df["hdf5_path"]))
+                output["caption_info"] = json.load(open(conf_split["caption_file"], "r"))["audios"]
+
             train_dataset = ac_dataset.CaptionDataset(
-                h5file_dict=train_h5file_dict,
-                caption_info=train_caption_info,
-                vocabulary=vocabulary,
+                data["train"]["raw_audio_to_h5"],
+                data["train"]["fc_audio_to_h5"],
+                data["train"]["attn_audio_to_h5"],
+                data["train"]["caption_info"],
+                vocabulary,
                 transform=augments
             )
             # TODO DistributedCaptionSampler
@@ -101,30 +115,36 @@ class BaseRunner(object):
             train_sampler = ac_dataset.CaptionSampler(train_dataset, shuffle=True)
             train_dataloader = torch.utils.data.DataLoader(
                 train_dataset,
-                collate_fn=ac_dataset.collate_fn([0, 1], 1),
+                collate_fn=ac_dataset.collate_fn([0, 2, 3], 3),
                 sampler=train_sampler,
                 **config["dataloader_args"]
             )
             val_dataset = ac_dataset.CaptionEvalDataset(
-                h5file_dict=val_h5file_dict
+                data["val"]["raw_audio_to_h5"],
+                data["val"]["fc_audio_to_h5"],
+                data["val"]["attn_audio_to_h5"],
             )
             val_dataloader = torch.utils.data.DataLoader(
                 val_dataset,
-                collate_fn=ac_dataset.collate_fn([1]),
+                collate_fn=ac_dataset.collate_fn([1, 3]),
                 **config["dataloader_args"]
             )
             train_key2refs = {}
-            for audio_idx in range(len(train_caption_info)):
-                audio_id = train_caption_info[audio_idx]["audio_id"]
+            caption_info = data["train"]["caption_info"]
+            for audio_idx in range(len(caption_info)):
+                audio_id = caption_info[audio_idx]["audio_id"]
                 train_key2refs[audio_id] = []
-                for caption in train_caption_info[audio_idx]["captions"]:
-                    train_key2refs[audio_id].append(caption["token" if config["zh"] else "caption"])
+                for caption in caption_info[audio_idx]["captions"]:
+                    train_key2refs[audio_id].append(
+                        caption["token" if config["zh"] else "caption"])
             val_key2refs = {}
-            for audio_idx in range(len(val_caption_info)):
-                audio_id = val_caption_info[audio_idx]["audio_id"]
+            caption_info = data["val"]["caption_info"]
+            for audio_idx in range(len(caption_info)):
+                audio_id = caption_info[audio_idx]["audio_id"]
                 val_key2refs[audio_id] = []
-                for caption in val_caption_info[audio_idx]["captions"]:
-                    val_key2refs[audio_id].append(caption["token" if config["zh"] else "caption"])
+                for caption in caption_info[audio_idx]["captions"]:
+                    val_key2refs[audio_id].append(
+                        caption["token" if config["zh"] else "caption"])
 
         return {
             "train_dataloader": train_dataloader,
@@ -134,7 +154,7 @@ class BaseRunner(object):
         }
 
     @staticmethod
-    def _get_model(config, vocab_size):
+    def _get_model(config):
         raise NotImplementedError
 
     def _forward(self, model, batch, mode, **kwargs):
@@ -144,7 +164,7 @@ class BaseRunner(object):
     def _convert_idx2sentence(word_ids, vocabulary, zh=False):
         candidate = []
         for word_id in word_ids:
-            word = vocabulary.idx2word[word_id]
+            word = vocabulary[word_id]
             if word == "<end>":
                 break
             elif word == "<start>":
@@ -195,36 +215,76 @@ class BaseRunner(object):
 
     def evaluate(self,
                  experiment_path: str,
-                 h5file_csv: str,
-                 caption_file: str,
-                 caption_embedding_path=None,
+                 task: str,
+                 save_type: str = "best",
                  caption_output: str = "eval_output.json",
                  score_output: str = "scores.txt",
                  **kwargs):
         """kwargs: {'max_length': int, 'method': str, 'beam_size': int}"""
+        eval_data = {
+            "clotho": {
+                "raw_feat_csv": "data/clotho_v2/eval/lms.csv",
+                "fc_feat_csv": "data/clotho_v2/eval/panns_cnn14_fc.csv",
+                "attn_feat_csv": "data/clotho_v2/eval/panns_cnn14_attn.csv",
+                "caption_file": "data/clotho_v2/eval/text.json",
+            },
+            # "clotho": {
+                # "raw_feat_csv": "data/clotho_v2/val/lms.csv",
+                # "fc_feat_csv": "data/clotho_v2/val/panns_cnn10_fc.csv",
+                # "attn_feat_csv": "data/clotho_v2/val/panns_cnn10_attn.csv",
+                # "caption_file": "data/clotho_v2/val/text.json",
+            # },
+            "audiocaps": {
+                "raw_feat_csv": "data/audiocaps/test/lms.csv",
+                "fc_feat_csv": "data/audiocaps/test/panns_cnn14_fc.csv",
+                "attn_feat_csv": "data/audiocaps/test/panns_cnn14_attn.csv",
+                "caption_file": "data/audiocaps/test/text.json"
+            },
+        }
+
+        if "method" in kwargs and kwargs["method"] == "beam":
+            del kwargs["method"]
+            kwargs["sample_method"] = "beam"
         experiment_path = Path(experiment_path)
-        dump = torch.load(str(experiment_path / "saved.pth"),
-                          map_location="cpu")
+        if save_type == "best":
+            checkpoint = "saved.pth"
+        elif save_type == "last":
+            checkpoint = "last.pth"
+        elif save_type == "swa":
+            checkpoint = "swa.pth"
+        dump = torch.load(experiment_path / checkpoint, map_location="cpu")
         # Previous training config
         config = train_util.parse_config_or_kwargs(experiment_path / "config.yaml")
 
-        vocabulary = pickle.load(open(config["vocab_file"], "rb"))
-        model = self._get_model(config, len(vocabulary))
+        vocabulary = dump["vocabulary"]
+        model = self._get_model(config)
         model.load_state_dict(dump["model"])
 
         zh = config["zh"]
         model = model.to(self.device)
 
-        h5file_df = pd.read_csv(h5file_csv, sep="\t")
-        h5file_dict = dict(zip(h5file_df["audio_id"], h5file_df["hdf5_path"]))
-        dataset = ac_dataset.CaptionEvalDataset(h5file_dict)
+        raw_feat_csv = eval_data[task]["raw_feat_csv"]
+        fc_feat_csv = eval_data[task]["fc_feat_csv"]
+        attn_feat_csv = eval_data[task]["attn_feat_csv"]
+        raw_feat_df = pd.read_csv(raw_feat_csv, sep="\t")
+        raw_audio_to_h5 = dict(zip(raw_feat_df["audio_id"], raw_feat_df["hdf5_path"]))
+        fc_feat_df = pd.read_csv(fc_feat_csv, sep="\t")
+        fc_audio_to_h5 = dict(zip(fc_feat_df["audio_id"], fc_feat_df["hdf5_path"]))
+        attn_feat_df = pd.read_csv(attn_feat_csv, sep="\t")
+        attn_audio_to_h5 = dict(zip(attn_feat_df["audio_id"], attn_feat_df["hdf5_path"]))
+        dataset = ac_dataset.CaptionEvalDataset(
+            raw_audio_to_h5,
+            fc_audio_to_h5,
+            attn_audio_to_h5
+        )
         dataloader = torch.utils.data.DataLoader(
             dataset,
             shuffle=False,
-            collate_fn=ac_dataset.collate_fn([1,]),
+            collate_fn=ac_dataset.collate_fn([1, 3]),
             batch_size=kwargs.get("batch_size", 1)
         )
-
+        
+        caption_file = eval_data[task]["caption_file"]
         captions = json.load(open(caption_file, "r"))["audios"]
         key2refs = {}
         for audio_idx in range(len(captions)):
@@ -258,7 +318,7 @@ class BaseRunner(object):
             pred_data.append({
                 "filename": key,
                 "caption": "".join(pred[0]) if zh else pred[0],
-                "tokens": " ".join(pred[0]) if zh else pred[0] 
+                "tokens": " ".join(pred[0]) if zh else pred[0]
             })
         json.dump({"predictions": pred_data}, open(experiment_path / caption_output, "w"), indent=4)
 
@@ -300,6 +360,11 @@ class BaseRunner(object):
         # score = diversity_evaluate(pred_df)
         # f.write("Diversity: {:6.3f}\n".format(score))
 
+    def train_evaluate(self, config, task, **kwargs):
+        experiment_path = self.train(config, **kwargs)
+        for save_type in ["best", "last", "swa"]:
+            self.evaluate(experiment_path, task, save_type=save_type, score_output=f"{save_type}.txt", method="beam")
+        return experiment_path
 
     def dcase_predict(self,
                       experiment_path: str,
