@@ -5,6 +5,7 @@ import numpy as np
 parser = argparse.ArgumentParser()
 parser.add_argument("exp_path", help="parent experiment path, with several child directory trained under different seeds")
 parser.add_argument("--output", help="output result file", default=None)
+parser.add_argument("--score_input", help="input filename", default="scores.txt", type=str)
 
 args = parser.parse_args()
 
@@ -14,7 +15,7 @@ if args.output is None:
 
 scores = {}
 for path in exp_path.glob("seed_*"):
-    with open(path / "scores_beam_3.txt", "r") as reader:
+    with open(path / args.score_input, "r") as reader:
         for line in reader.readlines():
             metric, score = line.strip().split(": ")
             score = float(score)

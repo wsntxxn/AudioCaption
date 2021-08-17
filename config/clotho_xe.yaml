@@ -42,7 +42,7 @@ scheduler_args:
     final_lrs: !!float 5e-7
     
 
-ss: True
+ss: False
 ss_args:
     ss_mode: linear
     ss_ratio: 1.0

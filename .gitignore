@@ -130,3 +130,7 @@ logs/
 
 # Sed support
 sed/
+
+# Submodule git files
+*.git
+pycocoevalcap

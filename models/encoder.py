@@ -1,177 +1,39 @@
 # -*- coding: utf-8 -*-
 
+import math
 import copy
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from utils.train_util import mean_with_lens, max_with_lens
-
-class E2EASREncoder(nn.Module):
-    
-    def __init__(self, model): 
-        super(E2EASREncoder, self).__init__()
-        self.model = model
-        self.embed_size = 320
-
-    def forward(self, *input):
-        x, lens = input
-        output, lens, _ = self.model(x, lens)
-        # output: [N, T, E]
-        N = x.size(0)
-        idxs = torch.arange(output.size(1), device="cpu").repeat(N).view(N, output.size(1))
-        mask = (idxs < lens.view(-1, 1)).to(output.device)
-        # mask: [N, T]
-
-        out_mean_time = output * mask.unsqueeze(-1)
-        out_mean = out_mean_time.sum(1) / lens.unsqueeze(1).to(x.device)
-
-        return {
-            "audio_embeds": out_mean,
-            "audio_embeds_time": out_mean_time,
-            "state": None,
-            "audio_embeds_lens": lens
-        }
-
-
-def load_espnet_encoder(model_path, pretrained=True):
-    import json
-    import argparse
-    from pathlib import Path
-    from espnet.nets.pytorch_backend.e2e_asr import E2E
-    
-    model_dir = (Path(model_path).parent)
-    with open(str(Path(model_dir)/"model.json"), "r") as f:
-        idim, odim, conf = json.load(f)
-    model = E2E(idim, odim, argparse.Namespace(**conf))
-    if pretrained:
-        model.load_state_dict(torch.load(model_path, map_location="cpu"))
-    encoder = E2EASREncoder(model.enc)
-    return encoder
+from captioning.models.utils import mean_with_lens, max_with_lens, init, pack_wrapper, generate_length_mask
 
 class BaseEncoder(nn.Module):
     
     """
-    Encodes the given input into a fixed sized dimension
+    Encode the given audio into embedding
     Base encoder class, cannot be called directly
     All encoders should inherit from this class
     """
 
-    def __init__(self, inputdim, embed_size):
+    def __init__(self, raw_feat_dim, fc_feat_dim, attn_feat_dim):
         super(BaseEncoder, self).__init__()
-        self.inputdim = inputdim
-        self.embed_size = embed_size
+        self.raw_feat_dim = raw_feat_dim
+        self.fc_feat_dim = fc_feat_dim
+        self.attn_feat_dim = attn_feat_dim
 
-    def init(self):
-        for m in self.modules():
-            m.apply(self.init_weights)
-
-    def init_weights(self, m):
-        if isinstance(m, (nn.Conv2d, nn.Conv1d)):
-            nn.init.kaiming_uniform_(m.weight)
-            if m.bias is not None:
-                nn.init.constant_(m.bias, 0)
-        elif isinstance(m, nn.BatchNorm2d):
-            nn.init.constant_(m.weight, 1)
-            if m.bias is not None:
-                nn.init.constant_(m.bias, 0)
-        if isinstance(m, nn.Linear):
-            nn.init.kaiming_uniform_(m.weight)
-            if m.bias is not None:
-                nn.init.constant_(m.bias, 0)
 
     def forward(self, x):
+        #########################
+        # an encoder first encodes audio feature into embedding, obtaining
+        # `encoded`: {
+        #     fc_embs: [N, fc_emb_dim],
+        #     attn_embs: [N, attn_max_len, attn_emb_dim],
+        #     attn_emb_lens: [N,]
+        # }
+        #########################
         raise NotImplementedError
-
-
-class CNNEncoder(BaseEncoder):
-
-    def __init__(self, inputdim, embed_size, **kwargs):
-        """
-
-        :inputdim: TODO
-        :embed_size: TODO
-        :**kwargs: TODO
-
-        """
-        super(CNNEncoder, self).__init__(inputdim, embed_size)
-        self._filtersizes = kwargs.get('filtersizes', [5, 3, 3])
-        self._filter = kwargs.get('filter', [32, 32, 32])
-        self._filter = [1] + self._filter
-        net = nn.ModuleList()
-        for nl, (h0, h1, filtersize) in enumerate(
-                zip(self._filter, self._filter[1:], self._filtersizes)):
-            if nl > 0:
-                # GLU Output halves
-                h0 = h0//2
-            net.append(
-                nn.Conv2d(
-                    h0,
-                    h1,
-                    filtersize,
-                    padding=int(
-                        filtersize /
-                        2),
-                    bias=False))
-            net.append(nn.BatchNorm2d(h1))
-            net.append(nn.GLU(dim=1))
-            net.append(nn.MaxPool2d((1, 2)))
-        self.network = nn.Sequential(*net)
-
-        def calculate_size(input_size):
-            x = torch.randn(input_size).unsqueeze(0)
-            output = self.network(x)
-            return output.size()[1:]
-        outputdim = calculate_size((1, 500, inputdim))[-1]
-        self.outputlayer = nn.Linear(
-            self._filter[-1]//2 * outputdim, self._embed_size)
-        self.init()
-
-    def forward(self, x):
-        # Add dimension for filters
-        x = x.unsqueeze(1)
-        x = self.network(x)
-        # Pool the time dimension
-        x = x.mean(2)
-        x = x.view(x.shape[0], x.shape[1]*x.shape[2])
-        return self.outputlayer(x), None
-
-
-class PreTrainedCNN(BaseEncoder):
-
-    """Model that does not update its layers expect last layer"""
-
-    def __init__(self, inputdim, embed_size, pretrained_model, **kwargs):
-        """TODO: to be defined1.
-
-        :inputdim: Input feature dimension
-        :embed_size: Output of this module
-        :**kwargs: Extra arguments ( config file )
-
-        """
-        super(PreTrainedCNN, self).__init__(inputdim, embed_size)
-
-        # Remove last output layer
-        modules = list(pretrained_model.children())[:-1]
-        self.network = nn.Sequential(*modules)
-
-        def calculate_size(input_size):
-            x = torch.randn(input_size).unsqueeze(0)
-            output = pretrained_model.network(x)
-            return output.size()[1:]
-        outputdim = calculate_size((1, 500, inputdim))[-1]//2
-        self.outputlayer = nn.Linear(
-            outputdim * pretrained_model._filter[-1],
-            embed_size)
-
-    def forward(self, x):
-        x = x.unsqueeze(1)
-        with torch.no_grad():
-            x = self.network(x)
-            x = x.mean(2)
-            x = x.view(x.shape[0], x.shape[1]*x.shape[2])
-        return self.outputlayer(x), None
 
 
 class Block2D(nn.Module):
@@ -216,6 +78,7 @@ class MeanPool(nn.Module):
     def forward(self, logits, decision):
         return torch.mean(decision, dim=self.pooldim)
 
+
 class AttentionPool(nn.Module):  
     """docstring for AttentionPool"""  
     def __init__(self, inputdim, outputdim=10, pooldim=1, **kwargs):  
@@ -226,7 +89,6 @@ class AttentionPool(nn.Module):
         self.transform = nn.Linear(inputdim, outputdim)  
         self.activ = nn.Softmax(dim=self.pooldim)  
         self.eps = 1e-7  
-
 
     def forward(self, logits, decision):  
         # Input is (B, T, D)  
@@ -248,6 +110,7 @@ class MMPool(nn.Module):
     def forward(self, x):
         return self.avgpool(x) + self.maxpool(x)
 
+
 def parse_poolingfunction(poolingfunction_name='mean', **kwargs):
     """parse_poolingfunction
     A heler function to parse any temporal pooling
@@ -264,14 +127,29 @@ def parse_poolingfunction(poolingfunction_name='mean', **kwargs):
         return AttentionPool(inputdim=kwargs['inputdim'],  
                              outputdim=kwargs['outputdim'])
 
+def embedding_pooling(x, lens, pooling="mean"):
+    if pooling == "max":
+        fc_embs = max_with_lens(x, lens)
+    elif pooling == "mean":
+        fc_embs = mean_with_lens(x, lens)
+    elif pooling == "mean+max":
+        x_mean = mean_with_lens(x, lens)
+        x_max = max_with_lens(x, lens)
+        fc_embs = x_mean + x_max
+    elif pooling == "last":
+        indices = (lens - 1).reshape(-1, 1, 1).repeat(1, 1, x.size(-1))
+        # indices: [N, 1, hidden]
+        fc_embs = torch.gather(x, 1, indices).squeeze(1)
+    else:
+        raise Exception(f"pooling method {pooling} not support")
+    return fc_embs
 
-class CRNNEncoder(BaseEncoder):
 
-    def __init__(self, inputdim, embed_size, **kwargs):
-        super(CRNNEncoder, self).__init__(inputdim, embed_size)
-        features = nn.ModuleList()
-        self.use_hidden = False
-        assert embed_size == 256, "CRNN10 only supports output feature dimension 512"
+class Cdur5Encoder(BaseEncoder):
+
+    def __init__(self, raw_feat_dim, fc_feat_dim, attn_feat_dim, pooling="mean"):
+        super().__init__(raw_feat_dim, fc_feat_dim, attn_feat_dim)
+        self.pooling = pooling
         self.features = nn.Sequential(
             Block2D(1, 32),
             nn.LPPool2d(4, (2, 4)),
@@ -284,109 +162,92 @@ class CRNNEncoder(BaseEncoder):
             nn.Dropout(0.3),
         )
         with torch.no_grad():
-            rnn_input_dim = self.features(torch.randn(1, 1, 500,
-                                                      inputdim)).shape
+            rnn_input_dim = self.features(
+                torch.randn(1, 1, 500, raw_feat_dim)).shape
             rnn_input_dim = rnn_input_dim[1] * rnn_input_dim[-1]
 
         self.gru = nn.GRU(rnn_input_dim,
                           128,
                           bidirectional=True,
                           batch_first=True)
-        self.features.apply(self.init_weights)
+        self.apply(init)
 
-    def forward(self, *input):
-        x, lens = input
-        lens = copy.deepcopy(lens)
-        lens = torch.as_tensor(lens)
+    def forward(self, input_dict):
+        x = input_dict["raw_feats"]
+        lens = input_dict["raw_feat_lens"]
+        if "upsample" not in input_dict:
+            input_dict["upsample"] = False
+        lens = torch.as_tensor(copy.deepcopy(lens))
         N, T, _ = x.shape
         x = x.unsqueeze(1)
         x = self.features(x)
         x = x.transpose(1, 2).contiguous().flatten(-2)
         x, _ = self.gru(x)
-        # x = nn.functional.interpolate(
-            # x.transpose(1, 2),
-            # T,
-            # mode='linear',
-            # align_corners=False).transpose(1, 2)
-        lens /= 4
-
-        # idxs = torch.arange(x.size(1), device="cpu").repeat(N).view(N, x.size(1))
-        # mask = (idxs < lens.view(-1, 1)).to(x.device)
-        # # mask: [N, T]
-
-        # x_mean_time = x * mask.unsqueeze(-1)
-        # x_mean = x_mean_time.sum(1) / lens.unsqueeze(1).to(x.device)
-
-        # # x_max = x
-        # # x_max[~mask] = float("-inf")
-        # # x_max, _ = x_max.max(1)
-        # # out = x_mean + x_max
-
-        # out = x_mean
-        out = mean_with_lens(x, lens)
-
-        # return {
-            # "audio_embeds": out,
-            # "audio_embeds_time": x_mean_time,
-            # "state": None,
-            # "audio_embeds_lens": lens
-        # }
+        if input_dict["upsample"]:
+            x = nn.functional.interpolate(
+                x.transpose(1, 2),
+                T,
+                mode='linear',
+                align_corners=False).transpose(1, 2)
+        else:
+            lens //= 4
+        attn_embs = x
+        fc_embs = embedding_pooling(x, lens, self.pooling)
         return {
-            "audio_embeds": x, # [N, T, E]
-            "audio_embeds_pooled": out,
-            "audio_embeds_lens": lens,
-            "state": None
+            "attn_embs": attn_embs,
+            "fc_embs": fc_embs,
+            "attn_emb_lens": lens
         }
 
 
-class CRNN8_Sub4(BaseEncoder):
+def conv_conv_block(in_channel, out_channel):
+    return nn.Sequential(
+        nn.Conv2d(in_channel,
+                  out_channel,
+                  kernel_size=3,
+                  bias=False,
+                  padding=1),
+        nn.BatchNorm2d(out_channel),
+        nn.ReLU(True),
+        nn.Conv2d(out_channel,
+                  out_channel,
+                  kernel_size=3,
+                  bias=False,
+                  padding=1),
+        nn.BatchNorm2d(out_channel),
+        nn.ReLU(True)
+    )
+
+
+class Cdur8Encoder(BaseEncoder):
     
-    def __init__(self, inputdim, embed_size, **kwargs):
-        super(CRNN8_Sub4, self).__init__(inputdim, embed_size)
-
-        def _block(in_channel, out_channel):
-            return nn.Sequential(
-                nn.Conv2d(in_channel,
-                          out_channel,
-                          kernel_size=3,
-                          bias=False,
-                          padding=1),
-                nn.BatchNorm2d(out_channel),
-                nn.ReLU(True),
-                nn.Conv2d(out_channel,
-                          out_channel,
-                          kernel_size=3,
-                          bias=False,
-                          padding=1),
-                nn.BatchNorm2d(out_channel),
-                nn.ReLU(True),
-            )
-
+    def __init__(self, raw_feat_dim, fc_feat_dim, attn_feat_dim, pooling="mean"):
+        super().__init__(raw_feat_dim, fc_feat_dim, attn_feat_dim)
+        self.pooling = pooling
         self.features = nn.Sequential(
-            _block(1, 64),
+            conv_conv_block(1, 64),
             MMPool((2, 2)),
             nn.Dropout(0.2, True),
-            _block(64, 128),
+            conv_conv_block(64, 128),
             MMPool((2, 2)),
             nn.Dropout(0.2, True),
-            _block(128, 256),
+            conv_conv_block(128, 256),
             MMPool((1, 2)),
             nn.Dropout(0.2, True),
-            _block(256, 512),
+            conv_conv_block(256, 512),
             MMPool((1, 2)),
             nn.Dropout(0.2, True),
             nn.AdaptiveAvgPool2d((None, 1)),
         )
-        self.init_bn = nn.BatchNorm2d(inputdim)
+        self.init_bn = nn.BatchNorm2d(raw_feat_dim)
         self.embedding = nn.Linear(512, 512)
-        self.features.apply(self.init_weights)
         self.gru = nn.GRU(512, 256, bidirectional=True, batch_first=True)
+        self.apply(init)
 
-    def forward(self, *input):
-        x, lens = input
-        lens = copy.deepcopy(lens)
-        lens = torch.as_tensor(lens)
-        N, T, _ = x.shape
+    def forward(self, input_dict):
+        x = input_dict["raw_feats"]
+        lens = input_dict["raw_feat_lens"]
+        lens = torch.as_tensor(copy.deepcopy(lens))
         x = x.unsqueeze(1)  # B x 1 x T x D
         x = x.transpose(1, 3)
         x = self.init_bn(x)
@@ -396,486 +257,331 @@ class CRNN8_Sub4(BaseEncoder):
         x = F.dropout(x, p=0.5, training=self.training)
         x = F.relu_(self.embedding(x))
         x, _ = self.gru(x)
-
+        attn_embs = x
         lens //= 4
-        # x: [N, T, E]
-        idxs = torch.arange(x.size(1), device="cpu").repeat(N).view(N, x.size(1))
-        mask = (idxs < lens.view(-1, 1)).to(x.device)
-        # mask: [N, T]
-
-        x_mean_time = x * mask.unsqueeze(-1)
-        x_mean = x_mean_time.sum(1) / lens.unsqueeze(1).to(x.device)
-
-        # x_max = x
-        # x_max[~mask] = float("-inf")
-        # x_max, _ = x_max.max(1)
-        # out = x_mean + x_max
-
-        out = x_mean
-
+        fc_embs = embedding_pooling(x, lens, self.pooling)
         return {
-            "audio_embeds": out,
-            "audio_embeds_time": x_mean_time,
-            "state": None,
-            "audio_embeds_lens": lens
+            "attn_embs": attn_embs,
+            "fc_embs": fc_embs,
+            "attn_emb_lens": lens
         }
 
 
-class CNN10QEncoder(BaseEncoder):
+class Cnn10Encoder(BaseEncoder):
 
-    def __init__(self, inputdim, embed_size, **kwargs):
-        super(CNN10QEncoder, self).__init__(inputdim, embed_size)
-        self.use_hidden = False
-
-        def _block(in_channel, out_channel):
-            return nn.Sequential(
-                nn.Conv2d(in_channel,
-                          out_channel,
-                          kernel_size=3,
-                          bias=False,
-                          padding=1),
-                nn.BatchNorm2d(out_channel),
-                nn.ReLU(True),
-                nn.Conv2d(out_channel,
-                          out_channel,
-                          kernel_size=3,
-                          bias=False,
-                          padding=1),
-                nn.BatchNorm2d(out_channel),
-                nn.ReLU(True),
-            )
-
+    def __init__(self, raw_feat_dim, fc_feat_dim, attn_feat_dim):
+        super().__init__(raw_feat_dim, fc_feat_dim, attn_feat_dim)
         self.features = nn.Sequential(
-            _block(1, 64),
+            conv_conv_block(1, 64),
             nn.AvgPool2d((2, 2)),
             nn.Dropout(0.2, True),
-            _block(64, 128),
+            conv_conv_block(64, 128),
             nn.AvgPool2d((2, 2)),
             nn.Dropout(0.2, True),
-            _block(128, 256),
+            conv_conv_block(128, 256),
             nn.AvgPool2d((2, 2)),
             nn.Dropout(0.2, True),
-            _block(256, 512),
+            conv_conv_block(256, 512),
             nn.AvgPool2d((2, 2)),
             nn.Dropout(0.2, True),
             nn.AdaptiveAvgPool2d((None, 1)),
         )
-        self.init_bn = nn.BatchNorm2d(inputdim)
-        # self.outputlayer = nn.Linear(512, embed_size)
+        self.init_bn = nn.BatchNorm2d(raw_feat_dim)
         self.embedding = nn.Linear(512, 512)
+        self.apply(init)
 
-    def forward(self, *input):
-        return self._forward(*input)
-
-    def _forward(self, *input):
-        x, lens = input
-        lens = copy.deepcopy(lens)
-        lens = torch.as_tensor(lens)
-        N = x.size(0)
+    def forward(self, input_dict):
+        x = input_dict["raw_feats"]
+        lens = input_dict["raw_feat_lens"]
+        lens = torch.as_tensor(copy.deepcopy(lens))
         x = x.unsqueeze(1)  # [N, 1, T, D]
         x = x.transpose(1, 3)
         x = self.init_bn(x)
         x = x.transpose(1, 3)
         x = self.features(x) # [N, 512, T/16, 1]
         x = x.transpose(1, 2).contiguous().flatten(-2) # [N, T/16, 512]
-
+        attn_embs = x
         lens //= 16
-
-        x_mean = mean_with_lens(x, lens)
-        x_max = max_with_lens(x, lens)
-        out = x_mean + x_max
-        out = F.dropout(out, p=0.5, training=self.training)
-        out = self.embedding(out)
-
+        fc_embs = embedding_pooling(x, lens, "mean+max")
+        fc_embs = F.dropout(fc_embs, p=0.5, training=self.training)
+        fc_embs = self.embedding(fc_embs)
+        fc_embs = F.relu_(fc_embs)
         return {
-            "audio_embeds": x,
-            "audio_embeds_pooled": out,
-            "state": None,
-            "audio_embeds_lens": lens
+            "attn_embs": attn_embs,
+            "fc_embs": fc_embs,
+            "attn_emb_lens": lens
         }
 
-class CNN10DEncoder(CNN10QEncoder):
 
-    def __init__(self, inputdim, embed_size, **kwargs):
-        super(CNN10DEncoder, self).__init__(inputdim, embed_size)
-        self.outputlayer = nn.Linear(512, embed_size)
+class RnnEncoder(BaseEncoder):
 
-    def forward(self, *input):
-        output = super(CNN10DEncoder, self)._forward(*input)
-        x = output["audio_embeds"]
-        x = self.embedding(x) # [N, T/16, 512]
-        x = F.relu_(x)
-        x = F.dropout(x, p=0.5, training=self.training)
-        x = self.outputlayer(x)
-        output["audio_embeds"] = x
+    def __init__(self, raw_feat_dim, fc_feat_dim, attn_feat_dim, pooling="mean", **kwargs):
+        super().__init__(raw_feat_dim, fc_feat_dim, attn_feat_dim)
+        self.pooling = pooling
+        self.hidden_size = kwargs.get('hidden_size', 512)
+        self.bidirectional = kwargs.get('bidirectional', False)
+        self.num_layers = kwargs.get('num_layers', 1)
+        self.dropout = kwargs.get('dropout', 0.2)
+        self.rnn_type = kwargs.get('rnn_type', "GRU")
+        self.in_bn = kwargs.get('in_bn', False)
+        self.embed_dim = self.hidden_size * (self.bidirectional + 1)
+        self.network = getattr(nn, self.rnn_type)(
+            attn_feat_dim,
+            self.hidden_size,
+            num_layers=self.num_layers,
+            bidirectional=self.bidirectional,
+            dropout=self.dropout,
+            batch_first=True)
+        if self.in_bn:
+            self.bn = nn.BatchNorm1d(self.embed_dim)
+        self.apply(init)
+
+    def forward(self, input_dict):
+        x = input_dict["attn_feats"]
+        lens = input_dict["attn_feat_lens"]
+        lens = torch.as_tensor(lens)
+        # x: [N, T, E]
+        if self.in_bn:
+            x = pack_wrapper(self.bn, x, lens)
+        out = pack_wrapper(self.network, x, lens)
+        # out: [N, T, hidden]
+        attn_embs = out
+        fc_embs = embedding_pooling(out, lens, self.pooling)
+        return {
+            "attn_embs": attn_embs,
+            "fc_embs": fc_embs,
+            "attn_emb_lens": lens
+        }
+
+
+class RnnEncoder2(RnnEncoder):
+
+    def __init__(self, raw_feat_dim, fc_feat_dim, attn_feat_dim, **kwargs):
+        super().__init__(raw_feat_dim, fc_feat_dim, attn_feat_dim, **kwargs)
+
+    def forward(self, input_dict):
+        output = super().forward(input_dict)
+        output["fc_embs"] = input_dict["fc_feats"]
         return output
 
-class CNN10Encoder(BaseEncoder):
 
-    def __init__(self, inputdim, embed_size, **kwargs):
-        super(CNN10Encoder, self).__init__(inputdim, embed_size)
-        assert embed_size == 512, "pretrained CNN10 only supports output feature dimension 512"
-        self.use_hidden = False
-        self.features = nn.Sequential(
-            Block2D(1, 64),
-            Block2D(64, 64),
-            nn.LPPool2d(4, (2, 4)),
-            Block2D(64, 128),
-            Block2D(128, 128),
-            nn.LPPool2d(4, (2, 2)),
-            Block2D(128, 256),
-            Block2D(256, 256),
-            nn.LPPool2d(4, (1, 2)),
-            Block2D(256, 512),
-            Block2D(512, 512),
-            nn.LPPool2d(4, (1, 2)),
-            nn.Dropout(0.3),
-            nn.AdaptiveAvgPool2d((None, 1)),
-        )
+class RnnEncoder3(RnnEncoder):
 
-        # self.temp_pool = parse_poolingfunction(kwargs.get('temppool', 'attention'),
-                                               # inputdim=512,
-                                               # outputdim=embed_size)
-        # self.outputlayer = nn.Linear(512, embed_size)
-        self.features.apply(self.init_weights)
-        # self.outputlayer.apply(self.init_weights)
-
-    def forward(self, *input):
-        x, lens = input
-        lens = torch.as_tensor(lens)
-        batch, time, dim = x.shape
-        x = x.unsqueeze(1)
-        x = self.features(x)
-        x = x.transpose(1, 2).contiguous().flatten(-2)
-        # decison_time = self.outputlayer(x)
-        # decison_time = nn.functional.interpolate(
-            # decison_time.transpose(1, 2),
-            # time,
-            # mode='linear',
-            # align_corners=False).transpose(1, 2)
-        # x = self.temp_pool(x, decison_time).squeeze(1)
-
-        N = x.size(0)
-        lens /= 4
-        idxs = torch.arange(x.size(1), device="cpu").repeat(N).view(N, x.size(1))
-        mask = (idxs < lens.view(-1, 1)).to(x.device)
-
-        x_mean = x * mask.unsqueeze(-1)
-        x_mean = x_mean.sum(1) / lens.unsqueeze(1).to(x.device)
-
-        out = x_mean
-        return {
-            "audio_embeds": out,
-            "audio_embeds_time": x,
-            "state": None,
-            "audio_embeds_lens": lens
-        }
-
-
-class CNN10CRNNEncoder(BaseEncoder):
-
-    def __init__(self, inputdim, embed_size, crnn, cnn, **kwargs):
-        super(CNN10CRNNEncoder, self).__init__(inputdim, embed_size)
-        self.use_hidden = False
-        self.crnn = crnn
-        self.cnn = cnn
-
-    def forward(self, *input):
-        crnn_feat, _ = self.crnn(*input)
-        cnn_feat, _ = self.cnn(*input)
-        # out = (crnn_feat + cnn_feat) / 2
-        out = torch.cat((crnn_feat, cnn_feat), dim=-1)
-        return out, None
-
-
-def init_layer(layer):
-    """Initialize a Linear or Convolutional layer. """
-    nn.init.xavier_uniform_(layer.weight)
- 
-    if hasattr(layer, 'bias'):
-        if layer.bias is not None:
-            layer.bias.data.fill_(0.)
-            
-    
-def init_bn(bn):
-    """Initialize a Batchnorm layer. """
-    bn.bias.data.fill_(0.)
-    bn.weight.data.fill_(1.)
-
-
-class ConvBlock(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        
-        super(ConvBlock, self).__init__()
-        
-        self.conv1 = nn.Conv2d(in_channels=in_channels,
-                              out_channels=out_channels,
-                              kernel_size=(3, 3), stride=(1, 1),
-                              padding=(1, 1), bias=False)
-                              
-        self.conv2 = nn.Conv2d(in_channels=out_channels,
-                              out_channels=out_channels,
-                              kernel_size=(3, 3), stride=(1, 1),
-                              padding=(1, 1), bias=False)
-                              
-        self.bn1 = nn.BatchNorm2d(out_channels)
-        self.bn2 = nn.BatchNorm2d(out_channels)
-
-        self.init_weight()
-        
-    def init_weight(self):
-        init_layer(self.conv1)
-        init_layer(self.conv2)
-        init_bn(self.bn1)
-        init_bn(self.bn2)
-
-        
-    def forward(self, input, pool_size=(2, 2), pool_type='avg'):
-        
-        x = input
-        x = F.relu_(self.bn1(self.conv1(x)))
-        x = F.relu_(self.bn2(self.conv2(x)))
-        if pool_type == 'max':
-            x = F.max_pool2d(x, kernel_size=pool_size)
-        elif pool_type == 'avg':
-            x = F.avg_pool2d(x, kernel_size=pool_size)
-        elif pool_type == 'avg+max':
-            x1 = F.avg_pool2d(x, kernel_size=pool_size)
-            x2 = F.max_pool2d(x, kernel_size=pool_size)
-            x = x1 + x2
-        else:
-            raise Exception('Incorrect argument!')
-        
-        return x
-
-
-class Cnn10(BaseEncoder):
-    def __init__(self, inputdim, embed_size, **kwargs):
-        super(Cnn10, self).__init__(inputdim, embed_size)
-
-        self.bn0 = nn.BatchNorm2d(64)
-
-        self.conv_block1 = ConvBlock(in_channels=1, out_channels=64)
-        self.conv_block2 = ConvBlock(in_channels=64, out_channels=128)
-        self.conv_block3 = ConvBlock(in_channels=128, out_channels=256)
-        self.conv_block4 = ConvBlock(in_channels=256, out_channels=512)
-
-        self.embed_pooled = nn.Linear(512, 256, bias=True)
-        # self.embed = nn.Linear(512, 256, bias=True)
-        
-        self.init_weight()
-
-    def init_weight(self):
-        init_bn(self.bn0)
-        # init_layer(self.embed)
-        init_layer(self.embed_pooled)
- 
-    def forward(self, input, lens):
-        """
-        Input: (batch_size, data_length)"""
-           
-        x = input.unsqueeze(1) # (batch_size, 1, time_steps, dim)
-        lens = torch.as_tensor(lens)
-        lens //= 16
-        x = x.transpose(1, 3)
-        x = self.bn0(x)
-        x = x.transpose(1, 3)
-        
-        x = self.conv_block1(x, pool_size=(2, 2), pool_type='avg')
-        x = F.dropout(x, p=0.2, training=self.training)
-        x = self.conv_block2(x, pool_size=(2, 2), pool_type='avg')
-        x = F.dropout(x, p=0.2, training=self.training)
-        x = self.conv_block3(x, pool_size=(2, 2), pool_type='avg')
-        x = F.dropout(x, p=0.2, training=self.training)
-        x = self.conv_block4(x, pool_size=(2, 2), pool_type='avg')
-        x = F.dropout(x, p=0.2, training=self.training)
-        x = torch.mean(x, dim=3)
-        
-        (x1, _) = torch.max(x, dim=2)
-        x2 = torch.mean(x, dim=2)
-        out = x1 + x2
-        out = F.dropout(out, p=0.5, training=self.training)
-        out = F.relu_(self.embed_pooled(out))
-        embedding = F.dropout(out, p=0.5, training=self.training)
-        
-        x = x.transpose(1, 2).contiguous()
-        
-        output_dict = {'audio_embeds': x,
-           'audio_embeds_pooled': embedding,
-           'state': None,
-           'audio_embeds_lens': lens}
-
-        return output_dict
-
-
-class RNNEncoder(BaseEncoder):
-
-    def __init__(self, inputdim, embed_size, **kwargs):
-        super(RNNEncoder, self).__init__(inputdim, embed_size)
-        hidden_size = kwargs.get('hidden_size', 256)
-        bidirectional = kwargs.get('bidirectional', False)
-        num_layers = kwargs.get('num_layers', 1)
-        dropout = kwargs.get('dropout', 0.3)
-        rnn_type = kwargs.get('rnn_type', "GRU")
-        self.representation = kwargs.get('representation', 'time')
-        assert self.representation in ('time', 'mean')
-        self.use_hidden = kwargs.get('use_hidden', False)
-        self.network = getattr(nn, rnn_type)(
-            inputdim,
-            hidden_size,
-            num_layers=num_layers,
-            bidirectional=bidirectional,
-            dropout=dropout,
+    def __init__(self, raw_feat_dim, fc_feat_dim, attn_feat_dim, **kwargs):
+        super().__init__(raw_feat_dim, fc_feat_dim, attn_feat_dim, **kwargs)
+        self.network = getattr(nn, self.rnn_type)(
+            fc_feat_dim + attn_feat_dim,
+            self.hidden_size,
+            num_layers=self.num_layers,
+            bidirectional=self.bidirectional,
+            dropout=self.dropout,
             batch_first=True)
-        self.outputlayer = nn.Linear(
-            hidden_size * (bidirectional + 1), embed_size)
-        self.bn = nn.BatchNorm1d(embed_size, momentum=0.01)
-        self.init()
+        self.fc_transform = nn.Linear(self.embed_dim, self.embed_dim)
+        self.apply(init)
 
-    def forward(self, *input):
-        x, lens = input
+    def forward(self, input_dict):
+        fc_feats = input_dict["fc_feats"]
+        attn_feats = input_dict["attn_feats"]
+        lens = input_dict["attn_feat_lens"]
         lens = torch.as_tensor(lens)
-        # x: [N, T, D]
+        x = torch.cat((fc_feats.unsqueeze(1).repeat(1, attn_feats.size(1), 1), attn_feats), dim=-1)
         packed = nn.utils.rnn.pack_padded_sequence(x, lens, batch_first=True, enforce_sorted=False)
         packed_out, hid = self.network(packed)
         # hid: [num_layers, N, hidden]
-        out_time, _ = nn.utils.rnn.pad_packed_sequence(packed_out, batch_first=True)
+        out, _ = nn.utils.rnn.pad_packed_sequence(packed_out, batch_first=True)
         # out: [N, T, hidden]
-        if not self.use_hidden:
-            hid = None
-        if self.representation == 'mean':
-            N = x.size(0)
-            idxs = torch.arange(x.size(1), device="cpu").repeat(N).view(N, x.size(1))
-            mask = (idxs < lens.view(-1, 1)).to(x.device)
-            # mask: [N, T]
-            out = out_time * mask.unsqueeze(-1)
-            out = out.sum(1) / lens.unsqueeze(1).to(x.device)
-        elif self.representation == 'time':
-            indices = (lens - 1).reshape(-1, 1, 1).expand(-1, 1, out_time.size(-1))
-            # indices: [N, 1, hidden]
-            out = torch.gather(out_time, 1, indices).squeeze(1)
-
-        out = self.bn(self.outputlayer(out))
+        attn_embs = out
+        fc_embs = embedding_pooling(out, lens, "mean+max")
+        fc_embs = F.dropout(fc_embs, p=0.5, training=self.training)
+        fc_embs = self.fc_transform(fc_embs)
+        if self.out_bn:
+            fc_embs = self.bn(fc_embs)
         return {
-            "audio_embeds": out,
-            "audio_embeds_time": out_time,
-            "state": hid,
-            "audio_embeds_lens": lens
+            "attn_embs": attn_embs,
+            "fc_embs": fc_embs,
+            "attn_emb_lens": lens
+        }
+
+class RnnEncoder4(RnnEncoder):
+
+    def __init__(self, raw_feat_dim, fc_feat_dim, attn_feat_dim, input_dim, **kwargs):
+        super().__init__(raw_feat_dim, fc_feat_dim, attn_feat_dim, **kwargs)
+        self.network = getattr(nn, self.rnn_type)(
+            input_dim,
+            self.hidden_size,
+            num_layers=self.num_layers,
+            bidirectional=self.bidirectional,
+            dropout=self.dropout,
+            batch_first=True)
+        self.init_norm = nn.LayerNorm(input_dim)
+        self.fc_in_proj = nn.Linear(fc_feat_dim, input_dim)
+        self.attn_in_proj = nn.Linear(attn_feat_dim, input_dim)
+        self.fc_out_transform = nn.Linear(self.embed_dim, self.embed_dim)
+        if hasattr(self, "bn"):
+            del self.bn
+        self.out_norm = nn.LayerNorm(self.embed_dim)
+        self.apply(init)
+
+    def forward(self, input_dict):
+        fc_feats = input_dict["fc_feats"]
+        attn_feats = input_dict["attn_feats"]
+        lens = input_dict["attn_feat_lens"]
+        lens = torch.as_tensor(lens)
+        p_fc_feats = self.fc_in_proj(fc_feats)
+        p_attn_feats = self.attn_in_proj(attn_feats)
+        x = p_fc_feats.unsqueeze(1) + p_attn_feats
+        x = self.init_norm(x)
+        x = F.dropout(x, p=0.5, training=self.training)
+        packed = nn.utils.rnn.pack_padded_sequence(x, lens, batch_first=True, enforce_sorted=False)
+        packed_out, hid = self.network(packed)
+        # hid: [num_layers, N, hidden]
+        out, _ = nn.utils.rnn.pad_packed_sequence(packed_out, batch_first=True)
+        # out: [N, T, hidden]
+        attn_embs = out
+        fc_embs = embedding_pooling(out, lens, "mean+max")
+        fc_embs = F.dropout(fc_embs, p=0.5, training=self.training)
+        fc_embs = self.fc_out_transform(fc_embs)
+        fc_embs = F.relu_(fc_embs)
+        fc_embs = F.dropout(fc_embs, p=0.5, training=self.training)
+        fc_embs = self.out_norm(fc_embs)
+        return {
+            "attn_embs": attn_embs,
+            "fc_embs": fc_embs,
+            "attn_emb_lens": lens
         }
 
 
-def conv3x3(in_planes, out_planes, stride=1, groups=1, dilation=1):
-    """3x3 convolution with padding"""
-    return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride,
-                     padding=dilation, groups=groups, bias=False, dilation=dilation)
+class PositionalEncoding(nn.Module):
 
-class BasicBlock(nn.Module):
-    expansion = 1
+    def __init__(self, d_model, dropout=0.1, max_len=100):
+        super(PositionalEncoding, self).__init__()
+        self.dropout = nn.Dropout(p=dropout)
 
-    def __init__(self, inplanes, planes ,stride=1, downsample=None, groups=1,
-                 base_width=64, dilation=1, norm_layer=None):
-        super(BasicBlock, self).__init__()
-        if norm_layer is None:
-            norm_layer = nn.BatchNorm2d
-        if groups != 1 or base_width != 64:
-            raise ValueError('BasicBlock only supports groups=1 and base_width=64')
-        if dilation > 1:
-            raise NotImplementedError("Dilation > 1 not supported in BasicBlock")
-        # Both self.conv1 and self.downsample layers downsample the input when stride != 1
-        self.conv1 = conv3x3(inplanes, planes, stride)
-        self.bn1 = norm_layer(planes)
-        self.relu = nn.ReLU(inplace=True)
-        self.conv2 = conv3x3(planes, planes)
-        self.bn2 = norm_layer(planes)
-        self.downsample = downsample
-        self.stride = stride
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0).transpose(0, 1)
+        self.register_buffer("pe", pe)
 
     def forward(self, x):
-        identity = x
-
-        out = self.conv1(x)
-        out = self.bn1(out)
-        out = self.relu(out)
-
-        out = self.conv2(out)
-        out = self.bn2(out)
-        
-        if self.downsample is not None:
-            identity = self.downsample(x)
-
-        out += identity
-        out = self.relu(out)
-
-        return out
+        # x: [T, N, E]
+        x = x + self.pe[:x.size(0), :]
+        return self.dropout(x)
 
 
-class ResNetEncoder(BaseEncoder):
-    
-    def __init__(self, inputdim, embed_size, **kwargs):
-        super().__init__(inputdim, embed_size)
-        self.network = nn.Sequential(
-            nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False), # (0)
-            nn.BatchNorm2d(64), # (1)
-            nn.ReLU(inplace=True), # (2)
-            nn.MaxPool2d(kernel_size=3, stride=2, padding=1), # (3)
-            nn.Sequential(
-                BasicBlock(64, 64),
-                BasicBlock(64, 64)
-            ), # (4)
-            nn.Sequential(
-                BasicBlock(64, 128, stride=2, downsample=nn.Sequential(
-                    nn.Conv2d(64, 128, kernel_size=1, stride=2, bias=False),
-                    nn.BatchNorm2d(128)
-                )),
-                BasicBlock(128, 128)
-            ), # (5)
-            nn.Sequential(
-                BasicBlock(128, 256, stride=2, downsample=nn.Sequential(
-                    nn.Conv2d(128, 256, kernel_size=1, stride=2, bias=False),
-                    nn.BatchNorm2d(256)
-                )),
-                BasicBlock(256, 256)
-            ), # (6)
-            nn.Sequential(
-                BasicBlock(256, 512, stride=2, downsample=nn.Sequential(
-                    nn.Conv2d(256, 512, kernel_size=1, stride=2, bias=False),
-                    nn.BatchNorm2d(512)
-                )),
-                BasicBlock(512, 512)
-            ) # (7)
+class TransformerEncoder(BaseEncoder):
+
+    def __init__(self, raw_feat_dim, fc_feat_dim, attn_feat_dim, d_model, **kwargs):
+        super().__init__(raw_feat_dim, fc_feat_dim, attn_feat_dim)
+        self.d_model = d_model
+        dropout = kwargs.get("dropout", 0.2)
+        self.nhead = kwargs.get("nhead", self.d_model // 64)
+        self.nlayers = kwargs.get("nlayers", 2)
+        self.dim_feedforward = kwargs.get("dim_feedforward", self.d_model * 4)
+
+        self.attn_proj = nn.Sequential(
+            nn.Linear(attn_feat_dim, self.d_model),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.LayerNorm(self.d_model)
         )
-        self.layer = nn.AdaptiveAvgPool2d((1, None))
+        layer = nn.TransformerEncoderLayer(d_model=self.d_model,
+                                           nhead=self.nhead,
+                                           dim_feedforward=self.dim_feedforward,
+                                           dropout=dropout)
+        self.model = nn.TransformerEncoder(layer, self.nlayers)
+        self.fc_out_transform = nn.Linear(self.d_model, self.d_model)
+        self.init_params()
 
-    def forward(self, feats, feat_lens):
-        x = feats
-        x = x.unsqueeze(1)
-        x = x.transpose(2, 3)
-        x = self.network(x)
-        x = self.layer(x)
-        x = x.squeeze(2)
-        x = x.transpose(-1, -2) # [N, T*, 512]
-        embed_lens = copy.deepcopy(feat_lens)
-        embed_lens = torch.as_tensor(embed_lens)
-        for i in range(5):
-            embed_lens = (embed_lens - 1) // 2 + 1
-        output_dict = {
-            "audio_embeds": x,
-            "audio_embeds_pooled": x.mean(1),
-            "state": None,
-            "audio_embeds_lens": embed_lens
+    def init_params(self):
+        for p in self.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p)
+
+    def forward(self, input_dict):
+        attn_feats = input_dict["attn_feats"]
+        attn_feat_lens = input_dict["attn_feat_lens"]
+        attn_feat_lens = torch.as_tensor(attn_feat_lens)
+
+        attn_feats = self.attn_proj(attn_feats) # [bs, T, d_model]
+        attn_feats = attn_feats.transpose(0, 1)
+
+        src_key_padding_mask = ~generate_length_mask(attn_feat_lens, attn_feats.size(0)).to(attn_feats.device)
+        output = self.model(attn_feats, src_key_padding_mask=src_key_padding_mask)
+
+        attn_embs = output.transpose(0, 1)
+        fc_embs = embedding_pooling(attn_embs, attn_feat_lens, "mean+max")
+        fc_embs = F.dropout(fc_embs, p=0.5, training=self.training)
+        fc_embs = self.fc_out_transform(fc_embs)
+        fc_embs = F.relu_(fc_embs)
+        fc_embs = F.dropout(fc_embs, p=0.5, training=self.training)
+        return {
+            "attn_embs": attn_embs,
+            "fc_embs": fc_embs,
+            "attn_emb_lens": attn_feat_lens
         }
-        return output_dict
+
+
+class M2TransformerEncoder(BaseEncoder):
+
+    def __init__(self, raw_feat_dim, fc_feat_dim, attn_feat_dim, d_model, **kwargs):
+        try:
+            from m2transformer.models.transformer import MemoryAugmentedEncoder, ScaledDotProductAttentionMemory
+        except:
+            raise ImportError("meshed-memory-transformer not installed; please run `pip install git+https://github.com/ruotianluo/meshed-memory-transformer.git`")
+        super().__init__(raw_feat_dim, fc_feat_dim, attn_feat_dim)
+        self.d_model = d_model
+        dropout = kwargs.get("dropout", 0.1)
+        self.nhead = kwargs.get("nhead", self.d_model // 64)
+        self.nlayers = kwargs.get("nlayers", 2)
+        self.dim_feedforward = kwargs.get("dim_feedforward", self.d_model * 4)
+
+        self.attn_proj = nn.Linear(attn_feat_dim, self.d_model)
+        self.pos_encoder = PositionalEncoding(self.d_model, dropout, 200)
+        self.model = MemoryAugmentedEncoder(self.nlayers, 0, self.attn_feat_dim,
+                                            d_model=self.d_model,
+                                            h=self.nhead,
+                                            d_ff=self.dim_feedforward,
+                                            dropout=dropout,
+                                            attention_module=ScaledDotProductAttentionMemory,
+                                            attention_module_kwargs={"m": 40})
+        self.init_params()
+
+    def init_params(self):
+        for p in self.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p)
+
+
+    def forward(self, input_dict):
+        attn_feats = input_dict["attn_feats"]
+        attn_embs, attn_emb_mask = self.model(attn_feats)
+        fc_embs = attn_embs.mean(-2)
+        return {
+            "fc_embs": fc_embs,
+            "attn_embs": attn_embs,
+            "attn_emb_mask": attn_emb_mask
+        }
 
 
 if __name__ == "__main__":
-    import os
-
-    state_dict = torch.load(os.path.join(os.getcwd(), "experiments/pretrained_encoder/CNN10.pth"), map_location="cpu")
-    encoder = CNN10Encoder(64, 527)
-
-    encoder.load_state_dict(state_dict, strict=False)
-
-    x = torch.randn(4, 1571, 64)
-
-    out = encoder(x, torch.tensor([1571, 1071, 985, 666]))
-    print(out[0].shape)
+    encoder = Cnn10Encoder(64, -1, -1)
+    # encoder = RnnEncoder(64, -1, 512, pooling="mean+max")
+    print(encoder)
+    raw_feats = torch.randn(4, 1571, 64)
+    raw_feat_lens = torch.tensor([1071, 666, 1571, 985])
+    attn_feats = torch.randn(4, 78, 512)
+    attn_feat_lens = torch.tensor([70, 78, 65, 55])
+    input_dict = {
+        "raw_feats": raw_feats,
+        # "fc_feats": None,
+        "attn_feats": attn_feats,
+        "attn_feat_lens": attn_feat_lens,
+        "raw_feat_lens": raw_feat_lens
+    }
+    output_dict = encoder(input_dict)
+    print("attn embs: ", output_dict["attn_embs"].shape)
+    print("fc embs: ", output_dict["fc_embs"].shape)
+    print("attn emb lens: ", output_dict["attn_emb_lens"])
