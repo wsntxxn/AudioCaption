@@ -1,4 +1,0 @@
-[submodule "pycocoevalcap"]
-    path = pycocoevalcap
-    url = https://github.com/wsntxxn/pycocoevalcap.git
-    ignore = all
