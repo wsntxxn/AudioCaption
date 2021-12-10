@@ -39,10 +39,22 @@ def mean_with_lens(features, lens):
     lens: [N,]
     """
     lens = torch.as_tensor(lens)
-    mask = generate_length_mask(lens).to(features.device) # [N, T]
+    if max(lens) != features.size(1):
+        max_length = features.size(1)
+        mask = generate_length_mask(lens, max_length)
+    else:
+        mask = generate_length_mask(lens)
+    mask = mask.to(features.device) # [N, T]
 
-    feature_mean = features * mask.unsqueeze(-1)
-    feature_mean = feature_mean.sum(1) / lens.unsqueeze(1).to(features.device)
+    while mask.ndim < features.ndim:
+        mask = mask.unsqueeze(-1)
+    feature_mean = features * mask
+    feature_mean = feature_mean.sum(1)
+    while lens.ndim < feature_mean.ndim:
+        lens = lens.unsqueeze(1)
+    feature_mean = feature_mean / lens.to(features.device)
+    # feature_mean = features * mask.unsqueeze(-1)
+    # feature_mean = feature_mean.sum(1) / lens.unsqueeze(1).to(features.device)
     return feature_mean
 
 def max_with_lens(features, lens):

@@ -62,23 +62,25 @@ class EmbeddingExtractor(object):
         with open(output, "wb") as f:
             pickle.dump(embeddings, f)
         
-    def extract_sbert(self, 
-                      input_json: str, 
+    def extract_sbert(self,
+                      input_json: str,
                       output: str):
         from sentence_transformers import SentenceTransformer
+        import json
         import torch
         from h5py import File
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        model = SentenceTransformer("bert-base-nli-mean-tokens")
+        model = SentenceTransformer("paraphrase-MiniLM-L6-v2")
         model = model.to(device)
         model.eval()
 
-        df = pd.read_json(input_json)
-
-        with torch.no_grad(), tqdm(total=df.shape[0], ascii=True) as pbar, File(output, "w") as store:
-            for idx, row in df.iterrows():
-                caption = row["caption"]
-                store[row["caption_key"]] = model.encode([caption]).squeeze(0)
+        data = json.load(open(input_json))["audios"]
+        with torch.no_grad(), tqdm(total=len(data), ascii=True) as pbar, File(output, "w") as store:
+            for sample in data:
+                audio_id = sample["audio_id"]
+                for cap in sample["captions"]:
+                    cap_id = cap["cap_id"]
+                    store[f"{audio_id}_{cap_id}"] = model.encode(cap["caption"])
                 pbar.update()
 
 

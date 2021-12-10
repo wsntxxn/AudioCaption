@@ -5,10 +5,17 @@ import sys
 import logging
 import yaml
 import torch
+from torch.optim.swa_utils import AveragedModel as torch_average_model
 import numpy as np
 import pandas as pd
 import sklearn.preprocessing as pre
 from pprint import pformat
+
+
+def load_dict_from_csv(csv, cols):
+    df = pd.read_csv(csv, sep="\t")
+    output = dict(zip(df[cols[0]], df[cols[1]]))
+    return output
 
 def genlogger(outputfile, level="INFO"):
     formatter = logging.Formatter(
@@ -58,7 +65,8 @@ def parse_config_or_kwargs(config_file, **kwargs):
     default_args = {
         "distributed": False,
         "swa": True,
-        "swa_start": 21
+        "swa_start": 21,
+        "sampler_args": {"max_cap_num": None},
     }
     with open(config_file) as con_reader:
         yaml_config = yaml.load(con_reader, Loader=yaml.FullLoader)
@@ -115,39 +123,6 @@ def criterion_improver(mode):
 def run_val(engine, evaluator, dataloader):
     evaluator.run(dataloader)
 
-# def generate_length_mask(lens):
-    # lens = torch.as_tensor(lens)
-    # N = lens.size(0)
-    # T = max(lens)
-    # idxs = torch.arange(T).repeat(N).view(N, T)
-    # mask = (idxs < lens.view(-1, 1))
-    # return mask
-
-# def mean_with_lens(features, lens):
-    # """
-    # features: [N, T, ...] (assume the second dimension represents length)
-    # lens: [N,]
-    # """
-    # lens = torch.as_tensor(lens)
-    # mask = generate_length_mask(lens).to(features.device) # [N, T]
-
-    # feature_mean = features * mask.unsqueeze(-1)
-    # feature_mean = feature_mean.sum(1) / lens.unsqueeze(1).to(features.device)
-    # return feature_mean
-
-# def max_with_lens(features, lens):
-    # """
-    # features: [N, T, ...] (assume the second dimension represents length)
-    # lens: [N,]
-    # """
-    # lens = torch.as_tensor(lens)
-    # mask = generate_length_mask(lens).to(features.device) # [N, T]
-
-    # feature_max = features.clone()
-    # feature_max[~mask] = float("-inf")
-    # feature_max, _ = feature_max.max(1)
-    # return feature_max
-
 def fix_batchnorm(model: torch.nn.Module):
     # classname = model.__class__.__name__
     # if classname.find("BatchNorm") != -1:
@@ -174,3 +149,24 @@ def load_pretrained_model(model: torch.nn.Module, pretrained, outputfun):
     model.load_state_dict(model_dict, strict=True)
 
 
+class AveragedModel(torch_average_model):
+
+    def update_parameters(self, model):
+        for p_swa, p_model in zip(self.parameters(), model.parameters()):
+            device = p_swa.device
+            p_model_ = p_model.detach().to(device)
+            if self.n_averaged == 0:
+                p_swa.detach().copy_(p_model_)
+            else:
+                p_swa.detach().copy_(self.avg_fn(p_swa.detach(), p_model_,
+                                                 self.n_averaged.to(device)))
+
+        for b_swa, b_model in zip(list(self.buffers())[1:], model.buffers()):
+            device = b_swa.device
+            b_model_ = b_model.detach().to(device)
+            if self.n_averaged == 0:
+                b_swa.detach().copy_(b_model_)
+            else:
+                b_swa.detach().copy_(self.avg_fn(b_swa.detach(), b_model_,
+                                                 self.n_averaged.to(device)))
+        self.n_averaged += 1

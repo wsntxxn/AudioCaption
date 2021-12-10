@@ -14,15 +14,12 @@ class ScstWrapper(nn.Module):
         self.model = model
 
     def forward(self, input_dict):
-        """Decode audio feature vectors and generates captions.
-        """
         if input_dict["mode"] == "train":
             output = self.scst(input_dict)
         else:
             output = self.model(input_dict)
         return output
 
-    # def scst(self, feats, feat_lens, keys, key2refs, vocabulary, **kwargs):
     def scst(self, input_dict):
         output = {}
 
@@ -70,18 +67,18 @@ class ScstWrapper(nn.Module):
         sampled_seqs = sampled_seqs.cpu().numpy()
 
         sampled_score = compute_batch_score(sampled_seqs,
-                                                       key2refs,
-                                                       keys,
-                                                       self.model.start_idx,
-                                                       self.model.end_idx,
-                                                       vocabulary,
-                                                       scorer)
-        greedy_score = compute_batch_score(greedy_seqs, 
-                                                      key2refs,
-                                                      keys,
-                                                      self.model.start_idx,
-                                                      self.model.end_idx,
-                                                      vocabulary,
-                                                      scorer)
+                                            key2refs,
+                                            keys,
+                                            self.model.start_idx,
+                                            self.model.end_idx,
+                                            vocabulary,
+                                            scorer)
+        greedy_score = compute_batch_score(greedy_seqs,
+                                           key2refs,
+                                           keys,
+                                           self.model.start_idx,
+                                           self.model.end_idx,
+                                           vocabulary,
+                                           scorer)
         reward = sampled_score - greedy_score
         return {"reward": reward, "score": sampled_score}
