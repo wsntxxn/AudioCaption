@@ -11,7 +11,8 @@ args = parser.parse_args()
 
 exp_path = Path(args.exp_path)
 if args.output is None:
-    args.output = exp_path / "scores.txt"
+    args.output = args.score_input
+args.output = exp_path / args.output
 
 scores = {}
 for path in exp_path.glob("seed_*"):
@@ -28,9 +29,14 @@ if len(scores) == 0:
     exit(1)
 
 with open(args.output, "w") as writer:
+    print("Average results: ", file=writer)
     for metric, score in scores.items():
         score = np.array(score)
         mean = np.mean(score)
         std = np.std(score)
         print(f"{metric}: {mean:.3f} (±{std:.3f})", file=writer)
-
+    print("", file=writer)
+    print("Best results: ", file=writer)
+    for metric, score in scores.items():
+        score = np.max(score)
+        print(f"{metric}: {score:.3f}", file=writer)

@@ -113,9 +113,9 @@ parser = argparse.ArgumentParser()
 parser.add_argument('wav_csv', type=str)
 parser.add_argument('feat_h5', type=str)
 parser.add_argument('feat_csv', type=str)
-parser.add_argument('-norm', default='mean')
 parser.add_argument('-nomono', default=False, action="store_true")
 parser.add_argument('--process_num', type=int, default=4)
+parser.add_argument('--blacklist', type=str, default=None)
 subparsers = parser.add_subparsers(help="subcommand help")
 
 stftparser = subparsers.add_parser('stft')
@@ -180,6 +180,12 @@ def pypeln_wrapper(extractfeat, **params):
     return extract
 
 wav_df = pd.read_csv(args.wav_csv, sep="\t")
+if args.blacklist is not None:
+    blacklist_samples = []
+    with open(args.blacklist, "r") as reader:
+        for line in reader.readlines():
+            blacklist_samples.append(line.strip())
+    wav_df = wav_df[~wav_df["audio_id"].isin(blacklist_samples)]
 feat_csv_data = []
 with h5py.File(args.feat_h5, "w") as feat_store, tqdm(total=wav_df.shape[0]) as pbar:
     for audio_id, feat in pr.map(pypeln_wrapper(args.extractfeat, **argsdict),

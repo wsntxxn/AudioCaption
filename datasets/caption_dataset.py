@@ -101,15 +101,16 @@ class CaptionDataset(CaptionEvalDataset):
         """
         audio_idx, cap_idx = index
         audio_id, raw_feat, fc_feat, attn_feat = super().__getitem__(audio_idx)
-        if "raw_name" in self._caption_info[audio_idx]:
-            audio_id = self._caption_info[audio_idx]["raw_name"]
-        # cap_id = self._caption_info[audio_idx]["captions"][cap_idx]["cap_id"]
+        # if "raw_name" in self._caption_info[audio_idx]:
+            # audio_id = self._caption_info[audio_idx]["raw_name"]
+        cap_id = self._caption_info[audio_idx]["captions"][cap_idx]["cap_id"]
+        cap_id = str(cap_id)
         tokens = self._caption_info[audio_idx]["captions"][cap_idx]["tokens"].split()
         caption = [self._vocabulary('<start>')] + \
             [self._vocabulary(token) for token in tokens] + \
             [self._vocabulary('<end>')]
         caption = torch.as_tensor(caption)
-        return raw_feat, fc_feat, attn_feat, caption, audio_id
+        return raw_feat, fc_feat, attn_feat, caption, audio_id, cap_id
 
     def __len__(self):
         length = 0
@@ -118,13 +119,121 @@ class CaptionDataset(CaptionEvalDataset):
         return length
 
 
+class CaptionConditionDataset(CaptionDataset):
+
+    def __init__(self,
+                 raw_audio_to_h5: Dict,
+                 fc_audio_to_h5: Dict,
+                 attn_audio_to_h5: Dict,
+                 caption_info: List,
+                 caption_to_condition: Dict,
+                 vocabulary: Vocabulary,
+                 transform: Optional[List] = None):
+        """Dataloader for audio captioning dataset
+
+        Args:
+            h5file_dict (Dict): Dictionary (<audio_id>: <hdf5_path>)
+            vocabulary (Vocabulary): Preloaded vocabulary object 
+            transform (List, optional): Defaults to None. Transformation onto the data (List of function)
+        """
+        super().__init__(raw_audio_to_h5, fc_audio_to_h5,
+                         attn_audio_to_h5, caption_info,
+                         vocabulary, transform)
+        self._caption_to_condition = caption_to_condition
+
+    def __getitem__(self, index: Tuple):
+        raw_feat, fc_feat, attn_feat, caption, \
+            audio_id, cap_id = super().__getitem__(index)
+        condition = self._caption_to_condition[f"{audio_id}_{cap_id}"]
+        condition = torch.as_tensor(condition)
+        return raw_feat, fc_feat, attn_feat, condition, caption, audio_id, cap_id
+
+
+class CaptionStructureDataset(CaptionDataset):
+
+    def __init__(self,
+                 raw_audio_to_h5: Dict,
+                 fc_audio_to_h5: Dict,
+                 attn_audio_to_h5: Dict,
+                 caption_info: List,
+                 vocabulary: Vocabulary,
+                 caption_to_structure: Dict,
+                 transform: Optional[List] = None):
+        """Dataloader for audio captioning dataset
+
+        Args:
+            h5file_dict (Dict): Dictionary (<audio_id>: <hdf5_path>)
+            vocabulary (Vocabulary): Preloaded vocabulary object 
+            transform (List, optional): Defaults to None. Transformation onto the data (List of function)
+        """
+        super().__init__(raw_audio_to_h5, fc_audio_to_h5,
+                         attn_audio_to_h5, caption_info,
+                         vocabulary, transform)
+        self._caption_to_structure = caption_to_structure
+
+    def __getitem__(self, index: Tuple):
+        raw_feat, fc_feat, attn_feat, caption, \
+            audio_id, cap_id = super().__getitem__(index)
+        structure = self._caption_to_structure[f"{audio_id}_{cap_id}"]
+        structure = torch.as_tensor(structure)
+        return raw_feat, fc_feat, attn_feat, structure, caption, audio_id, cap_id
+
+
+class RandomConditionDataset(CaptionEvalDataset):
+
+    def __init__(self,
+                 raw_audio_to_h5,
+                 fc_audio_to_h5,
+                 attn_audio_to_h5,
+                 caption_info,
+                 caption_to_condition,
+                 vocabulary,
+                 transform = None):
+        super().__init__(raw_audio_to_h5, fc_audio_to_h5,
+                         attn_audio_to_h5, transform)
+        self._vocabulary = vocabulary
+        self._num_audios = len(raw_audio_to_h5)
+        self._captions = []
+        cap_idx_to_condition = []
+        for item in caption_info:
+            audio_id = item["audio_id"]
+            for cap_item in item["captions"]:
+                cap_id = cap_item["cap_id"]
+                self._captions.append(cap_item["tokens"])
+                cap_idx_to_condition.append(caption_to_condition[f"{audio_id}_{cap_id}"])
+        self._cap_idx_to_condition = np.array(cap_idx_to_condition)
+        self._min_condition = min(cap_idx_to_condition)
+        self._max_condition = max(cap_idx_to_condition)
+
+    def __getitem__(self, index):
+        audio_idx = np.random.randint(0, self._num_audios)
+        audio_id, raw_feat, fc_feat, attn_feat = super().__getitem__(audio_idx)
+        condition = np.random.rand() * (self._max_condition - self._min_condition) + self._min_condition
+        cap_idx = np.argmin(np.abs(condition - self._cap_idx_to_condition))
+        tokens = self._captions[cap_idx].split()
+        caption = [self._vocabulary('<start>')] + \
+            [self._vocabulary(token) for token in tokens] + \
+            [self._vocabulary('<end>')]
+        caption = torch.as_tensor(caption)
+        condition = torch.as_tensor(condition)
+        return raw_feat, fc_feat, attn_feat, condition, caption, audio_id, "dummy_id"
+
+    def __len__(self):
+        return len(self._captions)
+
+
 class CaptionSampler(torch.utils.data.Sampler):
 
-    def __init__(self, data_source: CaptionDataset, audio_subset_indices: List = None, shuffle: bool = False):
+    def __init__(self, 
+                 data_source: CaptionDataset, 
+                 audio_subset_indices: List = None, 
+                 shuffle: bool = False,
+                 max_cap_num: int = None):
         self._caption_info = data_source._caption_info
         self._audio_subset_indices = audio_subset_indices
         self._shuffle = shuffle
         self._num_sample = None
+        self._max_cap_num = max_cap_num
 
     def __iter__(self):
         elems = []
@@ -133,7 +242,11 @@ class CaptionSampler(torch.utils.data.Sampler):
         else:
             audio_idxs = range(len(self._caption_info))
         for audio_idx in audio_idxs:
-            for cap_idx in range(len(self._caption_info[audio_idx]["captions"])):
+            if self._max_cap_num is None:
+                max_cap_num = len(self._caption_info[audio_idx]["captions"])
+            else:
+                max_cap_num = self._max_cap_num
+            for cap_idx in range(max_cap_num):
                 elems.append((audio_idx, cap_idx))
         self._num_sample = len(elems)
         if self._shuffle:
@@ -144,6 +257,40 @@ class CaptionSampler(torch.utils.data.Sampler):
         if self._num_sample is None:
             self.__iter__()
         return self._num_sample
+
+
+class ConditionOverSampler(CaptionSampler):
+
+    def __init__(self, 
+                 data_source: CaptionConditionDataset,
+                 shuffle: bool = True,
+                 threshold: float = 0.9,
+                 times: int = 4):
+        super().__init__(data_source, None, shuffle)
+        self._caption_to_condition = data_source._caption_to_condition
+        self._threshold = threshold
+        self._times = times
+
+    def __iter__(self):
+        elems = []
+        audio_idxs = range(len(self._caption_info))
+        for audio_idx in audio_idxs:
+            audio_id = self._caption_info[audio_idx]["audio_id"]
+            max_cap_num = len(self._caption_info[audio_idx]["captions"])
+            for cap_idx in range(max_cap_num):
+                cap_id = self._caption_info[audio_idx]["captions"][cap_idx]["cap_id"]
+                condition = self._caption_to_condition[f"{audio_id}_{cap_id}"]
+                if condition < self._threshold:
+                    for _ in range(self._times):
+                        elems.append((audio_idx, cap_idx))
+                else:
+                    elems.append((audio_idx, cap_idx))
+        self._num_sample = len(elems)
+        if self._shuffle:
+            random.shuffle(elems)
+        return iter(elems)
+
+    
 
 class CaptionDistributedSampler(torch.utils.data.distributed.DistributedSampler):
 

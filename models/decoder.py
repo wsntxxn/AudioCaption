@@ -106,6 +106,50 @@ class RnnFcDecoder(RnnDecoder):
 
         return output
 
+class RnnFcStartDecoder(RnnDecoder):
+
+    def __init__(self, emb_dim, vocab_size, fc_emb_dim, attn_emb_dim, dropout, d_model, **kwargs):
+        super().__init__(emb_dim, vocab_size, fc_emb_dim, attn_emb_dim, dropout, d_model, **kwargs)
+        self.model = getattr(nn, self.rnn_type)(
+            input_size=self.emb_dim,
+            hidden_size=self.d_model,
+            batch_first=True,
+            num_layers=self.num_layers,
+            bidirectional=self.bidirectional)
+        self.fc_proj = nn.Linear(self.fc_emb_dim, self.emb_dim)
+        self.apply(init)
+
+    def forward(self, input_dict):
+        device = self.word_embedding.weight.device
+        word = input_dict["word"]
+        state = input_dict.get("state", None)
+        fc_embs = input_dict["fc_embs"]
+
+        if word is not None:
+            word = word.to(device)
+            word_embed = self.in_dropout(self.word_embedding(word))
+        if fc_embs is not None:
+            fc_embed = self.fc_proj(fc_embs)
+
+        if word is not None and fc_embs is not None: # training, seq forward
+            embed = torch.cat((fc_embed.unsqueeze(1), word_embed), dim=1)
+        else:
+            if fc_embs is not None: # inference/schedule sampling, t = 0
+                embed = fc_embed.unsqueeze(1)
+            else:
+                embed = word_embed
+
+        out, state = self.model(embed, state)
+        # out: [N, T, hs], states: [num_layers * num_dire, N, hs]
+        logits = self.classifier(out)
+        output = {
+            "state": state,
+            "embeds": out,
+            "logits": logits
+        }
+
+        return output
+
 
 class Seq2SeqAttention(nn.Module):
 
@@ -301,6 +345,178 @@ class BahAttnDecoder2(RnnDecoder):
         return output
 
 
+class ConditionalBahAttnDecoder(RnnDecoder):
+
+    def __init__(self, emb_dim, vocab_size, fc_emb_dim, attn_emb_dim, dropout, d_model, **kwargs):
+        """
+        concatenate fc, attn, word to feed to the rnn
+        """
+        super().__init__(emb_dim, vocab_size, fc_emb_dim, attn_emb_dim, dropout, d_model, **kwargs)
+        attn_size = kwargs.get("attn_size", self.d_model)
+        self.model = getattr(nn, self.rnn_type)(
+            input_size=self.emb_dim * 3,
+            hidden_size=self.d_model,
+            batch_first=True,
+            num_layers=self.num_layers,
+            bidirectional=self.bidirectional)
+        self.attn = Seq2SeqAttention(self.attn_emb_dim,
+                                     self.d_model * (self.bidirectional + 1) * self.num_layers,
+                                     attn_size)
+        self.ctx_proj = nn.Linear(self.attn_emb_dim, self.emb_dim)
+        self.condition_embedding = nn.Embedding(2, emb_dim)
+        self.apply(init)
+
+    def forward(self, input_dict):
+        word = input_dict["word"]
+        state = input_dict.get("state", None) # [n_layer * n_dire, bs, d_model]
+        fc_embs = input_dict["fc_embs"]
+        attn_embs = input_dict["attn_embs"]
+        attn_emb_lens = input_dict["attn_emb_lens"]
+        conditions = input_dict["conditions"]
+
+        word = word.to(fc_embs.device)
+        embed = self.in_dropout(self.word_embedding(word))
+
+        conditions = torch.as_tensor([[1 - c, c] for c in conditions]).to(fc_embs.device)
+        condition_embs = torch.matmul(conditions, self.condition_embedding.weight)
+        # condition_embs: [N, emb_dim]
+
+        # embed: [N, 1, embed_size]
+        if state is None:
+            state = self.init_hidden(word.size(0), fc_embs.device)
+        if self.rnn_type == "LSTM":
+            query = state[0].transpose(0, 1).flatten(1)
+        else:
+            query = state.transpose(0, 1).flatten(1)
+        c, attn_weight = self.attn(query, attn_embs, attn_emb_lens)
+
+        p_ctx = self.ctx_proj(c)
+        rnn_input = torch.cat((embed, p_ctx.unsqueeze(1), condition_embs.unsqueeze(1)), dim=-1)
+
+        out, state = self.model(rnn_input, state)
+
+        output = {
+            "state": state,
+            "embeds": out,
+            "logits": self.classifier(out),
+            "weights": attn_weight
+        }
+        return output
+
+
+class StructBahAttnDecoder(RnnDecoder):
+
+    def __init__(self, emb_dim, vocab_size, fc_emb_dim, struct_vocab_size,
+                 attn_emb_dim, dropout, d_model, **kwargs):
+        """
+        concatenate fc, attn, word to feed to the rnn
+        """
+        super().__init__(emb_dim, vocab_size, fc_emb_dim, attn_emb_dim, dropout, d_model, **kwargs)
+        attn_size = kwargs.get("attn_size", self.d_model)
+        self.model = getattr(nn, self.rnn_type)(
+            input_size=self.emb_dim * 3,
+            hidden_size=self.d_model,
+            batch_first=True,
+            num_layers=self.num_layers,
+            bidirectional=self.bidirectional)
+        self.attn = Seq2SeqAttention(self.attn_emb_dim,
+                                     self.d_model * (self.bidirectional + 1) * self.num_layers,
+                                     attn_size)
+        self.ctx_proj = nn.Linear(self.attn_emb_dim, self.emb_dim)
+        self.struct_embedding = nn.Embedding(struct_vocab_size, emb_dim)
+        self.apply(init)
+
+    def forward(self, input_dict):
+        word = input_dict["word"]
+        state = input_dict.get("state", None) # [n_layer * n_dire, bs, d_model]
+        fc_embs = input_dict["fc_embs"]
+        attn_embs = input_dict["attn_embs"]
+        attn_emb_lens = input_dict["attn_emb_lens"]
+        structures = input_dict["structures"]
+
+        word = word.to(fc_embs.device)
+        embed = self.in_dropout(self.word_embedding(word))
+
+        struct_embs = self.struct_embedding(structures)
+        # struct_embs: [N, emb_dim]
+
+        # embed: [N, 1, embed_size]
+        if state is None:
+            state = self.init_hidden(word.size(0), fc_embs.device)
+        if self.rnn_type == "LSTM":
+            query = state[0].transpose(0, 1).flatten(1)
+        else:
+            query = state.transpose(0, 1).flatten(1)
+        c, attn_weight = self.attn(query, attn_embs, attn_emb_lens)
+
+        p_ctx = self.ctx_proj(c)
+        rnn_input = torch.cat((embed, p_ctx.unsqueeze(1), struct_embs.unsqueeze(1)), dim=-1)
+
+        out, state = self.model(rnn_input, state)
+
+        output = {
+            "state": state,
+            "embeds": out,
+            "logits": self.classifier(out),
+            "weights": attn_weight
+        }
+        return output
+
+
+class StyleBahAttnDecoder(RnnDecoder):
+
+    def __init__(self, emb_dim, vocab_size, fc_emb_dim, attn_emb_dim, dropout, d_model, **kwargs):
+        """
+        concatenate fc, attn, word to feed to the rnn
+        """
+        super().__init__(emb_dim, vocab_size, fc_emb_dim, attn_emb_dim, dropout, d_model, **kwargs)
+        attn_size = kwargs.get("attn_size", self.d_model)
+        self.model = getattr(nn, self.rnn_type)(
+            input_size=self.emb_dim * 3,
+            hidden_size=self.d_model,
+            batch_first=True,
+            num_layers=self.num_layers,
+            bidirectional=self.bidirectional)
+        self.attn = Seq2SeqAttention(self.attn_emb_dim,
+                                     self.d_model * (self.bidirectional + 1) * self.num_layers,
+                                     attn_size)
+        self.ctx_proj = nn.Linear(self.attn_emb_dim, self.emb_dim)
+        self.apply(init)
+
+    def forward(self, input_dict):
+        word = input_dict["word"]
+        state = input_dict.get("state", None) # [n_layer * n_dire, bs, d_model]
+        fc_embs = input_dict["fc_embs"]
+        attn_embs = input_dict["attn_embs"]
+        attn_emb_lens = input_dict["attn_emb_lens"]
+        styles = input_dict["styles"]
+
+        word = word.to(fc_embs.device)
+        embed = self.in_dropout(self.word_embedding(word))
+
+        # embed: [N, 1, embed_size]
+        if state is None:
+            state = self.init_hidden(word.size(0), fc_embs.device)
+        if self.rnn_type == "LSTM":
+            query = state[0].transpose(0, 1).flatten(1)
+        else:
+            query = state.transpose(0, 1).flatten(1)
+        c, attn_weight = self.attn(query, attn_embs, attn_emb_lens)
+
+        p_ctx = self.ctx_proj(c)
+        rnn_input = torch.cat((embed, p_ctx.unsqueeze(1), styles.unsqueeze(1)), dim=-1)
+
+        out, state = self.model(rnn_input, state)
+
+        output = {
+            "state": state,
+            "embeds": out,
+            "logits": self.classifier(out),
+            "weights": attn_weight
+        }
+        return output
+
+
 class BahAttnDecoder3(RnnDecoder):
 
     def __init__(self, emb_dim, vocab_size, fc_emb_dim, attn_emb_dim, dropout, d_model, **kwargs):
@@ -362,6 +578,59 @@ class BahAttnDecoder3(RnnDecoder):
         return output
 
 
+class SpecificityBahAttnDecoder(RnnDecoder):
+
+    def __init__(self, emb_dim, vocab_size, fc_emb_dim, attn_emb_dim, dropout, d_model, **kwargs):
+        """
+        concatenate fc, attn, word to feed to the rnn
+        """
+        super().__init__(emb_dim, vocab_size, fc_emb_dim, attn_emb_dim, dropout, d_model, **kwargs)
+        attn_size = kwargs.get("attn_size", self.d_model)
+        self.model = getattr(nn, self.rnn_type)(
+            input_size=self.emb_dim + attn_emb_dim + 1,
+            hidden_size=self.d_model,
+            batch_first=True,
+            num_layers=self.num_layers,
+            bidirectional=self.bidirectional)
+        self.attn = Seq2SeqAttention(self.attn_emb_dim,
+                                     self.d_model * (self.bidirectional + 1) * self.num_layers,
+                                     attn_size)
+        self.ctx_proj = lambda x: x
+        self.apply(init)
+
+    def forward(self, input_dict):
+        word = input_dict["word"]
+        state = input_dict.get("state", None) # [n_layer * n_dire, bs, d_model]
+        fc_embs = input_dict["fc_embs"]
+        attn_embs = input_dict["attn_embs"]
+        attn_emb_lens = input_dict["attn_emb_lens"]
+        conditions = input_dict["conditions"] # [N,]
+
+        word = word.to(fc_embs.device)
+        embed = self.in_dropout(self.word_embedding(word))
+
+        # embed: [N, 1, embed_size]
+        if state is None:
+            state = self.init_hidden(word.size(0), fc_embs.device)
+        if self.rnn_type == "LSTM":
+            query = state[0].transpose(0, 1).flatten(1)
+        else:
+            query = state.transpose(0, 1).flatten(1)
+        c, attn_weight = self.attn(query, attn_embs, attn_emb_lens)
+
+        p_ctx = self.ctx_proj(c)
+        rnn_input = torch.cat((embed, p_ctx.unsqueeze(1), conditions.reshape(-1, 1, 1)), dim=-1)
+
+        out, state = self.model(rnn_input, state)
+
+        output = {
+            "state": state,
+            "embeds": out,
+            "logits": self.classifier(out),
+            "weights": attn_weight
+        }
+        return output
+
 class PositionalEncoding(nn.Module):
 
     def __init__(self, d_model, dropout=0.1, max_len=100):
@@ -398,13 +667,13 @@ class TransformerDecoder(BaseDecoder):
                                            dropout=dropout)
         self.model = nn.TransformerDecoder(layer, self.nlayers)
         self.classifier = nn.Linear(self.d_model, vocab_size)
-        # self.attn_proj = nn.Sequential(
-            # nn.Linear(self.attn_emb_dim, self.d_model),
-            # nn.ReLU(),
-            # nn.Dropout(dropout),
-            # nn.LayerNorm(self.d_model)
-        # )
-        self.attn_proj = lambda x: x
+        self.attn_proj = nn.Sequential(
+            nn.Linear(self.attn_emb_dim, self.d_model),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.LayerNorm(self.d_model)
+        )
+        # self.attn_proj = lambda x: x
         self.init_params()
 
     def init_params(self):
