@@ -199,7 +199,7 @@ class BaseRunner(object):
                         "caption": pred
                     })
 
-            from captioning.pycocoevalcap.tokenizer.ptbtokenizer import PTBTokenizer
+            from pycocoevalcap.tokenizer.ptbtokenizer import PTBTokenizer
 
             tokenizer = PTBTokenizer()
             key2refs = tokenizer.tokenize(refs4eval)
@@ -232,11 +232,11 @@ class BaseRunner(object):
             else:
                 pred = pred_item["tokens"]
             key2pred[pred_item["filename"]] = [pred,]
-        from captioning.pycocoevalcap.bleu.bleu import Bleu
-        from captioning.pycocoevalcap.rouge.rouge import Rouge
-        from captioning.pycocoevalcap.cider.cider import Cider
-        from captioning.pycocoevalcap.meteor.meteor import Meteor
-        from captioning.pycocoevalcap.spice.spice import Spice
+        from pycocoevalcap.bleu.bleu import Bleu
+        from pycocoevalcap.rouge.rouge import Rouge
+        from pycocoevalcap.cider.cider import Cider
+        from pycocoevalcap.meteor.meteor import Meteor
+        from pycocoevalcap.spice.spice import Spice
         scorers = [Bleu(n=4), Rouge(), Cider()]
         if not zh:
             scorers.append(Meteor())
@@ -411,11 +411,11 @@ class BaseRunner(object):
             for caption in captions[audio_idx]["captions"]:
                 key2refs[audio_id].append(caption["tokens" if zh else "caption"])
 
-        from captioning.pycocoevalcap.bleu.bleu import Bleu
-        from captioning.pycocoevalcap.rouge.rouge import Rouge
-        from captioning.pycocoevalcap.cider.cider import Cider
-        from captioning.pycocoevalcap.meteor.meteor import Meteor
-        from captioning.pycocoevalcap.spice.spice import Spice
+        from pycocoevalcap.bleu.bleu import Bleu
+        from pycocoevalcap.rouge.rouge import Rouge
+        from pycocoevalcap.cider.cider import Cider
+        from pycocoevalcap.meteor.meteor import Meteor
+        from pycocoevalcap.spice.spice import Spice
 
         scorers = [Bleu(n=4), Rouge(), Cider()]
         if not zh:
@@ -646,19 +646,6 @@ class BaseRunner(object):
             f.write("Spice: {:6.3f}\n".format(score))
             spice = score
             f.write("Spider: {:6.3f}\n".format((cider + spice) / 2))
-
-        # from audiocaptioneval.sentbert.sentencebert import SentenceBert
-        # scorer = SentenceBert(zh=zh)
-        # if caption_embedding_path is not None:
-            # key2ref_embeds = np.load(caption_embedding_path, allow_pickle=True)
-            # score, scores = scorer.compute_score(key2ref_embeds, key2pred)
-        # else:
-            # score, scores = scorer.compute_score(key2refs, key2pred)
-        # f.write("SentenceBert: {:6.3f}\n".format(score))
-
-        from utils.diverse_eval import diversity_evaluate
-        score = diversity_evaluate(pred_df)
-        f.write("Diversity: {:6.3f}\n".format(score))
 
         f.close()
 
