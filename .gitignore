@@ -113,6 +113,7 @@ experiments*/*
 
 # Data files
 data/*
+!data/augment
 !data/*.py
 !data/README.md
 
@@ -120,7 +121,7 @@ data/*
 utils/dataserver/*
 
 # Backup files
-.backup/*
+.backup
 
 # Vscode files
 .vscode/*
@@ -130,7 +131,3 @@ logs/
 
 # Sed support
 sed/
-
-# Submodule git files
-*.git
-pycocoevalcap
