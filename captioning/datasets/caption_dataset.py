@@ -1,3 +1,4 @@
+import os
 import math
 import random
 from typing import List, Optional, Dict, Tuple
@@ -6,8 +7,10 @@ import numpy as np
 import pandas as pd
 import torch
 import h5py
+from tqdm import tqdm
 
 from captioning.utils.build_vocab import Vocabulary
+
 
 class CaptionEvalDataset(torch.utils.data.Dataset):
     
@@ -15,6 +18,7 @@ class CaptionEvalDataset(torch.utils.data.Dataset):
                  raw_audio_to_h5: Dict,
                  fc_audio_to_h5: Dict,
                  attn_audio_to_h5: Dict,
+                 load_into_mem: bool = False,
                  transform: Optional[List] = None):
         """audio captioning dataset object for inference and evaluation
 
@@ -38,27 +42,59 @@ class CaptionEvalDataset(torch.utils.data.Dataset):
         with h5py.File(self._attn_audio_to_h5[first_audio_id], 'r') as store:
             self.attn_feat_dim = store[first_audio_id].shape[-1]
 
+        self._load_into_mem = load_into_mem
+        if self._load_into_mem:
+            self.aid_to_raw = {}
+            self.aid_to_fc = {}
+            self.aid_to_attn = {}
+            # TODO load into memory following the original sequence in HDF5
+            for audio_id in tqdm(self._audio_ids, ascii=True):
+                raw_feat_h5 = self._raw_audio_to_h5[audio_id]
+                if not raw_feat_h5 in self._dataset_cache:
+                    self._dataset_cache[raw_feat_h5] = h5py.File(raw_feat_h5, "r")
+                raw_feat = self._dataset_cache[raw_feat_h5][audio_id][()]
+
+                fc_feat_h5 = self._fc_audio_to_h5[audio_id]
+                if not fc_feat_h5 in self._dataset_cache:
+                    self._dataset_cache[fc_feat_h5] = h5py.File(fc_feat_h5, "r")
+                fc_feat = self._dataset_cache[fc_feat_h5][audio_id][()]
+
+                attn_feat_h5 = self._attn_audio_to_h5[audio_id]
+                if not attn_feat_h5 in self._dataset_cache:
+                    self._dataset_cache[attn_feat_h5] = h5py.File(attn_feat_h5, "r")
+                attn_feat = self._dataset_cache[attn_feat_h5][audio_id][()]
+                self.aid_to_raw[audio_id] = raw_feat
+                self.aid_to_fc[audio_id] = fc_feat
+                self.aid_to_attn[audio_id] = attn_feat
+
     def __getitem__(self, index):
         audio_id = self._audio_ids[index]
 
-        raw_feat_h5 = self._raw_audio_to_h5[audio_id]
-        if not raw_feat_h5 in self._dataset_cache:
-            self._dataset_cache[raw_feat_h5] = h5py.File(raw_feat_h5, "r")
-        raw_feat = self._dataset_cache[raw_feat_h5][audio_id][()]
+        if self._load_into_mem:
+            raw_feat = self.aid_to_raw[audio_id]
+            fc_feat = self.aid_to_fc[audio_id]
+            attn_feat = self.aid_to_attn[audio_id]
+        else:
+            raw_feat_h5 = self._raw_audio_to_h5[audio_id]
+            if not raw_feat_h5 in self._dataset_cache:
+                self._dataset_cache[raw_feat_h5] = h5py.File(raw_feat_h5, "r")
+            raw_feat = self._dataset_cache[raw_feat_h5][audio_id][()]
 
-        fc_feat_h5 = self._fc_audio_to_h5[audio_id]
-        if not fc_feat_h5 in self._dataset_cache:
-            self._dataset_cache[fc_feat_h5] = h5py.File(fc_feat_h5, "r")
-        fc_feat = self._dataset_cache[fc_feat_h5][audio_id][()]
+            fc_feat_h5 = self._fc_audio_to_h5[audio_id]
+            if not fc_feat_h5 in self._dataset_cache:
+                self._dataset_cache[fc_feat_h5] = h5py.File(fc_feat_h5, "r")
+            fc_feat = self._dataset_cache[fc_feat_h5][audio_id][()]
 
-        attn_feat_h5 = self._attn_audio_to_h5[audio_id]
-        if not attn_feat_h5 in self._dataset_cache:
-            self._dataset_cache[attn_feat_h5] = h5py.File(attn_feat_h5, "r")
-        attn_feat = self._dataset_cache[attn_feat_h5][audio_id][()]
+            attn_feat_h5 = self._attn_audio_to_h5[audio_id]
+            if not attn_feat_h5 in self._dataset_cache:
+                self._dataset_cache[attn_feat_h5] = h5py.File(attn_feat_h5, "r")
+            attn_feat = self._dataset_cache[attn_feat_h5][audio_id][()]
 
         if self._transform:
+            # for transform in self._transform:
+                # raw_feat = transform(raw_feat)
             for transform in self._transform:
-                raw_feat = transform(raw_feat)
+                attn_feat = transform(attn_feat)
         return audio_id, torch.as_tensor(raw_feat), torch.as_tensor(fc_feat), torch.as_tensor(attn_feat)
 
     def __len__(self):
@@ -81,17 +117,24 @@ class CaptionDataset(CaptionEvalDataset):
                  attn_audio_to_h5: Dict,
                  caption_info: List,
                  vocabulary: Vocabulary,
+                 load_into_mem: bool = False,
                  transform: Optional[List] = None):
         """Dataloader for audio captioning dataset
 
         Args:
-            h5file_dict (Dict): Dictionary (<audio_id>: <hdf5_path>)
+            raw_audio_to_h5 (Dict): Mapping from audio id to raw feature hdf5 (<audio_id>: <hdf5_path>)
+            fc_audio_to_h5 (Dict): Mapping from audio id to pre-trained fc hdf5 (<audio_id>: <hdf5_path>)
+            attn_audio_to_h5 (Dict): Mapping from audio id to pre-trained attn feature hdf5 (<audio_id>: <hdf5_path>)
             vocabulary (Vocabulary): Preloaded vocabulary object 
             transform (List, optional): Defaults to None. Transformation onto the data (List of function)
         """
-        super().__init__(raw_audio_to_h5, fc_audio_to_h5, attn_audio_to_h5, transform)
+        audio_ids = [info["audio_id"] for info in caption_info]
+        raw_audio_to_h5 = {aid: raw_audio_to_h5[aid] for aid in audio_ids}
+        fc_audio_to_h5 = {aid: fc_audio_to_h5[aid] for aid in audio_ids}
+        attn_audio_to_h5 = {aid: attn_audio_to_h5[aid] for aid in audio_ids}
+        super().__init__(raw_audio_to_h5, fc_audio_to_h5, attn_audio_to_h5, load_into_mem, transform)
         # Important!!! reset audio id list, otherwise there is problem in matching!
-        self._audio_ids = [info["audio_id"] for info in caption_info]
+        self._audio_ids = audio_ids
         self._caption_info = caption_info
         self._vocabulary = vocabulary
 
@@ -220,6 +263,33 @@ class RandomConditionDataset(CaptionEvalDataset):
 
     def __len__(self):
         return len(self._captions)
+
+
+class CaptionKeywordProbDataset(CaptionDataset):
+
+    def __init__(self,
+                 raw_audio_to_h5: Dict,
+                 fc_audio_to_h5: Dict,
+                 attn_audio_to_h5: Dict,
+                 keyword_audio_to_h5: Dict,
+                 caption_info: List,
+                 vocabulary: Vocabulary,
+                 load_into_mem: bool,
+                 transform: Optional[List]):
+        super().__init__(raw_audio_to_h5, fc_audio_to_h5, attn_audio_to_h5,
+                         caption_info, vocabulary, load_into_mem=load_into_mem,
+                         transform=transform)
+        self._keyword_audio_to_h5 = keyword_audio_to_h5
+
+    def __getitem__(self, index: Tuple):
+        raw_feat, fc_feat, attn_feat, caption, \
+            audio_id, cap_id = super().__getitem__(index)
+        keyword_h5 = self._keyword_audio_to_h5[audio_id]
+        if not keyword_h5 in self._dataset_cache:
+            self._dataset_cache[keyword_h5] = h5py.File(keyword_h5, "r")
+        keyword = self._dataset_cache[keyword_h5][audio_id][()]
+        keyword = torch.as_tensor(keyword)
+        return raw_feat, fc_feat, attn_feat, keyword, caption, audio_id 
 
 
 class CaptionSampler(torch.utils.data.Sampler):
@@ -387,12 +457,25 @@ def collate_fn(length_idxs: List = [], sort_idx = None):
 
 if __name__ == "__main__":
     import argparse
+    import sys
     import json
     import pickle
+    from tqdm import tqdm
+    torch.multiprocessing.set_sharing_strategy('file_system')
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        'feature_csv',
+        'raw_csv',
         default='data/clotho_v2/dev/lms.csv',
+        type=str,
+        nargs="?")
+    parser.add_argument(
+        'fc_csv',
+        default='data/clotho_v2/dev/panns_wavegram_logmel_cnn14_fc.csv',
+        type=str,
+        nargs="?")
+    parser.add_argument(
+        'attn_csv',
+        default='data/clotho_v2/dev/panns_wavegram_logmel_cnn14_attn.csv',
         type=str,
         nargs="?")
     parser.add_argument(
@@ -407,31 +490,39 @@ if __name__ == "__main__":
         nargs="?")
     args = parser.parse_args()
     caption_info = json.load(open(args.annotation_file, "r"))["audios"]
-    feature_df = pd.read_csv(args.feature_csv, sep="\t")
+    raw_df = pd.read_csv(args.raw_csv, sep="\t")
+    fc_df = pd.read_csv(args.fc_csv, sep="\t")
+    attn_df = pd.read_csv(args.attn_csv, sep="\t")
     vocabulary = pickle.load(open(args.vocab_file, "rb"))
     random.seed(1)
     np.random.seed(1)
     torch.manual_seed(1)
     dataset = CaptionDataset(
-        dict(zip(feature_df["audio_id"], feature_df["hdf5_path"])),
+        dict(zip(raw_df["audio_id"], raw_df["hdf5_path"])),
+        dict(zip(fc_df["audio_id"], fc_df["hdf5_path"])),
+        dict(zip(attn_df["audio_id"], attn_df["hdf5_path"])),
         caption_info,
-        vocabulary
+        vocabulary,
+        load_into_mem=True
     )
     # for feat, target in dataset:
         # print(feat.shape, target.shape)
     sampler = CaptionSampler(dataset, shuffle=True)
     dataloader = torch.utils.data.DataLoader(
         dataset,
-        batch_size=16,
-        collate_fn=collate_fn([0, 1], 1),
+        batch_size=64,
+        collate_fn=collate_fn([0, 2, 3], 3),
         num_workers=4,
         sampler=sampler)
-    agg = 0
-    for feat, target, audio_ids, feat_lens, cap_lens in dataloader:
-        agg += len(feat)
-        print(feat.shape, target.shape, cap_lens)
-        print(audio_ids)
-        break
-    print("Overall seen {} feats (of {})".format(agg, len(dataset)))
+    idx = 0
+    import time
+    start = time.time()
+    for batch in tqdm(dataloader, unit="batch"):
+        idx += 1
+        end = time.time()
+        # print("batch ", idx, "{:.3f} seconds".format(end - start))
+        start = end
+        sys.stdout.flush()
+        pass
 
 

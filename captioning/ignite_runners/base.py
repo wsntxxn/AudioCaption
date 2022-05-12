@@ -14,6 +14,7 @@ from ignite.contrib.handlers import ProgressBar
 import captioning.utils.train_util as train_util
 import captioning.datasets.caption_dataset as ac_dataset
 
+
 class BaseRunner(object):
     """Main class to run experiments"""
     def __init__(self, seed=1):
@@ -59,7 +60,8 @@ class BaseRunner(object):
             )
             # TODO DistributedCaptionSampler
             # train_sampler = torch.utils.data.DistributedSampler(train_dataset) if config["distributed"] else None
-            train_sampler = ac_dataset.CaptionSampler(train_dataset, train_audio_idxs, True, **config["sampler_args"])
+            train_sampler = ac_dataset.CaptionSampler(train_dataset, train_audio_idxs,
+                shuffle=True, **config["sampler_args"])
             train_dataloader = torch.utils.data.DataLoader(
                 train_dataset,
                 collate_fn=ac_dataset.collate_fn([0, 2, 3], 3),
@@ -112,13 +114,18 @@ class BaseRunner(object):
             )
             # TODO DistributedCaptionSampler
             # train_sampler = torch.utils.data.DistributedSampler(train_dataset) if config["distributed"] else None
-            train_sampler = ac_dataset.CaptionSampler(train_dataset, shuffle=True, **config["sampler_args"])
+            train_sampler = ac_dataset.CaptionSampler(train_dataset, shuffle=True,
+                **config["sampler_args"])
             train_dataloader = torch.utils.data.DataLoader(
                 train_dataset,
                 collate_fn=ac_dataset.collate_fn([0, 2, 3], 3),
                 sampler=train_sampler,
                 **config["dataloader_args"]
             )
+            val_audio_ids = [item["audio_id"] for item in data["val"]["caption_info"]]
+            for key in ["raw_audio_to_h5", "fc_audio_to_h5", "attn_audio_to_h5"]:
+                data["val"][key] = {aid: data["val"][key][aid] for aid in data["val"][key] \
+                    if aid in val_audio_ids}
             val_dataset = ac_dataset.CaptionEvalDataset(
                 data["val"]["raw_audio_to_h5"],
                 data["val"]["fc_audio_to_h5"],
@@ -237,10 +244,13 @@ class BaseRunner(object):
         from pycocoevalcap.cider.cider import Cider
         from pycocoevalcap.meteor.meteor import Meteor
         from pycocoevalcap.spice.spice import Spice
+        from fense.fense import Fense
+
         scorers = [Bleu(n=4), Rouge(), Cider()]
         if not zh:
             scorers.append(Meteor())
             scorers.append(Spice())
+            scorers.append(Fense())
         scores_output = self._eval_prediction(key2refs, key2pred, scorers, pretokenized=zh)
         spider = 0
         for name, score in scores_output.items():
@@ -390,6 +400,12 @@ class BaseRunner(object):
         if attn_feat_csv is None:
             attn_feat_csv = default_eval_data[task]["attn_feat_csv"]
         experiment_path = Path(experiment_path)
+        
+        if not (experiment_path / caption_output).parent.exists():
+            (experiment_path / caption_output).parent.mkdir()
+        if not (experiment_path / score_output).parent.exists():
+            (experiment_path / score_output).parent.mkdir()
+
         # Previous training config
         config = train_util.parse_config_or_kwargs(experiment_path / "config.yaml")
         zh = config["zh"]
@@ -416,11 +432,13 @@ class BaseRunner(object):
         from pycocoevalcap.cider.cider import Cider
         from pycocoevalcap.meteor.meteor import Meteor
         from pycocoevalcap.spice.spice import Spice
+        from fense.fense import Fense
 
         scorers = [Bleu(n=4), Rouge(), Cider()]
         if not zh:
             scorers.append(Meteor())
             scorers.append(Spice())
+            scorers.append(Fense())
         scores_output = self._eval_prediction(key2refs, key2pred, scorers, pretokenized=zh)
 
         with open(experiment_path / score_output, "w") as f:
@@ -439,7 +457,9 @@ class BaseRunner(object):
     def train_evaluate(self, config, task, **kwargs):
         experiment_path = self.train(config, **kwargs)
         for save_type in ["best", "last", "swa"]:
-            self.evaluate(experiment_path, task, save_type=save_type, score_output=f"{save_type}.txt", method="beam")
+            self.evaluate(experiment_path, task, save_type=save_type,
+                caption_output=f"{save_type}.json", score_output=f"{save_type}.txt", 
+                method="beam")
         return experiment_path
 
     def dcase_predict(self,

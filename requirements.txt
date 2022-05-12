@@ -7,9 +7,9 @@ tqdm==4.36.1
 nltk==3.5
 fire==0.2.1
 zhon==1.1.5
-scikit_learn==0.21.3
 PyYAML==5.1.2
 gensim==3.8.3
 h5py==3.1.0
 pypeln==0.4.7
 kaldiio==2.16.0a1
+pycocoevalcap==1.2

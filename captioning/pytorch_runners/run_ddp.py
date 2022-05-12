@@ -3,17 +3,15 @@
 import os
 import sys
 import pickle
+import datetime
+import uuid
 from pathlib import Path
 
 import fire
 import numpy as np
 import torch
-from ignite.engine.engine import Engine, Events
-from ignite.metrics import RunningAverage
-from ignite.handlers import ModelCheckpoint
-from ignite.contrib.handlers import ProgressBar
-from ignite.utils import convert_tensor
 from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
 
 import captioning.models
 import captioning.models.encoder
@@ -21,7 +19,7 @@ import captioning.models.decoder
 import captioning.losses.loss as losses
 import captioning.utils.train_util as train_util
 from captioning.utils.build_vocab import Vocabulary
-from captioning.ignite_runners.base import BaseRunner
+from captioning.pytorch_runners.base import BaseRunner
 
 class Runner(BaseRunner):
 
@@ -39,7 +37,6 @@ class Runner(BaseRunner):
             train_util.load_pretrained_model(encoder, 
                                              config["pretrained_encoder"],
                                              outputfun)
-
         decoder = getattr(
             captioning.models.decoder, config["decoder"])(
             vocab_size=len(vocabulary),
@@ -60,7 +57,7 @@ class Runner(BaseRunner):
             encoder, decoder, **config["model_args"]
         )
         if "pretrained" in config:
-            train_util.load_pretrained_model(model, 
+            train_util.load_pretrained_model(model,
                                              config["pretrained"],
                                              outputfun)
         return model
@@ -83,15 +80,9 @@ class Runner(BaseRunner):
             raw_feat_lens = batch[-2]
             attn_feat_lens = batch[-1]
 
-        raw_feats = convert_tensor(raw_feats.float(),
-                                   device=self.device,
-                                   non_blocking=True)
-        fc_feats = convert_tensor(fc_feats.float(),
-                                  device=self.device,
-                                  non_blocking=True)
-        attn_feats = convert_tensor(attn_feats.float(),
-                                    device=self.device,
-                                    non_blocking=True)
+        raw_feats = raw_feats.float().to(self.device)
+        fc_feats = fc_feats.float().to(self.device)
+        attn_feats = attn_feats.float().to(self.device)
         input_dict = {
             "mode": "train" if mode == "train" else "inference",
             "raw_feats": raw_feats,
@@ -102,15 +93,11 @@ class Runner(BaseRunner):
         }
 
         if mode == "train":
-            caps = convert_tensor(caps.long(),
-                                  device=self.device,
-                                  non_blocking=True)
-
+            caps = caps.long().to(self.device)
             input_dict["caps"] = caps
             input_dict["cap_lens"] = cap_lens
             input_dict["ss_ratio"] = kwargs["ss_ratio"]
             output = model(input_dict)
-
             output["targets"] = caps[:, 1:]
             output["lens"] = torch.as_tensor(cap_lens - 1)
         else:
@@ -118,6 +105,14 @@ class Runner(BaseRunner):
             output = model(input_dict)
 
         return output
+
+    def _update_ss_ratio(self, config):
+        mode = config["ss_args"]["ss_mode"]
+        total_iters = config["data"]["total_iters"]
+        if mode == "exponential":
+            self.ss_ratio *= 0.01 ** (1.0 / total_iters)
+        elif mode == "linear":
+            self.ss_ratio -= (1.0 - config["ss_args"]["final_ss_ratio"]) / total_iters
 
     def train(self, config, **kwargs):
         """Trains a model on the given configurations.
@@ -139,7 +134,6 @@ class Runner(BaseRunner):
             assert kwargs["local_rank"] == self.local_rank
             torch.cuda.set_device(self.local_rank)
             self.device = torch.device("cuda", self.local_rank)
-            # self.group = torch.distributed.new_group()
 
         #########################
         # Create checkpoint directory
@@ -147,7 +141,8 @@ class Runner(BaseRunner):
         if not conf["distributed"] or not self.local_rank:
             outputdir = Path(conf["outputpath"]) / conf["model"] / \
                 conf["remark"] / f"seed_{self.seed}"
-
+                # "{}_{}".format(datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%m"),
+                               # uuid.uuid1().hex)
             outputdir.mkdir(parents=True, exist_ok=True)
             logger = train_util.genlogger(str(outputdir / "train.log"))
             # print passed config parameters
@@ -160,6 +155,7 @@ class Runner(BaseRunner):
         #########################
         # Create dataloaders
         #########################
+        zh = conf["zh"]
         vocabulary = pickle.load(open(conf["data"]["vocab_file"], "rb"))
         conf["vocabulary"] = vocabulary
         dataloaders = self._get_dataloaders(conf)
@@ -169,9 +165,11 @@ class Runner(BaseRunner):
         conf["data"]["raw_feat_dim"] = train_dataloader.dataset.raw_feat_dim
         conf["data"]["fc_feat_dim"] = train_dataloader.dataset.fc_feat_dim
         conf["data"]["attn_feat_dim"] = train_dataloader.dataset.attn_feat_dim
+        total_iters = len(train_dataloader) * conf["epochs"]
+        conf["data"]["total_iters"] = total_iters
 
         #########################
-        # Initialize model
+        # Build model
         #########################
         if not conf["distributed"] or not self.local_rank:
             model = self._get_model(conf, logger.info)
@@ -182,6 +180,7 @@ class Runner(BaseRunner):
             model = torch.nn.parallel.distributed.DistributedDataParallel(
                 model, device_ids=[self.local_rank,], output_device=self.local_rank,
                 find_unused_parameters=True)
+        swa_model = torch.optim.swa_utils.AveragedModel(model)
         if not conf["distributed"] or not self.local_rank:
             train_util.pprint_dict(model, logger.info, formatter="pretty")
             num_params = 0
@@ -190,11 +189,11 @@ class Runner(BaseRunner):
             logger.info(f"{num_params} parameters in total")
 
         #########################
-        # Create loss function and saving criterion
+        # Build loss function and optimizer
         #########################
         optimizer = getattr(torch.optim, conf["optimizer"])(
             model.parameters(), **conf["optimizer_args"])
-        criterion = getattr(losses, conf["loss"])(**conf["loss_args"])
+        loss_fn = getattr(losses, conf["loss"])(**conf["loss_args"])
         if not conf["distributed"] or not self.local_rank:
             train_util.pprint_dict(optimizer, logger.info, formatter="pretty")
             crtrn_imprvd = train_util.criterion_improver(conf["improvecriterion"])
@@ -203,87 +202,8 @@ class Runner(BaseRunner):
         # Tensorboard record
         #########################
         if not conf["distributed"] or not self.local_rank:
-            tensorboard_writer = SummaryWriter(outputdir / "run")
+            tb_writer = SummaryWriter(outputdir / "run")
 
-        #########################
-        # Define training engine
-        #########################
-        def _train_batch(engine, batch):
-            if conf["distributed"]:
-                train_dataloader.sampler.set_epoch(engine.state.epoch)
-            model.train()
-            with torch.enable_grad():
-                optimizer.zero_grad()
-                output = self._forward(
-                    model, batch, "train",
-                    ss_ratio=conf["ss_args"]["ss_ratio"]
-                )
-                # loss = criterion(output["packed_logits"], output["targets"]).to(self.device)
-                loss = criterion(output).to(self.device)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), conf["max_grad_norm"])
-                optimizer.step()
-                output["loss"] = loss.item()
-                if not conf["distributed"] or not self.local_rank:
-                    tensorboard_writer.add_scalar("loss/train", loss.item(), engine.state.iteration)
-                return output
-
-        trainer = Engine(_train_batch)
-        RunningAverage(output_transform=lambda x: x["loss"]).attach(trainer, "running_loss")
-        pbar = ProgressBar(persist=False, ascii=True, ncols=100)
-        pbar.attach(trainer, ["running_loss"])
-        train_metrics = {
-            "loss": losses.Loss(criterion)
-        }
-        for name, metric in train_metrics.items():
-            metric.attach(trainer, name)
-        # scheduled sampling
-        if conf["ss"]:
-            @trainer.on(Events.ITERATION_STARTED)
-            def update_ss_ratio(engine):
-                num_iter = len(train_dataloader)
-                num_epoch = conf["epochs"]
-                mode = conf["ss_args"]["ss_mode"]
-                if mode == "exponential":
-                    conf["ss_args"]["ss_ratio"] *= 0.01 ** (1.0 / num_epoch / num_iter)
-                elif mode == "linear":
-                    conf["ss_args"]["ss_ratio"] -= (1.0 - conf["ss_args"]["final_ss_ratio"]) / num_epoch / num_iter
-        # stochastic weight averaging
-        if conf["swa"]:
-            swa_model = train_util.AveragedModel(model)
-            @trainer.on(Events.EPOCH_COMPLETED)
-            def update_swa(engine):
-                if engine.state.epoch >= conf["swa_start"]:
-                    swa_model.update_parameters(model)
-
-
-        #########################
-        # Define inference engine
-        #########################
-        key2pred = {}
-
-        def _inference(engine, batch):
-            model.eval()
-            keys = batch[0]
-            with torch.no_grad():
-                output = self._forward(model, batch, "validation", sample_method="beam", beam_size=3)
-                # output = self._forward(model, batch, "validation")
-                seqs = output["seqs"].cpu().numpy()
-                for (idx, seq) in enumerate(seqs):
-                    candidate = self._convert_idx2sentence(seq, vocabulary.idx2word)
-                    key2pred[keys[idx]] = [candidate,]
-                return output
-
-        evaluator = Engine(_inference)
-
-        @evaluator.on(Events.EPOCH_COMPLETED)
-        def eval_val(engine):
-            scorer = Cider()
-            score_output = self._eval_prediction(val_key2refs, key2pred, [scorer])
-            engine.state.metrics["score"] = score_output["CIDEr"]
-            key2pred.clear()
-
-        pbar.attach(evaluator)
 
         #########################
         # Create learning rate scheduler
@@ -294,106 +214,154 @@ class Runner(BaseRunner):
         except AttributeError:
             import captioning.utils.lr_scheduler as lr_scheduler
             if conf["scheduler"] == "ExponentialDecayScheduler":
-                conf["scheduler_args"]["total_iters"] = len(train_dataloader) * conf["epochs"]
+                conf["scheduler_args"]["total_iters"] = total_iters
             if "warmup_iters" not in conf["scheduler_args"]:
-                warmup_iters = len(train_dataloader) * conf["epochs"] // 5
+                warmup_iters = total_iters // 5
                 conf["scheduler_args"]["warmup_iters"] = warmup_iters
             if not conf["distributed"] or not self.local_rank:
                 logger.info(f"Warm up iterations: {conf['scheduler_args']['warmup_iters']}")
             scheduler = getattr(lr_scheduler, conf["scheduler"])(
                 optimizer, **conf["scheduler_args"])
 
-        def update_lr(engine, metric=None):
-            if scheduler.__class__.__name__ == "ReduceLROnPlateau":
-                assert metric is not None, "need validation metric for ReduceLROnPlateau"
-                val_result = engine.state.metrics[metric]
-                scheduler.step(val_result)
-            else:
-                scheduler.step()
-
         if scheduler.__class__.__name__ in ["StepLR", "ReduceLROnPlateau", "ExponentialLR", "MultiStepLR"]:
-            evaluator.add_event_handler(Events.EPOCH_COMPLETED, update_lr, "score")
+            epoch_update_lr = True
         else:
-            trainer.add_event_handler(Events.ITERATION_STARTED, update_lr)
+            epoch_update_lr = False
+
 
         #########################
-        # Events for main process: mostly logging and saving
+        # Dump configuration
         #########################
-
-
         if not conf["distributed"] or not self.local_rank:
-            # logging training and validation loss and metrics
-            @trainer.on(Events.EPOCH_COMPLETED)
-            def log_results(engine):
-                train_results = engine.state.metrics
-                evaluator.run(val_dataloader)
-                val_results = evaluator.state.metrics
-                output_str_list = [
-                    "Validation Results - Epoch : {:<4}".format(engine.state.epoch)
-                ]
-                for metric in train_metrics:
-                    output = train_results[metric]
-                    if isinstance(output, torch.Tensor):
-                        output = output.item()
-                    output_str_list.append("{} {:<5.2g} ".format(
-                        metric, output))
-                for metric in ["score"]:
-                    output = val_results[metric]
-                    if isinstance(output, torch.Tensor):
-                        output = output.item()
-                    output_str_list.append("{} {:5<.2g} ".format(
-                        metric, output))
-                    tensorboard_writer.add_scalar(f"{metric}/val", output, engine.state.epoch)
-                lr = optimizer.param_groups[0]["lr"]
-                output_str_list.append(f"lr {lr:5<.2g} ")
-
-                logger.info(" ".join(output_str_list))
-            # saving best model
-            @evaluator.on(Events.EPOCH_COMPLETED)
-            def save_model(engine):
-                dump = {
-                    "model": model.state_dict() if not conf["distributed"] else model.module.state_dict(),
-                    "optimizer": optimizer.state_dict(),
-                    "lr_scheduler": scheduler.state_dict(),
-                    "vocabulary": vocabulary.idx2word
-                }
-                if crtrn_imprvd(engine.state.metrics["score"]):
-                    best_dump = dump.copy()
-                    del best_dump["optimizer"]
-                    del best_dump["lr_scheduler"]
-                    torch.save(best_dump, outputdir / "best.pth")
-                torch.save(dump, outputdir / "last.pth")
-            # # regular checkpoint
-            # checkpoint_handler = ModelCheckpoint(
-                # outputdir,
-                # "run",
-                # n_saved=1,
-                # require_empty=False,
-                # create_dir=False,
-                # score_function=lambda engine: engine.state.metrics["score"],
-                # score_name="score")
-            # evaluator.add_event_handler(
-                # Events.EPOCH_COMPLETED, checkpoint_handler, {
-                    # "model": model,
-                # }
-            # )
-            # dump configuration
             del conf["vocabulary"]
             train_util.store_yaml(conf, outputdir / "config.yaml")
 
         #########################
         # Start training
         #########################
-        trainer.run(train_dataloader, max_epochs=conf["epochs"])
 
-        # stochastic weight averaging
-        if conf["swa"]:
-            torch.save({
-                "model": swa_model.module.state_dict(),
-                "vocabulary": vocabulary.idx2word
-            }, outputdir / "swa.pth")
+        self.ss_ratio = conf["ss_args"]["ss_ratio"]
+        iteration = 0
+        logger.info("{:^10}\t{:^10}\t{:^10}\t{:^10}".format(
+            "Epoch", "Train loss", "Val score", "Learning rate"))
+        
+        for epoch in range(1, conf["epochs"] + 1):
+            #########################
+            # Training of one epoch
+            #########################
+            model.train()
+            loss_history = []
+            nsample_history = []
+            with torch.enable_grad(), tqdm(total=len(train_dataloader), ncols=100,
+                                           ascii=True) as pbar:
+                for batch in train_dataloader:
+
+                    iteration += 1
+
+                    #########################
+                    # Update scheduled sampling ratio
+                    #########################
+                    self._update_ss_ratio(conf)
+                    tb_writer.add_scalar("scheduled_sampling_prob", self.ss_ratio, iteration)
+
+                    #########################
+                    # Update learning rate
+                    #########################
+                    if not epoch_update_lr:
+                        scheduler.step()
+                        tb_writer.add_scalar("lr", optimizer.param_groups[0]["lr"], iteration)
+
+                    #########################
+                    # Forward and backward
+                    #########################
+                    optimizer.zero_grad()
+                    output = self._forward(model, batch, "train",
+                                           ss_ratio=self.ss_ratio)
+                    loss = loss_fn(output)
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 
+                                                   conf["max_grad_norm"])
+                    optimizer.step()
+
+                    #########################
+                    # Write the loss summary
+                    #########################
+                    cap_lens = batch[-1]
+                    nsample = sum(cap_lens - 1)
+                    loss_history.append(loss.item() * nsample)
+                    nsample_history.append(sum(cap_lens - 1))
+                    if not conf["distributed"] or not self.local_rank:
+                        tb_writer.add_scalar("loss/train", loss.item(), iteration)
+                    pbar.set_postfix(running_loss=loss.item())
+                    pbar.update()
+
+            #########################
+            # Stochastic weight averaging
+            #########################
+            if conf["swa"]:
+                if epoch >= conf["swa_start"]:
+                    swa_model.update_parameters(model)
+
+            #########################
+            # Validation of one epoch
+            #########################
+            model.eval()
+            key2pred = {}
+            with torch.no_grad(), tqdm(total=len(val_dataloader), ncols=100,
+                                       ascii=True) as pbar:
+                for batch in val_dataloader:
+                    output = self._forward(model, batch, "validation",
+                                           sample_method="beam", beam_size=3)
+                    keys = batch[0]
+                    seqs = output["seqs"].cpu().numpy()
+                    for (idx, seq) in enumerate(seqs):
+                        candidate = self._convert_idx2sentence(
+                            seq, vocabulary.idx2word, zh)
+                        key2pred[keys[idx]] = [candidate,]
+                    pbar.update()
+            scorer = Cider()
+            score_output = self._eval_prediction(val_key2refs, key2pred, [scorer])
+            score = score_output["CIDEr"]
+
+            #########################
+            # Update learning rate
+            #########################
+            if epoch_update_lr:
+                scheduler.step(score)
+
+            if not conf["distributed"] or not self.local_rank:
+                #########################
+                # Log results of this epoch
+                #########################
+                train_loss = np.sum(loss_history) / np.sum(nsample_history)
+                lr = optimizer.param_groups[0]["lr"]
+                output_str = f"{epoch:^10}\t{train_loss:^10.2g}\t{score:^10.2g}\t{lr:^10.2g}"
+                logger.info(output_str)
+                tb_writer.add_scalar(f"score/val", score, epoch)
+
+                #########################
+                # Save checkpoint
+                #########################
+                dump = {
+                    "model": model.state_dict() if not conf["distributed"] else model.module.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "lr_scheduler": scheduler.state_dict(),
+                    "vocabulary": vocabulary.idx2word
+                }
+                if crtrn_imprvd(score):
+                    torch.save(dump, outputdir / "best.pth")
+                torch.save(dump, outputdir / "last.pth")
+
 
         if not conf["distributed"] or not self.local_rank:
+            #########################
+            # Stochastic weight averaging
+            #########################
+            if conf["swa"]:
+                torch.save({
+                    "model": swa_model.module.state_dict(),
+                    "vocabulary": vocabulary.idx2word
+                }, outputdir / "swa.pth")
             return outputdir
 
 

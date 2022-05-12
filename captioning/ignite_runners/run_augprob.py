@@ -6,6 +6,7 @@ import pickle
 from pathlib import Path
 
 import fire
+from ignite.metrics.accumulation import Average
 import numpy as np
 import torch
 from ignite.engine.engine import Engine, Events
@@ -27,7 +28,7 @@ class Runner(BaseRunner):
 
     @staticmethod
     def _get_model(config, outputfun=sys.stdout):
-        vocabulary = config["vocabulary"]
+        vocabulary = pickle.load(open(config["data"]["vocab_file"], "rb"))
         encoder = getattr(
             captioning.models.encoder, config["encoder"])(
             config["data"]["raw_feat_dim"],
@@ -105,14 +106,14 @@ class Runner(BaseRunner):
             caps = convert_tensor(caps.long(),
                                   device=self.device,
                                   non_blocking=True)
-
             input_dict["caps"] = caps
             input_dict["cap_lens"] = cap_lens
             input_dict["ss_ratio"] = kwargs["ss_ratio"]
             output = model(input_dict)
-
             output["targets"] = caps[:, 1:]
             output["lens"] = torch.as_tensor(cap_lens - 1)
+            output["cap_ids"] = batch[5]
+            output["use_aug_prob"] = kwargs["use_aug_prob"]
         else:
             input_dict.update(kwargs)
             output = model(input_dict)
@@ -147,6 +148,8 @@ class Runner(BaseRunner):
         if not conf["distributed"] or not self.local_rank:
             outputdir = Path(conf["outputpath"]) / conf["model"] / \
                 conf["remark"] / f"seed_{self.seed}"
+                # "{}_{}".format(datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%m"),
+                               # uuid.uuid1().hex)
 
             outputdir.mkdir(parents=True, exist_ok=True)
             logger = train_util.genlogger(str(outputdir / "train.log"))
@@ -160,8 +163,8 @@ class Runner(BaseRunner):
         #########################
         # Create dataloaders
         #########################
+        zh = conf["zh"]
         vocabulary = pickle.load(open(conf["data"]["vocab_file"], "rb"))
-        conf["vocabulary"] = vocabulary
         dataloaders = self._get_dataloaders(conf)
         train_dataloader = dataloaders["train_dataloader"]
         val_dataloader = dataloaders["val_dataloader"]
@@ -195,6 +198,11 @@ class Runner(BaseRunner):
         optimizer = getattr(torch.optim, conf["optimizer"])(
             model.parameters(), **conf["optimizer_args"])
         criterion = getattr(losses, conf["loss"])(**conf["loss_args"])
+        criterion = losses.AugmentLossWrapper(criterion)
+        # if conf["label_smoothing"]:
+            # criterion = losses.LabelSmoothingLoss(len(vocabulary), smoothing=conf["smoothing"])
+        # else:
+            # criterion = torch.nn.CrossEntropyLoss().to(self.device)
         if not conf["distributed"] or not self.local_rank:
             train_util.pprint_dict(optimizer, logger.info, formatter="pretty")
             crtrn_imprvd = train_util.criterion_improver(conf["improvecriterion"])
@@ -216,7 +224,8 @@ class Runner(BaseRunner):
                 optimizer.zero_grad()
                 output = self._forward(
                     model, batch, "train",
-                    ss_ratio=conf["ss_args"]["ss_ratio"]
+                    ss_ratio=conf["ss_args"]["ss_ratio"],
+                    use_aug_prob=engine.state.use_aug_prob
                 )
                 # loss = criterion(output["packed_logits"], output["targets"]).to(self.device)
                 loss = criterion(output).to(self.device)
@@ -233,7 +242,7 @@ class Runner(BaseRunner):
         pbar = ProgressBar(persist=False, ascii=True, ncols=100)
         pbar.attach(trainer, ["running_loss"])
         train_metrics = {
-            "loss": losses.Loss(criterion)
+            "loss": Average(output_transform=lambda x: x["loss"]),
         }
         for name, metric in train_metrics.items():
             metric.attach(trainer, name)
@@ -250,11 +259,15 @@ class Runner(BaseRunner):
                     conf["ss_args"]["ss_ratio"] -= (1.0 - conf["ss_args"]["final_ss_ratio"]) / num_epoch / num_iter
         # stochastic weight averaging
         if conf["swa"]:
-            swa_model = train_util.AveragedModel(model)
+            swa_model = torch.optim.swa_utils.AveragedModel(model)
             @trainer.on(Events.EPOCH_COMPLETED)
             def update_swa(engine):
                 if engine.state.epoch >= conf["swa_start"]:
                     swa_model.update_parameters(model)
+        # update the weight of augmentation data
+        @trainer.on(Events.ITERATION_STARTED)
+        def update_use_aug_prob(engine):
+            engine.state.use_aug_prob = engine.state.iteration / (conf["epochs"] * len(train_dataloader))
 
 
         #########################
@@ -270,7 +283,7 @@ class Runner(BaseRunner):
                 # output = self._forward(model, batch, "validation")
                 seqs = output["seqs"].cpu().numpy()
                 for (idx, seq) in enumerate(seqs):
-                    candidate = self._convert_idx2sentence(seq, vocabulary.idx2word)
+                    candidate = self._convert_idx2sentence(seq, vocabulary.idx2word, zh)
                     key2pred[keys[idx]] = [candidate,]
                 return output
 
@@ -278,7 +291,7 @@ class Runner(BaseRunner):
 
         @evaluator.on(Events.EPOCH_COMPLETED)
         def eval_val(engine):
-            scorer = Cider()
+            scorer = Cider(zh=zh)
             score_output = self._eval_prediction(val_key2refs, key2pred, [scorer])
             engine.state.metrics["score"] = score_output["CIDEr"]
             key2pred.clear()
@@ -311,6 +324,12 @@ class Runner(BaseRunner):
             else:
                 scheduler.step()
 
+        # if scheduler.__class__.__name__ in ["StepLR", "ReduceLROnPlateau", "ExponentialLR", "MultiStepLR"]:
+            # evaluator.add_event_handler(Events.EPOCH_COMPLETED, update_lr, "score")
+        # elif scheduler.__class__.__name__ == "NoamScheduler":
+            # trainer.add_event_handler(Events.ITERATION_STARTED, update_lr)
+        # else:
+            # trainer.add_event_handler(Events.ITERATION_COMPLETED, update_lr)
         if scheduler.__class__.__name__ in ["StepLR", "ReduceLROnPlateau", "ExponentialLR", "MultiStepLR"]:
             evaluator.add_event_handler(Events.EPOCH_COMPLETED, update_lr, "score")
         else:
@@ -331,7 +350,7 @@ class Runner(BaseRunner):
                 output_str_list = [
                     "Validation Results - Epoch : {:<4}".format(engine.state.epoch)
                 ]
-                for metric in train_metrics:
+                for metric in ["loss"]:
                     output = train_results[metric]
                     if isinstance(output, torch.Tensor):
                         output = output.item()
@@ -346,7 +365,7 @@ class Runner(BaseRunner):
                     tensorboard_writer.add_scalar(f"{metric}/val", output, engine.state.epoch)
                 lr = optimizer.param_groups[0]["lr"]
                 output_str_list.append(f"lr {lr:5<.2g} ")
-
+                output_str_list.append(f"use_aug_prob {engine.state.use_aug_prob:5<.2g} ")
                 logger.info(" ".join(output_str_list))
             # saving best model
             @evaluator.on(Events.EPOCH_COMPLETED)
@@ -358,27 +377,23 @@ class Runner(BaseRunner):
                     "vocabulary": vocabulary.idx2word
                 }
                 if crtrn_imprvd(engine.state.metrics["score"]):
-                    best_dump = dump.copy()
-                    del best_dump["optimizer"]
-                    del best_dump["lr_scheduler"]
-                    torch.save(best_dump, outputdir / "best.pth")
+                    torch.save(dump, outputdir / "best.pth")
                 torch.save(dump, outputdir / "last.pth")
-            # # regular checkpoint
-            # checkpoint_handler = ModelCheckpoint(
-                # outputdir,
-                # "run",
-                # n_saved=1,
-                # require_empty=False,
-                # create_dir=False,
-                # score_function=lambda engine: engine.state.metrics["score"],
-                # score_name="score")
-            # evaluator.add_event_handler(
-                # Events.EPOCH_COMPLETED, checkpoint_handler, {
-                    # "model": model,
-                # }
-            # )
+            # regular checkpoint
+            checkpoint_handler = ModelCheckpoint(
+                outputdir,
+                "run",
+                n_saved=1,
+                require_empty=False,
+                create_dir=False,
+                score_function=lambda engine: engine.state.metrics["score"],
+                score_name="score")
+            evaluator.add_event_handler(
+                Events.EPOCH_COMPLETED, checkpoint_handler, {
+                    "model": model,
+                }
+            )
             # dump configuration
-            del conf["vocabulary"]
             train_util.store_yaml(conf, outputdir / "config.yaml")
 
         #########################
@@ -390,6 +405,8 @@ class Runner(BaseRunner):
         if conf["swa"]:
             torch.save({
                 "model": swa_model.module.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "lr_scheduler": scheduler.state_dict(),
                 "vocabulary": vocabulary.idx2word
             }, outputdir / "swa.pth")
 

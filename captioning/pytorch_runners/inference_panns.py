@@ -1,75 +1,26 @@
+import sys
 import os
 from pathlib import Path
 import multiprocessing
 import json
 
 import fire
-from tqdm import trange, tqdm
+from tqdm import tqdm, trange
 import librosa
 import numpy as np
 import pandas as pd
 import torch
-import torch.nn as nn
+import kaldiio
 
 import captioning.models
 import captioning.models.encoder
 import captioning.models.decoder
-import efficient_latent
-from efficient_latent.models import upsample as _upsample
-from efficientnet_pytorch import utils as efficientnet_utils
-from einops import reduce
+import captioning.utils.train_util as train_util
+import captioning.models.panns_inference_models as panns_inference_models
 
-
-class _EffiNet(efficient_latent.models._EffiNet):
-
-    def extract_embedding(self, x, upsample=False):
-        x, num_input_frames = self.forward(x)
-        if upsample:
-            x = _upsample(x, ratio=32, target_length=num_input_frames)
-        segment_embedding = x
-        clip_embedding = reduce(segment_embedding, 'b t d -> b d', 'mean')
-        return {"attn_feat": segment_embedding, "fc_feat": clip_embedding}
-
-
-def EfficientNet_B2(**kwargs) -> _EffiNet:
-    blocks_args, global_params = efficientnet_utils.get_model_params(
-        'efficientnet-b2', {'include_top': False})
-    model = _EffiNet(blocks_args=blocks_args,
-                     global_params=global_params,
-                     embed_dim=1_408,
-                     **kwargs)
-    model._change_in_channels(1)
-    return model
-
-def load_feature_extractor(model_file_path: str = None, device: str = None) -> nn.Module:
-    if device is None:
-        torch_device = torch.device(
-            'cuda' if torch.cuda.is_available() else 'cpu')
-    else:
-        torch_device = torch.device(device)
-
-    # Instantiate model
-    model = EfficientNet_B2()
-    model = model.to(torch_device)
-
-    if model_file_path is None:
-        # Download model
-        state_dict = torch.hub.load_state_dict_from_url(
-            'https://github.com/richermans/HEAR2021_EfficientLatent/releases/download/v0.0.1/effb2.pt',
-            progress=True)
-        model.load_state_dict(state_dict, strict=True)
-    else:
-        # Set model weights using checkpoint file
-        checkpoint = torch.load(model_file_path, map_location=device)
-        model.load_state_dict(checkpoint, strict=True)
-
-    model.sample_rate = 16000  # Input sample rate
-    model.scene_embedding_size = 1408
-    model.timestamp_embedding_size = 1408
-    model.eval()
-    return model
 
 def load_model(config, checkpoint):
+    dump = torch.load(checkpoint, map_location="cpu")
     encoder = getattr(
         captioning.models.encoder, config["encoder"])(
         config["data"]["raw_feat_dim"],
@@ -79,25 +30,48 @@ def load_model(config, checkpoint):
     )
     decoder = getattr(
         captioning.models.decoder, config["decoder"])(
-        vocab_size=len(checkpoint["vocabulary"]),
+        vocab_size=len(dump["vocabulary"]),
         **config["decoder_args"]
     )
     model = getattr(
         captioning.models, config["model"])(
         encoder, decoder, **config["model_args"]
     )
-    model.load_state_dict(checkpoint["model"])
+    model.load_state_dict(dump["model"])
     model.eval()
-    return model, checkpoint["vocabulary"]
+    return model, dump["vocabulary"]
+
+def load_feature_extractor(model_name, checkpoint):
+    model = getattr(panns_inference_models, model_name)(
+        sample_rate=32000,
+        window_size=1024,
+        hop_size=320,
+        mel_bins=64,
+        fmin=50,
+        fmax=14000,
+        classes_num=527)
+    checkpoint = torch.load(checkpoint, map_location='cpu')
+    model.load_state_dict(checkpoint['model'])
+    model.eval()
+    return model
 
 def load_audio(specifier: str):
-    assert Path(specifier).exists(), specifier + " not exists!"
-    y, sr = librosa.core.load(specifier, sr=None)
+    if specifier.endswith("|"):
+        fd = kaldiio.utils.open_like_kaldi(specifier, "rb")
+        mat = kaldiio.matio._load_mat(fd, None)
+        fd.close()
+        sr, y = mat
+        y = y.copy() / 2 ** 15
+    else:
+        assert Path(specifier).exists(), specifier + " not exists!"
+        y, sr = librosa.core.load(specifier, sr=None)
+    if y.shape[0] == 0:
+        return None
     y = librosa.core.resample(y, sr, 32000)
     return y
 
 
-class InferenceLogMelDataset(torch.utils.data.Dataset):
+class InferenceDataset(torch.utils.data.Dataset):
 
     def __init__(self, aid_to_fname):
         super().__init__()
@@ -125,7 +99,7 @@ def collate_wrapper(min_length=0.32):
         for item in data_list:
             waveform = item[1]
             audio_id = item[0]
-            if len(waveform) < min_length * 32000:
+            if waveform is None or len(waveform) < min_length * 32000:
                 blacklist_aids.append(audio_id)
                 continue
             aids.append(audio_id)
@@ -149,43 +123,28 @@ def decode_caption(word_ids, vocabulary):
     candidate = " ".join(candidate)
     return candidate
 
+name_to_dr = {
+    "Cnn10": 16,
+    "Cnn14": 32,
+    "Wavegram_Logmel_Cnn14": 32
+}
+
 def inference(input,
               output,
+              generator_checkpoint,
+              generator_config,
+              feature_extractor_name="Wavegram_Logmel_Cnn14",
+              feature_extractor_checkpoint="sed/audioset_tagging_cnn/pretrained_weights/Wavegram_Logmel_Cnn14_mAP=0.439.pth",
               batch_size=32,
               num_process=4):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     device = torch.device(device)
-    config = {
-        "data": {
-            "raw_feat_dim": 64,
-            "fc_feat_dim": 1408,
-            "attn_feat_dim": 1408
-        },
-        "encoder": "RnnEncoder",
-        "encoder_args":{
-            "bidirectional": True,
-            "dropout": 0.5,
-            "hidden_size": 256,
-            "num_layers": 3
-        },
-        "decoder": "TransformerDecoder",
-        "decoder_args": {
-            "attn_emb_dim": 512,
-            "dropout": 0.2,
-            "emb_dim": 256,
-            "fc_emb_dim": 512,
-            "nlayers": 2
-        },
-        "model": "TransformerModel",
-        "model_args": {}
-    }
-    checkpoint = torch.hub.load_state_dict_from_url(
-        "https://github.com/wsntxxn/AudioCaption/releases/download/v0.0.1/audiocaps_effb2_rnn_trm.pth",
-        progress=True,
-        map_location="cpu")
-    model, vocabulary = load_model(config, checkpoint)
+
+    config = train_util.parse_config_or_kwargs(generator_config)
+    model, vocabulary = load_model(config, generator_checkpoint)
     model = model.to(device)
-    feature_extractor = load_feature_extractor()
+    feature_extractor = load_feature_extractor(feature_extractor_name,
+                                               feature_extractor_checkpoint)
     feature_extractor = feature_extractor.to(device)
 
     if Path(input).suffix == ".csv":
@@ -197,11 +156,13 @@ def inference(input,
     else:
         raise Exception("input should be wav.csv or audio file")
 
+    downsample_ratio = name_to_dr[feature_extractor_name]
+
     dataloader = torch.utils.data.DataLoader(
-        InferenceLogMelDataset(aid_to_fname),
+        InferenceDataset(aid_to_fname),
         batch_size=batch_size,
         shuffle=False,
-        collate_fn=collate_wrapper(0.32),
+        collate_fn=collate_wrapper(0.01 * downsample_ratio),
         num_workers=num_process
     )
 
@@ -211,16 +172,20 @@ def inference(input,
         for batch in dataloader:
             aids, waveforms, lengths, _ = batch
             waveforms = torch.as_tensor(waveforms).float().to(device)
-            audio_feats = feature_extractor.extract_embedding(waveforms)
-            attn_feat_lengths = np.floor((lengths / 160 + 1) / 32)
+            audio_feats = feature_extractor(waveforms)
+            audio_feat_lengths = np.floor((lengths / 320 + 1) / downsample_ratio)
+            for sample_idx in range(audio_feat_lengths.shape[0]):
+                if audio_feat_lengths[sample_idx] > audio_feats["attn_feat"][sample_idx].shape[0]:
+                    audio_feat_lengths[sample_idx] = audio_feats["attn_feat"][sample_idx].shape[0]
             input_dict = {
                 "mode": "inference",
                 "raw_feats": None,
                 "raw_feat_lens": None,
                 "fc_feats": audio_feats["fc_feat"],
                 "attn_feats": audio_feats["attn_feat"],
-                "attn_feat_lens": torch.as_tensor(attn_feat_lengths, dtype=torch.long),
-                "sample_method": "beam"
+                "attn_feat_lens": torch.as_tensor(audio_feat_lengths, dtype=torch.long),
+                "sample_method": "beam",
+                # "beam_size": 2
             }
             output_dict = model(input_dict)
             caption_batch = [decode_caption(seq, vocabulary) for seq in output_dict["seqs"].cpu().numpy()]

@@ -28,9 +28,9 @@ class Vocabulary(object):
         return len(self.word2idx)
 
 def build_vocab(input_json: str,
+                output_json: str,
                 threshold: int,
                 keep_punctuation: bool,
-                host_address: str,
                 character_level: bool = False,
                 zh: bool = True ):
     """Build vocabulary from csv file with a given threshold to drop all counts < threshold
@@ -62,23 +62,24 @@ def build_vocab(input_json: str,
     pretokenized = "tokens" in data[0]["captions"][0]
     
     if zh:
-        from nltk.parse.corenlp import CoreNLPParser
+        from ltp import LTP
         from zhon.hanzi import punctuation
         if not pretokenized:
-            parser = CoreNLPParser(host_address)
+            parser = LTP("base")
         for audio_idx in tqdm(range(len(data)), leave=False, ascii=True):
             for cap_idx in range(len(data[audio_idx]["captions"])):
                 if pretokenized:
                     tokens = data[audio_idx]["captions"][cap_idx]["tokens"].split()
                 else:
                     caption = data[audio_idx]["captions"][cap_idx]["caption"]
-                    # Remove all punctuations
-                    if not keep_punctuation:
-                        caption = re.sub("[{}]".format(punctuation), "", caption)
                     if character_level:
                         tokens = list(caption)
                     else:
-                        tokens = list(parser.tokenize(caption))
+                        tokens, _ = parser.seg([caption])
+                        tokens = tokens[0]
+                    # Remove all punctuations
+                    if not keep_punctuation:
+                        tokens = [token for token in tokens if token not in punctuation]
                     data[audio_idx]["captions"][cap_idx]["tokens"] = " ".join(tokens)
                 counter.update(tokens)
     else:
@@ -88,7 +89,7 @@ def build_vocab(input_json: str,
                     tokens = data[audio_idx]["captions"][cap_idx]["tokens"].split()
                     counter.update(tokens)
         else:
-            from captioning.pycocoevalcap.tokenizer.ptbtokenizer import PTBTokenizer
+            from pycocoevalcap.tokenizer.ptbtokenizer import PTBTokenizer
             captions = {}
             for audio_idx in range(len(data)):
                 audio_id = data[audio_idx]["audio_id"]
@@ -110,7 +111,9 @@ def build_vocab(input_json: str,
                     counter.update(tokens.split(" "))
 
     if not pretokenized:
-        json.dump({ "audios": data }, open(input_json, "w"), indent=4, ensure_ascii=not zh)
+        if output_json is None:
+            output_json = input_json
+        json.dump({ "audios": data }, open(output_json, "w"), indent=4, ensure_ascii=not zh)
     words = [word for word, cnt in counter.items() if cnt >= threshold]
 
     # Create a vocab wrapper and add some special tokens.
@@ -127,17 +130,17 @@ def build_vocab(input_json: str,
 
 def process(input_json: str,
             output_file: str,
+            output_json: str = None,
             threshold: int = 1,
             keep_punctuation: bool = False,
             character_level: bool = False,
-            host_address: str = "http://localhost:9000",
-            zh: bool = False):
+            zh: bool = True):
     logfmt = "%(asctime)s (%(module)s:%(lineno)d) %(levelname)s: %(message)s"
     logging.basicConfig(level=logging.INFO, format=logfmt)
     logging.info("Build Vocab")
     vocabulary = build_vocab(
-        input_json=input_json, threshold=threshold, keep_punctuation=keep_punctuation,
-        host_address=host_address, character_level=character_level, zh=zh)
+        input_json=input_json, output_json=output_json, threshold=threshold, 
+        keep_punctuation=keep_punctuation, character_level=character_level, zh=zh)
     pickle.dump(vocabulary, open(output_file, "wb"))
     logging.info("Total vocabulary size: {}".format(len(vocabulary)))
     logging.info("Saved vocab to '{}'".format(output_file))

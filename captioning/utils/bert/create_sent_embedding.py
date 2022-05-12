@@ -20,7 +20,6 @@ class EmbeddingExtractor(object):
 
     def extract_originbert(self, caption_file: str, output: str, dev: bool=True, ip="localhost"):
         from bert_serving.client import BertClient
-        caption_df = pd.read_json(caption_file, dtype={"key": str})
         client = BertClient(ip)
         
         self.extract(caption_file, client, output, dev)
@@ -34,8 +33,10 @@ class EmbeddingExtractor(object):
                 for idx, row in caption_df.iterrows():
                     caption = row["caption"]
                     key = row["key"]
-                    caption_index = row["caption_index"]
-                    embeddings["{}_{}".format(key, caption_index)] = np.array(model.encode([caption])).reshape(-1)
+                    cap_idx = row["caption_index"]
+                    embedding = model.encode([caption])
+                    embedding = np.array(embedding).reshape(-1)
+                    embeddings[f"{key}_{cap_idx}"] = embedding
                     pbar.update()
 
         else:

@@ -5,7 +5,7 @@ import numpy as np
 parser = argparse.ArgumentParser()
 parser.add_argument("exp_path", help="parent experiment path, with several child directory trained under different seeds")
 parser.add_argument("--output", help="output result file", default=None)
-parser.add_argument("--score_input", help="input filename", default="scores.txt", type=str)
+parser.add_argument("--score_input", help="input filename", default="swa.txt", type=str)
 
 args = parser.parse_args()
 

@@ -3,9 +3,13 @@
 import os
 import sys
 import pickle
+import json
+import datetime
+import uuid
 from pathlib import Path
 
 import fire
+from ignite.metrics.accumulation import Average
 import numpy as np
 import torch
 from ignite.engine.engine import Engine, Events
@@ -19,11 +23,143 @@ import captioning.models
 import captioning.models.encoder
 import captioning.models.decoder
 import captioning.losses.loss as losses
+import captioning.metrics.metric as metrics
 import captioning.utils.train_util as train_util
 from captioning.utils.build_vocab import Vocabulary
-from captioning.ignite_runners.base import BaseRunner
+from captioning.ignite_runners.base_runner import BaseRunner
+import captioning.datasets.caption_dataset as ac_dataset
 
 class Runner(BaseRunner):
+
+    def _get_dataloaders(self, config):
+        augments = train_util.parse_augments(config["augments"])
+        if config["distributed"]:
+            config["dataloader_args"]["batch_size"] //= self.world_size
+
+        data_config = config["data"]
+        vocabulary = config["vocabulary"]
+        if "train" not in data_config:
+            raw_audio_to_h5 = train_util.load_dict_from_csv(data_config["raw_feat_csv"],
+                                                            ("audio_id", "hdf5_path"))
+            fc_audio_to_h5 = train_util.load_dict_from_csv(data_config["fc_feat_csv"],
+                                                           ("audio_id", "hdf5_path"))
+            attn_audio_to_h5 = train_util.load_dict_from_csv(data_config["attn_feat_csv"],
+                                                             ("audio_id", "hdf5_path"))
+            # cap_id_to_condition = train_util.load_dict_from_csv(data_config["caption_condition"],
+                                                                # ("cap_id", "prob"))
+            caption_info = json.load(open(data_config["caption_file"], "r"))["audios"]
+            val_size = int(len(caption_info) * (1 - data_config["train_percent"] / 100.))
+            val_audio_idxs = np.random.choice(len(caption_info), val_size, replace=False)
+            train_audio_idxs = [idx for idx in range(len(caption_info)) if idx not in val_audio_idxs]
+            train_dataset = ac_dataset.CaptionDataset(
+                raw_audio_to_h5,
+                fc_audio_to_h5,
+                attn_audio_to_h5,
+                caption_info,
+                # cap_id_to_condition,
+                vocabulary,
+                transform=augments
+            )
+            # if config["oversample"]:
+                # train_sampler = ac_dataset.ConditionOverSampler(train_dataset, shuffle=True, **config["oversample_args"])
+            # else:
+            train_sampler = ac_dataset.CaptionSampler(train_dataset, train_audio_idxs, True, **config["sampler_args"])
+            train_dataloader = torch.utils.data.DataLoader(
+                train_dataset,
+                collate_fn=ac_dataset.collate_fn([0, 2, 3], 3),
+                sampler=train_sampler,
+                **config["dataloader_args"]
+            )
+            val_audio_ids = [caption_info[audio_idx]["audio_id"] for audio_idx in val_audio_idxs]
+            val_dataset = ac_dataset.CaptionEvalDataset(
+                {audio_id: raw_audio_to_h5[audio_id] for audio_id in val_audio_ids},
+                {audio_id: fc_audio_to_h5[audio_id] for audio_id in val_audio_ids},
+                {audio_id: attn_audio_to_h5[audio_id] for audio_id in val_audio_ids},
+            )
+            val_dataloader = torch.utils.data.DataLoader(
+                val_dataset,
+                collate_fn=ac_dataset.collate_fn([1, 3]),
+                **config["dataloader_args"]
+            )
+            train_key2refs = {}
+            for audio_idx in train_audio_idxs:
+                audio_id = caption_info[audio_idx]["audio_id"]
+                train_key2refs[audio_id] = []
+                for caption in caption_info[audio_idx]["captions"]:
+                    train_key2refs[audio_id].append(caption["tokens" if config["zh"] else "caption"])
+            val_key2refs = {}
+            for audio_idx in val_audio_idxs:
+                audio_id = caption_info[audio_idx]["audio_id"]
+                val_key2refs[audio_id] = []
+                for caption in caption_info[audio_idx]["captions"]:
+                    val_key2refs[audio_id].append(caption["tokens" if config["zh"] else "caption"])
+        else:
+            data = {"train": {}, "val": {}}
+            for split in ["train", "val"]:
+                conf_split = data_config[split]
+                output = data[split]
+                output["raw_audio_to_h5"] = train_util.load_dict_from_csv(
+                    conf_split["raw_feat_csv"], ("audio_id", "hdf5_path"))
+                output["fc_audio_to_h5"] = train_util.load_dict_from_csv(
+                    conf_split["fc_feat_csv"], ("audio_id", "hdf5_path"))
+                output["attn_audio_to_h5"] = train_util.load_dict_from_csv(
+                    conf_split["attn_feat_csv"], ("audio_id", "hdf5_path"))
+                output["caption_info"] = json.load(open(conf_split["caption_file"], "r"))["audios"]
+            # cap_id_to_condition = train_util.load_dict_from_csv(data_config["train"]["caption_condition"],
+                                                                # ("cap_id", "prob"))
+
+            train_dataset = ac_dataset.CaptionDataset(
+                data["train"]["raw_audio_to_h5"],
+                data["train"]["fc_audio_to_h5"],
+                data["train"]["attn_audio_to_h5"],
+                data["train"]["caption_info"],
+                # cap_id_to_condition,
+                vocabulary,
+                transform=augments
+            )
+            # if config["oversample"]:
+                # train_sampler = ac_dataset.ConditionOverSampler(train_dataset, shuffle=True, **config["oversample_args"])
+            # else:
+            train_sampler = ac_dataset.CaptionSampler(train_dataset, shuffle=True, **config["sampler_args"])
+            train_dataloader = torch.utils.data.DataLoader(
+                train_dataset,
+                collate_fn=ac_dataset.collate_fn([0, 2, 3], 3),
+                sampler=train_sampler,
+                **config["dataloader_args"]
+            )
+            val_dataset = ac_dataset.CaptionEvalDataset(
+                data["val"]["raw_audio_to_h5"],
+                data["val"]["fc_audio_to_h5"],
+                data["val"]["attn_audio_to_h5"],
+            )
+            val_dataloader = torch.utils.data.DataLoader(
+                val_dataset,
+                collate_fn=ac_dataset.collate_fn([1, 3]),
+                **config["dataloader_args"]
+            )
+            train_key2refs = {}
+            caption_info = data["train"]["caption_info"]
+            for audio_idx in range(len(caption_info)):
+                audio_id = caption_info[audio_idx]["audio_id"]
+                train_key2refs[audio_id] = []
+                for caption in caption_info[audio_idx]["captions"]:
+                    train_key2refs[audio_id].append(
+                        caption["token" if config["zh"] else "caption"])
+            val_key2refs = {}
+            caption_info = data["val"]["caption_info"]
+            for audio_idx in range(len(caption_info)):
+                audio_id = caption_info[audio_idx]["audio_id"]
+                val_key2refs[audio_id] = []
+                for caption in caption_info[audio_idx]["captions"]:
+                    val_key2refs[audio_id].append(
+                        caption["token" if config["zh"] else "caption"])
+
+        return {
+            "train_dataloader": train_dataloader,
+            "train_key2refs": train_key2refs,
+            "val_dataloader": val_dataloader,
+            "val_key2refs": val_key2refs
+        }
 
     @staticmethod
     def _get_model(config, outputfun=sys.stdout):
@@ -72,6 +208,7 @@ class Runner(BaseRunner):
             raw_feats = batch[0]
             fc_feats = batch[1]
             attn_feats = batch[2]
+            conditions = kwargs["conditions"]
             caps = batch[3]
             raw_feat_lens = batch[-3]
             attn_feat_lens = batch[-2]
@@ -108,13 +245,17 @@ class Runner(BaseRunner):
 
             input_dict["caps"] = caps
             input_dict["cap_lens"] = cap_lens
+            input_dict["conditions"] = conditions
             input_dict["ss_ratio"] = kwargs["ss_ratio"]
             output = model(input_dict)
 
             output["targets"] = caps[:, 1:]
             output["lens"] = torch.as_tensor(cap_lens - 1)
+            output["conditions"] = conditions
         else:
             input_dict.update(kwargs)
+            conditions = torch.empty(raw_feats.size(0)).fill_(kwargs["condition"])
+            input_dict["conditions"] = conditions
             output = model(input_dict)
 
         return output
@@ -125,6 +266,7 @@ class Runner(BaseRunner):
         :param **kwargs: parameters to overwrite yaml config
         """
         from pycocoevalcap.cider.cider import Cider
+        import captioning.models.hm_classifier
 
         conf = train_util.parse_config_or_kwargs(config, **kwargs)
         conf["seed"] = self.seed
@@ -147,6 +289,8 @@ class Runner(BaseRunner):
         if not conf["distributed"] or not self.local_rank:
             outputdir = Path(conf["outputpath"]) / conf["model"] / \
                 conf["remark"] / f"seed_{self.seed}"
+                # "{}_{}".format(datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%m"),
+                               # uuid.uuid1().hex)
 
             outputdir.mkdir(parents=True, exist_ok=True)
             logger = train_util.genlogger(str(outputdir / "train.log"))
@@ -194,7 +338,22 @@ class Runner(BaseRunner):
         #########################
         optimizer = getattr(torch.optim, conf["optimizer"])(
             model.parameters(), **conf["optimizer_args"])
-        criterion = getattr(losses, conf["loss"])(**conf["loss_args"])
+
+        dscrm = getattr(captioning.models.hm_classifier, conf["discriminator"])(
+            len(vocabulary), **conf["discriminator_args"])
+        dscrm = dscrm.to(self.device)
+        if "pretrained_discriminator" in conf:
+            train_util.load_pretrained_model(dscrm,
+                conf["pretrained_discriminator"], logger.info)
+        loss_fn = getattr(losses, conf["loss"])(**conf["loss_args"])
+        loss_fn = losses.ConditionLossWrapper(loss_fn, dscrm, 0, conf["loss_sample_method"])
+
+        # optimizer_dscrm = getattr(torch.optim, conf["optimizer"])(
+            # dscrm.parameters(), **conf["discriminator_optimizer_args"])
+        optimizer_dscrm = getattr(torch.optim, conf["optimizer"])(
+            dscrm.parameters(), **conf["optimizer_args"])
+        loss_fn_dscrm = torch.nn.BCELoss()
+
         if not conf["distributed"] or not self.local_rank:
             train_util.pprint_dict(optimizer, logger.info, formatter="pretty")
             crtrn_imprvd = train_util.criterion_improver(conf["improvecriterion"])
@@ -203,7 +362,7 @@ class Runner(BaseRunner):
         # Tensorboard record
         #########################
         if not conf["distributed"] or not self.local_rank:
-            tensorboard_writer = SummaryWriter(outputdir / "run")
+            tb_writer = SummaryWriter(outputdir / "run")
 
         #########################
         # Define training engine
@@ -211,29 +370,100 @@ class Runner(BaseRunner):
         def _train_batch(engine, batch):
             if conf["distributed"]:
                 train_dataloader.sampler.set_epoch(engine.state.epoch)
+            #######################################
+            # fix discriminator, train model
+            #######################################
             model.train()
             with torch.enable_grad():
                 optimizer.zero_grad()
+                dscrm_batch_dict = {
+                    "caps": batch[3].long().to(self.device)[:, 1:-1],
+                    "lens": torch.as_tensor(batch[-1]) - 2
+                }
+                conditions = dscrm(dscrm_batch_dict).detach()
                 output = self._forward(
                     model, batch, "train",
-                    ss_ratio=conf["ss_args"]["ss_ratio"]
+                    ss_ratio=conf["ss_args"]["ss_ratio"],
+                    conditions=conditions
                 )
-                # loss = criterion(output["packed_logits"], output["targets"]).to(self.device)
-                loss = criterion(output).to(self.device)
+                loss, word_loss, condition_loss = loss_fn(output)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), conf["max_grad_norm"])
                 optimizer.step()
                 output["loss"] = loss.item()
+                output["word_loss"] = word_loss.item()
+                output["condition_loss"] = condition_loss.item()
+                output["discriminator_loss"] = 0.0
                 if not conf["distributed"] or not self.local_rank:
-                    tensorboard_writer.add_scalar("loss/train", loss.item(), engine.state.iteration)
-                return output
+                    tb_writer.add_scalar("loss/train", loss.item(),
+                                         engine.state.iteration)
+                    tb_writer.add_scalar("word_loss/train", word_loss.item(),
+                                         engine.state.iteration)
+                    tb_writer.add_scalar("condition_loss/train",
+                        condition_loss.item(), engine.state.iteration)
+
+            #######################################
+            # fix model, train discriminator
+            #######################################
+            if engine.state.epoch > conf["condition_start"]:
+                model.eval()
+                optimizer_dscrm.zero_grad()
+                model_batch = [
+                    None,
+                    batch[0],
+                    batch[1],
+                    batch[2],
+                    batch[-3],
+                    batch[-2]
+                ]
+                model_output = self._forward(model, model_batch, "validation",
+                                             condition=1.0)
+                seqs = model_output["seqs"]
+                seq_lens = []
+                for seq in seqs:
+                    seq_len = 0
+                    while seq[seq_len] != model.end_idx:
+                        seq_len += 1
+                        if seq_len == len(seq):
+                            break
+                    seq_lens.append(seq_len)
+                caps = batch[3][:, 1:-1]
+                if caps.size(1) > seqs.size(1):
+                    seqs_padded = torch.zeros(seqs.size(0), caps.size(1))
+                    seqs_padded[:, :seqs.size(1)] = seqs
+                    caps = torch.cat((caps, seqs_padded), dim=0)
+                elif seqs.size(1) > caps.size(1):
+                    caps_padded = torch.zeros(caps.size(0), seqs.size(1))
+                    caps_padded[:, :caps.size(1)] = caps
+                    caps = torch.cat((caps_padded, seqs), dim=0)
+                else:
+                    caps = torch.cat((caps, seqs), dim=0)
+                lens = torch.cat(
+                    (torch.as_tensor(batch[-1] - 2), torch.as_tensor(seq_lens)),
+                    dim=0)
+                caps = caps.to(self.device).long()
+                dscrm_batch_dict = {"caps": caps, "lens": lens}
+                dscrm_output = dscrm(dscrm_batch_dict)
+                dscrm_labels = [1] * batch[3].size(0) + [0] * seqs.size(0)
+                dscrm_labels = torch.as_tensor(dscrm_labels).float(). \
+                    to(self.device)
+                dscrm_loss = loss_fn_dscrm(dscrm_output, dscrm_labels)
+                dscrm_loss.backward()
+                torch.nn.utils.clip_grad_norm_(dscrm.parameters(),
+                                               conf["max_grad_norm"])
+                optimizer_dscrm.step()
+                output["discriminator_loss"] = dscrm_loss.item()
+            return output
 
         trainer = Engine(_train_batch)
         RunningAverage(output_transform=lambda x: x["loss"]).attach(trainer, "running_loss")
         pbar = ProgressBar(persist=False, ascii=True, ncols=100)
         pbar.attach(trainer, ["running_loss"])
         train_metrics = {
-            "loss": losses.Loss(criterion)
+            "loss": Average(lambda x: x["loss"]),
+            "word_loss": Average(lambda x: x["word_loss"]),
+            "cond_loss": Average(lambda x: x["condition_loss"]),
+            "dscrm_loss": Average(lambda x: x["discriminator_loss"]),
         }
         for name, metric in train_metrics.items():
             metric.attach(trainer, name)
@@ -244,18 +474,25 @@ class Runner(BaseRunner):
                 num_iter = len(train_dataloader)
                 num_epoch = conf["epochs"]
                 mode = conf["ss_args"]["ss_mode"]
+                total_iters = num_epoch * num_iter
                 if mode == "exponential":
-                    conf["ss_args"]["ss_ratio"] *= 0.01 ** (1.0 / num_epoch / num_iter)
+                    conf["ss_args"]["ss_ratio"] *= 0.01 ** (1.0 / total_iters)
                 elif mode == "linear":
-                    conf["ss_args"]["ss_ratio"] -= (1.0 - conf["ss_args"]["final_ss_ratio"]) / num_epoch / num_iter
+                    final_ss = conf["ss_args"]["final_ss_ratio"]
+                    conf["ss_args"]["ss_ratio"] -= (1.0 - final_ss) / total_iters
         # stochastic weight averaging
         if conf["swa"]:
-            swa_model = train_util.AveragedModel(model)
+            swa_model = torch.optim.swa_utils.AveragedModel(model)
             @trainer.on(Events.EPOCH_COMPLETED)
             def update_swa(engine):
-                if engine.state.epoch >= conf["swa_start"]:
+                if engine.state.epoch > conf["swa_start"]:
                     swa_model.update_parameters(model)
 
+        # set condition alpha when epoch > condition_start
+        @trainer.on(Events.EPOCH_STARTED)
+        def set_condition_alpha(engine):
+            if engine.state.epoch > conf["condition_start"]:
+                loss_fn.alpha = conf["condition_alpha"]
 
         #########################
         # Define inference engine
@@ -266,8 +503,8 @@ class Runner(BaseRunner):
             model.eval()
             keys = batch[0]
             with torch.no_grad():
-                output = self._forward(model, batch, "validation", sample_method="beam", beam_size=3)
-                # output = self._forward(model, batch, "validation")
+                output = self._forward(model, batch, "validation",
+                                       sample_method="beam", beam_size=3, condition=1.0)
                 seqs = output["seqs"].cpu().numpy()
                 for (idx, seq) in enumerate(seqs):
                     candidate = self._convert_idx2sentence(seq, vocabulary.idx2word)
@@ -291,25 +528,37 @@ class Runner(BaseRunner):
         try:
             scheduler = getattr(torch.optim.lr_scheduler, conf["scheduler"])(
                 optimizer, **conf["scheduler_args"])
+            # dscrm_scheduler = getattr(torch.optim.lr_scheduler, conf["scheduler"])(
+                # optimizer, **conf["dicriminator_scheduler_args"])
+
         except AttributeError:
             import captioning.utils.lr_scheduler as lr_scheduler
             if conf["scheduler"] == "ExponentialDecayScheduler":
                 conf["scheduler_args"]["total_iters"] = len(train_dataloader) * conf["epochs"]
+                # conf["discriminator_scheduler_args"]["total_iters"] = len(train_dataloader) * \
+                    # (conf["epochs"] - conf["condition_start"])
             if "warmup_iters" not in conf["scheduler_args"]:
                 warmup_iters = len(train_dataloader) * conf["epochs"] // 5
                 conf["scheduler_args"]["warmup_iters"] = warmup_iters
+                # conf["discriminator_scheduler_args"]["warmup_iters"] = 0
             if not conf["distributed"] or not self.local_rank:
                 logger.info(f"Warm up iterations: {conf['scheduler_args']['warmup_iters']}")
             scheduler = getattr(lr_scheduler, conf["scheduler"])(
                 optimizer, **conf["scheduler_args"])
+            # dscrm_scheduler = getattr(lr_scheduler, conf["dscrm_scheduler"])(
+                # optimizer_dscrm, **conf["discriminator_scheduler_args"])
+            dscrm_scheduler = getattr(lr_scheduler, conf["scheduler"])(
+                optimizer_dscrm, **conf["scheduler_args"])
 
         def update_lr(engine, metric=None):
             if scheduler.__class__.__name__ == "ReduceLROnPlateau":
                 assert metric is not None, "need validation metric for ReduceLROnPlateau"
                 val_result = engine.state.metrics[metric]
                 scheduler.step(val_result)
+                dscrm_scheduler.step(val_result)
             else:
                 scheduler.step()
+                dscrm_scheduler.step()
 
         if scheduler.__class__.__name__ in ["StepLR", "ReduceLROnPlateau", "ExponentialLR", "MultiStepLR"]:
             evaluator.add_event_handler(Events.EPOCH_COMPLETED, update_lr, "score")
@@ -343,7 +592,7 @@ class Runner(BaseRunner):
                         output = output.item()
                     output_str_list.append("{} {:5<.2g} ".format(
                         metric, output))
-                    tensorboard_writer.add_scalar(f"{metric}/val", output, engine.state.epoch)
+                    tb_writer.add_scalar(f"{metric}/val", output, engine.state.epoch)
                 lr = optimizer.param_groups[0]["lr"]
                 output_str_list.append(f"lr {lr:5<.2g} ")
 
@@ -358,27 +607,9 @@ class Runner(BaseRunner):
                     "vocabulary": vocabulary.idx2word
                 }
                 if crtrn_imprvd(engine.state.metrics["score"]):
-                    best_dump = dump.copy()
-                    del best_dump["optimizer"]
-                    del best_dump["lr_scheduler"]
-                    torch.save(best_dump, outputdir / "best.pth")
+                    torch.save(dump, outputdir / "best.pth")
                 torch.save(dump, outputdir / "last.pth")
-            # # regular checkpoint
-            # checkpoint_handler = ModelCheckpoint(
-                # outputdir,
-                # "run",
-                # n_saved=1,
-                # require_empty=False,
-                # create_dir=False,
-                # score_function=lambda engine: engine.state.metrics["score"],
-                # score_name="score")
-            # evaluator.add_event_handler(
-                # Events.EPOCH_COMPLETED, checkpoint_handler, {
-                    # "model": model,
-                # }
-            # )
             # dump configuration
-            del conf["vocabulary"]
             train_util.store_yaml(conf, outputdir / "config.yaml")
 
         #########################
@@ -392,6 +623,7 @@ class Runner(BaseRunner):
                 "model": swa_model.module.state_dict(),
                 "vocabulary": vocabulary.idx2word
             }, outputdir / "swa.pth")
+
 
         if not conf["distributed"] or not self.local_rank:
             return outputdir

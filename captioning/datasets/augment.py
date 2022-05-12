@@ -5,28 +5,37 @@ import torch
 
 from .nb_SparseImageWarp import sparse_image_warp
 
+
 def time_warp(spec: np.ndarray, W: int = 5):
     spec = torch.as_tensor(spec).transpose(0, 1).unsqueeze(0)
-    spec_len = spec.shape[2]
-    num_freq = spec.shape[1]
+    num_rows = spec.shape[2]
+    spec_len = spec.shape[1]
     device = spec.device
 
-    y = num_freq // 2
-    horizontal_line_at_ctr = spec[0][y]
-    assert len(horizontal_line_at_ctr) == spec_len
+    pt = (num_rows - 2* W) * torch.rand([1], dtype=torch.float) + W # random point along the time axis
+    src_ctr_pt_freq = torch.arange(0, spec_len // 2)  # control points on freq-axis
+    src_ctr_pt_time = torch.ones_like(src_ctr_pt_freq) * pt  # control points on time-axis
+    src_ctr_pts = torch.stack((src_ctr_pt_freq, src_ctr_pt_time), dim=-1)
+    src_ctr_pts = src_ctr_pts.float().to(device)
 
-    point_to_warp = horizontal_line_at_ctr[random.randrange(W, spec_len - W)]
-    assert isinstance(point_to_warp, torch.Tensor)
+    # Destination
+    w = 2 * W * torch.rand([1], dtype=torch.float) - W# distance
+    dest_ctr_pt_freq = src_ctr_pt_freq
+    dest_ctr_pt_time = src_ctr_pt_time + w
+    dest_ctr_pts = torch.stack((dest_ctr_pt_freq, dest_ctr_pt_time), dim=-1)
+    dest_ctr_pts = dest_ctr_pts.float().to(device)
 
-    # Uniform distribution from (0,W) with chance to be up to W negative
-    dist_to_warp = random.randrange(-W, W)
-    src_pts, dest_pts = (torch.tensor([[[y, point_to_warp]]], device=device),
-                         torch.tensor([[[y, point_to_warp + dist_to_warp]]], device=device))
-    warped_spectro, dense_flows = sparse_image_warp(spec, src_pts, dest_pts)
-    return warped_spectro.squeeze(3).squeeze(0).transpose(0, 1).numpy()
+    # warp
+    source_control_point_locations = torch.unsqueeze(src_ctr_pts, 0)  # (1, v//2, 2)
+    dest_control_point_locations = torch.unsqueeze(dest_ctr_pts, 0)  # (1, v//2, 2)
+    warped_spectro, dense_flows = sparse_image_warp(spec, 
+                                                    source_control_point_locations, 
+                                                    dest_control_point_locations)
+    warped_spectro = warped_spectro.squeeze(3).squeeze(0).transpose(0, 1).numpy()
+    return warped_spectro
 
 
-def freq_mask(spec: np.ndarray, F: int = 30, num_masks: int = 1, replace_with_zero: bool = False):
+def freq_mask(spec: np.ndarray, F: int = 30, num_masks: int = 1, replace_with_zero: bool = True):
     """spec: [T, F]"""
     cloned = spec.copy()
     num_channels = cloned.shape[1]
@@ -47,7 +56,7 @@ def freq_mask(spec: np.ndarray, F: int = 30, num_masks: int = 1, replace_with_ze
     return cloned
 
 
-def time_mask(spec: np.ndarray, T: int = 40, num_masks: int = 1, replace_with_zero: bool = False):
+def time_mask(spec: np.ndarray, T: int = 40, num_masks: int = 1, replace_with_zero: bool = True):
     cloned = spec.copy()
     len_spectro = cloned.shape[0]
 
