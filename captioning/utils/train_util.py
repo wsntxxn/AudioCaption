@@ -61,6 +61,33 @@ def encode_labels(labels: pd.Series, encoder=None):
     labels_encoded = encoder.transform(labels)
     return labels_encoded.tolist(), encoder
 
+def merge_a_into_b(a, b):
+    # merge dict a into dict b. values in a will overwrite b.
+    for k, v in a.items():
+        if isinstance(v, dict) and k in b:
+            assert isinstance(
+                b[k], dict
+            ), "Cannot inherit key '{}' from base!".format(k)
+            merge_a_into_b(v, b[k])
+        else:
+            b[k] = v
+
+def load_config(config_file):
+    with open(config_file, "r") as reader:
+        config = yaml.load(reader, Loader=yaml.FullLoader)
+    if "inherit_from" in config:
+        base_config_file = config["inherit_from"]
+        base_config_file = os.path.join(
+            os.path.dirname(config_file), base_config_file
+        )
+        assert not os.path.samefile(config_file, base_config_file), \
+            "inherit from itself"
+        base_config = load_config(base_config_file)
+        del config["inherit_from"]
+        merge_a_into_b(config, base_config)
+        return base_config
+    return config
+
 def parse_config_or_kwargs(config_file, **kwargs):
     default_args = {
         "distributed": False,
@@ -68,8 +95,7 @@ def parse_config_or_kwargs(config_file, **kwargs):
         "swa_start": 21,
         "sampler_args": {"max_cap_num": None},
     }
-    with open(config_file) as con_reader:
-        yaml_config = yaml.load(con_reader, Loader=yaml.FullLoader)
+    yaml_config = load_config(config_file)
     # passed kwargs will override yaml config
     args = dict(yaml_config, **kwargs)
     for key, value in default_args.items():
@@ -88,7 +114,14 @@ def parse_augments(augment_list):
     """
     from captioning.datasets import augment
 
-    specaug_kwargs = {"timemask": False, "freqmask": False, "timewarp": False}
+    specaug_kwargs = {
+        "timemask": False, 
+        "freqmask": False,
+        "timewarp": False,
+        "num_timemask": 2,
+        "T": 1,
+        "F": 600
+    }
     augments = []
     for transform in augment_list:
         if transform == "timemask":

@@ -7,6 +7,7 @@ import torch.nn as nn
 
 from captioning.models.utils import mean_with_lens, repeat_tensor
 
+
 class CaptionModel(nn.Module):
     """
     Encoder-decoder captioning model.
@@ -31,8 +32,9 @@ class CaptionModel(nn.Module):
         self.check_decoder_compatibility()
 
     def check_decoder_compatibility(self):
+        compatible_decoders = [x.__class__.__name__ for x in self.compatible_decoders]
         assert isinstance(self.decoder, self.compatible_decoders), \
-            f"{self.decoder.__class__.__name__} is incompatible with {self.__class__.__name__}, please use decoder in {self.compatible_decoders} "
+            f"{self.decoder.__class__.__name__} is incompatible with {self.__class__.__name__}, please use decoder in {compatible_decoders} "
 
     @classmethod
     def set_index(cls, start_idx, end_idx):
@@ -278,7 +280,9 @@ class CaptionModel(nn.Module):
                         beam_size, 0, True, True)
                 topk_words = topk_words.cpu()
                 output_i["topk_logprobs"] = topk_logprobs
-                output_i["prev_words_beam"] = topk_words // self.vocab_size  # [beam_size,]
+                # output_i["prev_words_beam"] = topk_words // self.vocab_size  # [beam_size,]
+                output_i["prev_words_beam"] = torch.div(topk_words, self.vocab_size,
+                                                        rounding_mode='trunc')
                 output_i["next_word"] = topk_words % self.vocab_size  # [beam_size,]
                 if t == 0:
                     output_i["seqs"] = output_i["next_word"].unsqueeze(1)

@@ -696,7 +696,6 @@ class TransformerDecoder(BaseDecoder):
         p_attn_embs = p_attn_embs.transpose(0, 1) # [T_src, N, emb_dim]
         word = word.to(attn_embs.device)
         embed = self.in_dropout(self.word_embedding(word)) * math.sqrt(self.emb_dim) # [N, T, emb_dim]
-        # embed = self.word_embedding(word) * math.sqrt(self.emb_dim) # [N, T, emb_dim]
         embed = embed.transpose(0, 1) # [T, N, emb_dim]
         embed = self.pos_encoder(embed)
 
@@ -749,5 +748,74 @@ class M2TransformerDecoder(BaseDecoder):
         output = {
             "embeds": embeds,
             "logits": logits,
+        }
+        return output
+
+
+class EventTransformerDecoder(TransformerDecoder):
+
+    def forward(self, input_dict):
+        word = input_dict["word"] # index of word embeddings
+        attn_embs = input_dict["attn_embs"]
+        attn_emb_lens = input_dict["attn_emb_lens"]
+        caps_padding_mask = input_dict["caps_padding_mask"]
+        event_embs = input_dict["events"] # [N, emb_dim]
+
+        p_attn_embs = self.attn_proj(attn_embs)
+        p_attn_embs = p_attn_embs.transpose(0, 1) # [T_src, N, emb_dim]
+        word = word.to(attn_embs.device)
+        embed = self.in_dropout(self.word_embedding(word)) * math.sqrt(self.emb_dim) # [N, T, emb_dim]
+
+        embed = embed.transpose(0, 1) # [T, N, emb_dim]
+        embed += event_embs
+        embed = self.pos_encoder(embed)
+
+        tgt_mask = self.generate_square_subsequent_mask(embed.size(0)).to(attn_embs.device)
+        memory_key_padding_mask = ~generate_length_mask(attn_emb_lens, attn_embs.size(1)).to(attn_embs.device)
+        output = self.model(embed, p_attn_embs, tgt_mask=tgt_mask,
+                            tgt_key_padding_mask=caps_padding_mask,
+                            memory_key_padding_mask=memory_key_padding_mask)
+        output = output.transpose(0, 1)
+        output = {
+            "embeds": output,
+            "logits": self.classifier(output),
+        }
+        return output
+
+
+class KeywordProbTransformerDecoder(TransformerDecoder):
+
+    def __init__(self, emb_dim, vocab_size, fc_emb_dim, attn_emb_dim, dropout, keyword_classes_num, **kwargs):
+        super().__init__(emb_dim, vocab_size, fc_emb_dim, attn_emb_dim, dropout, **kwargs)
+        self.keyword_proj = nn.Linear(keyword_classes_num, self.d_model)
+        self.word_keyword_norm = nn.LayerNorm(self.d_model)
+
+    def forward(self, input_dict):
+        word = input_dict["word"] # index of word embeddings
+        attn_embs = input_dict["attn_embs"]
+        attn_emb_lens = input_dict["attn_emb_lens"]
+        caps_padding_mask = input_dict["caps_padding_mask"]
+        keywords = input_dict["keywords"] # [N, keyword_classes_num]
+
+        p_attn_embs = self.attn_proj(attn_embs)
+        p_attn_embs = p_attn_embs.transpose(0, 1) # [T_src, N, emb_dim]
+        word = word.to(attn_embs.device)
+        embed = self.in_dropout(self.word_embedding(word)) * math.sqrt(self.emb_dim) # [N, T, emb_dim]
+
+        embed = embed.transpose(0, 1) # [T, N, emb_dim]
+        embed += self.keyword_proj(keywords)
+        embed = self.word_keyword_norm(embed)
+
+        embed = self.pos_encoder(embed)
+
+        tgt_mask = self.generate_square_subsequent_mask(embed.size(0)).to(attn_embs.device)
+        memory_key_padding_mask = ~generate_length_mask(attn_emb_lens, attn_embs.size(1)).to(attn_embs.device)
+        output = self.model(embed, p_attn_embs, tgt_mask=tgt_mask,
+                            tgt_key_padding_mask=caps_padding_mask,
+                            memory_key_padding_mask=memory_key_padding_mask)
+        output = output.transpose(0, 1)
+        output = {
+            "embeds": output,
+            "logits": self.classifier(output),
         }
         return output

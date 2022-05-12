@@ -19,48 +19,9 @@ import captioning.models.decoder
 import captioning.losses.loss as losses
 import captioning.utils.train_util as train_util
 from captioning.utils.build_vocab import Vocabulary
-from captioning.pytorch_runners.base import BaseRunner
+from captioning.pytorch_runners.run import Runner as BaseRunner
 
 class Runner(BaseRunner):
-
-    @staticmethod
-    def _get_model(config, outputfun=sys.stdout):
-        vocabulary = config["vocabulary"]
-        encoder = getattr(
-            captioning.models.encoder, config["encoder"])(
-            config["data"]["raw_feat_dim"],
-            config["data"]["fc_feat_dim"],
-            config["data"]["attn_feat_dim"],
-            **config["encoder_args"]
-        )
-        if "pretrained_encoder" in config:
-            train_util.load_pretrained_model(encoder, 
-                                             config["pretrained_encoder"],
-                                             outputfun)
-        decoder = getattr(
-            captioning.models.decoder, config["decoder"])(
-            vocab_size=len(vocabulary),
-            **config["decoder_args"]
-        )
-        if "pretrained_word_embedding" in config:
-            embeddings = np.load(config["pretrained_word_embedding"])
-            decoder.load_word_embeddings(
-                embeddings,
-                freeze=config["freeze_word_embedding"]
-            )
-        if "pretrained_decoder" in config:
-            train_util.load_pretrained_model(decoder,
-                                             config["pretrained_decoder"],
-                                             outputfun)
-        model = getattr(
-            captioning.models, config["model"])(
-            encoder, decoder, **config["model_args"]
-        )
-        if "pretrained" in config:
-            train_util.load_pretrained_model(model,
-                                             config["pretrained"],
-                                             outputfun)
-        return model
 
     def _forward(self, model, batch, mode, **kwargs):
         assert mode in ("train", "validation", "eval")
@@ -105,14 +66,6 @@ class Runner(BaseRunner):
             output = model(input_dict)
 
         return output
-
-    def _update_ss_ratio(self, config):
-        mode = config["ss_args"]["ss_mode"]
-        total_iters = config["data"]["total_iters"]
-        if mode == "exponential":
-            self.ss_ratio *= 0.01 ** (1.0 / total_iters)
-        elif mode == "linear":
-            self.ss_ratio -= (1.0 - config["ss_args"]["final_ss_ratio"]) / total_iters
 
     def inference(self, model, dataloader, vocabulary, zh):
         model.eval()

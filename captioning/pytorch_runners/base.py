@@ -33,11 +33,10 @@ class BaseRunner(object):
 
     def _get_dataloaders(self, config):
         augments = train_util.parse_augments(config["augments"])
-        if config["distributed"]:
-            config["dataloader_args"]["batch_size"] //= self.world_size
 
         data_config = config["data"]
         vocabulary = config["vocabulary"]
+        load_into_mem = data_config["load_into_mem"]
         if "train" not in data_config:
             raw_feat_df = pd.read_csv(data_config["raw_feat_csv"], sep="\t")
             raw_audio_to_h5 = dict(zip(raw_feat_df["audio_id"], raw_feat_df["hdf5_path"]))
@@ -55,6 +54,7 @@ class BaseRunner(object):
                 attn_audio_to_h5,
                 caption_info,
                 vocabulary,
+                load_into_mem=load_into_mem,
                 transform=augments
             )
             # TODO DistributedCaptionSampler
@@ -71,6 +71,7 @@ class BaseRunner(object):
                 {audio_id: raw_audio_to_h5[audio_id] for audio_id in val_audio_ids},
                 {audio_id: fc_audio_to_h5[audio_id] for audio_id in val_audio_ids},
                 {audio_id: attn_audio_to_h5[audio_id] for audio_id in val_audio_ids},
+                load_into_mem=load_into_mem
             )
             val_dataloader = torch.utils.data.DataLoader(
                 val_dataset,
@@ -108,6 +109,7 @@ class BaseRunner(object):
                 data["train"]["attn_audio_to_h5"],
                 data["train"]["caption_info"],
                 vocabulary,
+                load_into_mem=load_into_mem,
                 transform=augments
             )
             # TODO DistributedCaptionSampler
@@ -123,6 +125,7 @@ class BaseRunner(object):
                 data["val"]["raw_audio_to_h5"],
                 data["val"]["fc_audio_to_h5"],
                 data["val"]["attn_audio_to_h5"],
+                load_into_mem=load_into_mem
             )
             val_dataloader = torch.utils.data.DataLoader(
                 val_dataset,
@@ -135,8 +138,14 @@ class BaseRunner(object):
                 audio_id = caption_info[audio_idx]["audio_id"]
                 train_key2refs[audio_id] = []
                 for caption in caption_info[audio_idx]["captions"]:
-                    train_key2refs[audio_id].append(
-                        caption["token" if config["zh"] else "caption"])
+                    if config["zh"]:
+                        cap = caption["tokens"]
+                    else:
+                        if "tokens" in caption:
+                            cap = caption["tokens"]
+                        else:
+                            cap = caption["caption"]
+                    train_key2refs[audio_id].append(cap)
             val_key2refs = {}
             caption_info = data["val"]["caption_info"]
             for audio_idx in range(len(caption_info)):
@@ -144,7 +153,7 @@ class BaseRunner(object):
                 val_key2refs[audio_id] = []
                 for caption in caption_info[audio_idx]["captions"]:
                     val_key2refs[audio_id].append(
-                        caption["token" if config["zh"] else "caption"])
+                        caption["tokens" if config["zh"] else "caption"])
 
         return {
             "train_dataloader": train_dataloader,
@@ -178,7 +187,18 @@ class BaseRunner(object):
         raise NotImplementedError
 
     @staticmethod
-    def _eval_prediction(key2refs, key2pred, scorers, pretokenized=False):
+    def _eval_prediction(key2refs, key2pred, scorers, pretokenized=False, per_audio=False):
+        output = {}
+        if per_audio:
+            output["per_audio"] = {}
+        for scorer in scorers:
+            if scorer.method() == "Fense":
+                score, scores = scorer.compute_score(key2refs, key2pred)
+                output[scorer.method()] = score
+                if per_audio:
+                    output["per_audio"][scorer.method()] = dict(zip(
+                        key2refs.keys(), scores))
+
         if not pretokenized:
             refs4eval = {}
             for key, refs in key2refs.items():
@@ -206,11 +226,125 @@ class BaseRunner(object):
             key2refs = tokenizer.tokenize(refs4eval)
             key2pred = tokenizer.tokenize(preds4eval)
 
-        output = {}
         for scorer in scorers:
-            score, scores = scorer.compute_score(key2refs, key2pred)
-            output[scorer.method()] = score
+            if scorer.method() != "Fense":
+                score, scores = scorer.compute_score(key2refs, key2pred)
+                output[scorer.method()] = score
+                if per_audio:
+                    if scorer.method() == "Bleu":
+                        output["per_audio"][scorer.method()] = dict(zip(
+                            key2refs.keys(), scores[3]))
+                    elif scorer.method() == "SPICE":
+                        scores = np.array([item["All"]["f"] for item in scores])
+                        output["per_audio"][scorer.method()] = dict(zip(
+                            sorted(key2refs.keys()), scores))
+                    else:
+                        output["per_audio"][scorer.method()] = dict(zip(
+                            key2refs.keys(), scores))
         return output
+
+    def evaluate_prediction(self,
+                            caption_file,
+                            system_output,
+                            score_output=None,
+                            zh=False,
+                            system_output_index=None):
+        captions = json.load(open(caption_file, "r"))["audios"]
+        key2refs = {}
+        for audio_idx in range(len(captions)):
+            audio_id = captions[audio_idx]["audio_id"]
+            key2refs[audio_id] = []
+            for caption in captions[audio_idx]["captions"]:
+                key2refs[audio_id].append(caption["tokens" if zh else "caption"])
+        key2pred = {}
+        predictions = json.load(open(system_output, "r"))["predictions"]
+        for pred_item in predictions:
+            if system_output_index is not None:
+                pred = pred_item["tokens"][system_output_index]
+            else:
+                pred = pred_item["tokens"]
+            key2pred[pred_item["filename"]] = [pred,]
+        from pycocoevalcap.bleu.bleu import Bleu
+        from pycocoevalcap.rouge.rouge import Rouge
+        from pycocoevalcap.cider.cider import Cider
+        from pycocoevalcap.meteor.meteor import Meteor
+        from pycocoevalcap.spice.spice import Spice
+        from fense.fense import Fense
+        scorers = [Bleu(n=4), Rouge(), Cider()]
+        if not zh:
+            scorers.append(Meteor())
+            scorers.append(Spice())
+            scorers.append(Fense())
+        scores_output = self._eval_prediction(key2refs, key2pred, scorers, pretokenized=zh)
+        spider = 0
+        for name, score in scores_output.items():
+            if name == "Bleu":
+                for n in range(4):
+                    print("Bleu-{}: {:6.3f}".format(n + 1, score[n]))
+            else:
+                print("{}: {:6.3f}".format(name, score))
+                if name in ["CIDEr", "SPICE"]:
+                    spider += score
+        if not zh:
+            print("SPIDEr: {:6.3f}".format(spider / 2))
+
+        if score_output:
+            with open(score_output, "w") as f:
+                for name, score in scores_output.items():
+                    if name == "Bleu":
+                        for n in range(4):
+                            print("Bleu-{}: {:6.3f}".format(n + 1, score[n]), file=f)
+                    else:
+                        print("{}: {:6.3f}".format(name, score), file=f)
+                if not zh:
+                    print("SPIDEr: {:6.3f}".format(spider / 2), file=f)
+
+    def evaluate_prediction_per_audio(
+        self, caption_file, system_output, score_output,
+        zh=False, system_output_index=None):
+        captions = json.load(open(caption_file, "r"))["audios"]
+        key2refs = {}
+        for audio_idx in range(len(captions)):
+            audio_id = captions[audio_idx]["audio_id"]
+            key2refs[audio_id] = []
+            for caption in captions[audio_idx]["captions"]:
+                key2refs[audio_id].append(caption["tokens" if zh else "caption"])
+        key2pred = {}
+        key2idx = {}
+        predictions = json.load(open(system_output, "r"))["predictions"]
+        for idx, pred_item in enumerate(predictions):
+            if system_output_index is not None:
+                pred = pred_item["tokens"][system_output_index]
+            else:
+                pred = pred_item["tokens"]
+            audio_id = pred_item["filename"]
+            key2idx[audio_id] = idx
+            key2pred[audio_id] = [pred,]
+        from pycocoevalcap.bleu.bleu import Bleu
+        from pycocoevalcap.rouge.rouge import Rouge
+        from pycocoevalcap.cider.cider import Cider
+        from pycocoevalcap.meteor.meteor import Meteor
+        from pycocoevalcap.spice.spice import Spice
+        from fense.fense import Fense
+        scorers = [Bleu(n=4), Rouge(), Cider()]
+        if not zh:
+            scorers.append(Meteor())
+            scorers.append(Spice())
+            scorers.append(Fense())
+        scores_output = self._eval_prediction(key2refs, key2pred, scorers,
+            pretokenized=zh, per_audio=True)
+
+        for name, key2score in scores_output["per_audio"].items():
+            for key in key2refs.keys():
+                predictions[key2idx[key]][name] = f"{key2score[key]:.3f}"
+
+        for key in key2refs.keys():
+            spider = (scores_output["per_audio"]["CIDEr"][key] + 
+                scores_output["per_audio"]["SPICE"][key]) / 2
+            predictions[key2idx[key]]["SPIDEr"] = f"{spider:.3f}"
+
+        json.dump({"predictions": predictions}, open(score_output, "w"), indent=4)
+
 
     def predict(self,
                 experiment_path: str,
@@ -274,7 +408,6 @@ class BaseRunner(object):
         for key, pred in key2pred.items():
             pred_data.append({
                 "filename": key,
-                "caption": "".join(pred[0]) if zh else pred[0],
                 "tokens": " ".join(pred[0]) if zh else pred[0]
             })
         json.dump({"predictions": pred_data}, open(experiment_path / caption_output, "w"), indent=4)
@@ -297,14 +430,14 @@ class BaseRunner(object):
         default_eval_data = {
             "clotho": {
                 "raw_feat_csv": "data/clotho_v2/eval/lms.csv",
-                "fc_feat_csv": "data/clotho_v2/eval/panns_cnn14_fc.csv",
-                "attn_feat_csv": "data/clotho_v2/eval/panns_cnn14_attn.csv",
+                "fc_feat_csv": "data/clotho_v2/eval/panns_wavegram_logmel_cnn14_fc.csv",
+                "attn_feat_csv": "data/clotho_v2/eval/panns_wavegram_logmel_cnn14_attn.csv",
                 "caption_file": "data/clotho_v2/eval/text.json",
             },
             "audiocaps": {
                 "raw_feat_csv": "data/audiocaps/test/lms.csv",
-                "fc_feat_csv": "data/audiocaps/test/panns_cnn14_fc.csv",
-                "attn_feat_csv": "data/audiocaps/test/panns_cnn14_attn.csv",
+                "fc_feat_csv": "data/audiocaps/test/panns_wavegram_logmel_cnn14_fc.csv",
+                "attn_feat_csv": "data/audiocaps/test/panns_wavegram_logmel_cnn14_attn.csv",
                 "caption_file": "data/audiocaps/test/text.json"
             },
         }
@@ -341,11 +474,13 @@ class BaseRunner(object):
         from pycocoevalcap.cider.cider import Cider
         from pycocoevalcap.meteor.meteor import Meteor
         from pycocoevalcap.spice.spice import Spice
+        from fense.fense import Fense
 
-        scorers = [Bleu(n=4, zh=zh), Rouge(zh=zh), Cider(zh=zh)]
+        scorers = [Bleu(n=4), Rouge(), Cider()]
         if not zh:
             scorers.append(Meteor())
             scorers.append(Spice())
+            scorers.append(Fense())
         scores_output = self._eval_prediction(key2refs, key2pred, scorers)
 
         with open(str(experiment_path / score_output), "w") as f:
@@ -361,79 +496,13 @@ class BaseRunner(object):
             if not zh:
                 f.write("SPIDEr: {:6.3f}\n".format(spider / 2))
 
-        # from audiocaptioneval.sentbert.sentencebert import SentenceBert
-        # scorer = SentenceBert(zh=zh)
-        # if caption_embedding_path is not None:
-            # key2ref_embeds = np.load(caption_embedding_path, allow_pickle=True)
-            # score, scores = scorer.compute_score(key2ref_embeds, key2pred)
-        # else:
-            # score, scores = scorer.compute_score(key2refs, key2pred)
-        # f.write("SentenceBert: {:6.3f}\n".format(score))
-
-        # from utils.diverse_eval import diversity_evaluate
-        # score = diversity_evaluate(pred_df)
-        # f.write("Diversity: {:6.3f}\n".format(score))
-
     def train_evaluate(self, config, task, **kwargs):
         experiment_path = self.train(config, **kwargs)
         for save_type in ["best", "last", "swa"]:
-            self.evaluate(experiment_path, task, save_type=save_type, score_output=f"{save_type}.txt", method="beam")
+            self.evaluate(experiment_path, task, save_type=save_type,
+                score_output=f"{save_type}.txt", caption_output=f"{save_type}.json",
+                method="beam")
         return experiment_path
-
-    def dcase_predict(self,
-                      experiment_path: str,
-                      feature_file: str,
-                      feature_scp: str,
-                      output: str="test_prediction.csv",
-                      **kwargs):
-        """kwargs: {'max_length': int, 'method': str, 'beam_size': int}"""
-
-        dump = torch.load(str(Path(experiment_path) / "saved.pth"), map_location="cpu")
-        # Some scaler (sklearn standardscaler)
-        scaler = dump["scaler"]
-        # Also load previous training config
-        config = dump["config"]
-
-        vocabulary = torch.load(config["vocab_file"])
-        model = self._get_model(config, vocabulary)
-        model.load_state_dict(dump["model"])
-
-        zh = config["zh"]
-        model = model.to(self.device)
-        
-        dataset = SJTUDatasetEval(
-            feature=feature_file,
-            eval_scp=feature_scp,
-            transform=None if scaler is None else [scaler.transform]
-        )
-        dataloader = torch.utils.data.DataLoader(
-            dataset,
-            shuffle=False,
-            collate_fn=collate_fn((1,)),
-            batch_size=32,
-            num_workers=0
-        )
-
-        pbar = ProgressBar(persist=False, ascii=True, ncols=100)
-        predictions = []
-
-        def _sample(engine, batch):
-            # batch: [keys, feats, feat_lens]
-            with torch.no_grad():
-                model.eval()
-                keys = batch[0]
-                output = self._forward(model, batch, mode="eval", **kwargs)
-                seqs = output["seqs"].cpu().numpy()
-                for idx, seq in enumerate(seqs):
-                    caption = self._convert_idx2sentence(seq, vocabulary, zh)
-                    predictions.append({"file_name": keys[idx], "caption_predicted": caption})
-
-        sample_engine = Engine(_sample)
-        pbar.attach(sample_engine)
-        sample_engine.run(dataloader)
-
-        pred_df = pd.DataFrame(predictions)
-        pred_df.to_csv(str(Path(experiment_path) / output), index=False)
 
     def ensemble(self,
                  exp_path_file: str,

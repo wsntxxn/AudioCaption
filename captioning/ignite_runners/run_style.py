@@ -3,6 +3,8 @@
 import os
 import sys
 import pickle
+import datetime
+import uuid
 from pathlib import Path
 
 import fire
@@ -10,7 +12,6 @@ import numpy as np
 import torch
 from ignite.engine.engine import Engine, Events
 from ignite.metrics import RunningAverage
-from ignite.handlers import ModelCheckpoint
 from ignite.contrib.handlers import ProgressBar
 from ignite.utils import convert_tensor
 from torch.utils.tensorboard import SummaryWriter
@@ -18,7 +19,9 @@ from torch.utils.tensorboard import SummaryWriter
 import captioning.models
 import captioning.models.encoder
 import captioning.models.decoder
+import captioning.models.ref_encoder
 import captioning.losses.loss as losses
+import captioning.metrics.metric as metrics
 import captioning.utils.train_util as train_util
 from captioning.utils.build_vocab import Vocabulary
 from captioning.ignite_runners.base import BaseRunner
@@ -27,7 +30,7 @@ class Runner(BaseRunner):
 
     @staticmethod
     def _get_model(config, outputfun=sys.stdout):
-        vocabulary = config["vocabulary"]
+        vocabulary = pickle.load(open(config["data"]["vocab_file"], "rb"))
         encoder = getattr(
             captioning.models.encoder, config["encoder"])(
             config["data"]["raw_feat_dim"],
@@ -55,9 +58,14 @@ class Runner(BaseRunner):
             train_util.load_pretrained_model(decoder,
                                              config["pretrained_decoder"],
                                              outputfun)
+        ref_encoder = getattr(
+            captioning.models.ref_encoder, config["ref_encoder"])(
+            vocab_size=len(vocabulary) + 1, # add cls token
+            **config["ref_encoder_args"]
+        )
         model = getattr(
             captioning.models, config["model"])(
-            encoder, decoder, **config["model_args"]
+            encoder, decoder, ref_encoder, **config["model_args"]
         )
         if "pretrained" in config:
             train_util.load_pretrained_model(model, 
@@ -115,6 +123,8 @@ class Runner(BaseRunner):
             output["lens"] = torch.as_tensor(cap_lens - 1)
         else:
             input_dict.update(kwargs)
+            style_weights = torch.as_tensor(kwargs["style_weights"]).float()
+            input_dict["style_weights"] = style_weights
             output = model(input_dict)
 
         return output
@@ -147,6 +157,8 @@ class Runner(BaseRunner):
         if not conf["distributed"] or not self.local_rank:
             outputdir = Path(conf["outputpath"]) / conf["model"] / \
                 conf["remark"] / f"seed_{self.seed}"
+                # "{}_{}".format(datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%m"),
+                               # uuid.uuid1().hex)
 
             outputdir.mkdir(parents=True, exist_ok=True)
             logger = train_util.genlogger(str(outputdir / "train.log"))
@@ -160,8 +172,8 @@ class Runner(BaseRunner):
         #########################
         # Create dataloaders
         #########################
+        zh = conf["zh"]
         vocabulary = pickle.load(open(conf["data"]["vocab_file"], "rb"))
-        conf["vocabulary"] = vocabulary
         dataloaders = self._get_dataloaders(conf)
         train_dataloader = dataloaders["train_dataloader"]
         val_dataloader = dataloaders["val_dataloader"]
@@ -195,6 +207,10 @@ class Runner(BaseRunner):
         optimizer = getattr(torch.optim, conf["optimizer"])(
             model.parameters(), **conf["optimizer_args"])
         criterion = getattr(losses, conf["loss"])(**conf["loss_args"])
+        # if conf["label_smoothing"]:
+            # criterion = losses.LabelSmoothingLoss(len(vocabulary), smoothing=conf["smoothing"])
+        # else:
+            # criterion = torch.nn.CrossEntropyLoss().to(self.device)
         if not conf["distributed"] or not self.local_rank:
             train_util.pprint_dict(optimizer, logger.info, formatter="pretty")
             crtrn_imprvd = train_util.criterion_improver(conf["improvecriterion"])
@@ -233,7 +249,8 @@ class Runner(BaseRunner):
         pbar = ProgressBar(persist=False, ascii=True, ncols=100)
         pbar.attach(trainer, ["running_loss"])
         train_metrics = {
-            "loss": losses.Loss(criterion)
+            "loss": losses.Loss(criterion),
+            "accuracy": metrics.Accuracy(),
         }
         for name, metric in train_metrics.items():
             metric.attach(trainer, name)
@@ -250,7 +267,7 @@ class Runner(BaseRunner):
                     conf["ss_args"]["ss_ratio"] -= (1.0 - conf["ss_args"]["final_ss_ratio"]) / num_epoch / num_iter
         # stochastic weight averaging
         if conf["swa"]:
-            swa_model = train_util.AveragedModel(model)
+            swa_model = torch.optim.swa_utils.AveragedModel(model)
             @trainer.on(Events.EPOCH_COMPLETED)
             def update_swa(engine):
                 if engine.state.epoch >= conf["swa_start"]:
@@ -266,11 +283,12 @@ class Runner(BaseRunner):
             model.eval()
             keys = batch[0]
             with torch.no_grad():
-                output = self._forward(model, batch, "validation", sample_method="beam", beam_size=3)
-                # output = self._forward(model, batch, "validation")
+                output = self._forward(model, batch, "validation",
+                                       sample_method="beam", beam_size=3,
+                                       style_weights=[1.0, 0.0])
                 seqs = output["seqs"].cpu().numpy()
                 for (idx, seq) in enumerate(seqs):
-                    candidate = self._convert_idx2sentence(seq, vocabulary.idx2word)
+                    candidate = self._convert_idx2sentence(seq, vocabulary.idx2word, zh)
                     key2pred[keys[idx]] = [candidate,]
                 return output
 
@@ -278,7 +296,7 @@ class Runner(BaseRunner):
 
         @evaluator.on(Events.EPOCH_COMPLETED)
         def eval_val(engine):
-            scorer = Cider()
+            scorer = Cider(zh=zh)
             score_output = self._eval_prediction(val_key2refs, key2pred, [scorer])
             engine.state.metrics["score"] = score_output["CIDEr"]
             key2pred.clear()
@@ -320,7 +338,6 @@ class Runner(BaseRunner):
         # Events for main process: mostly logging and saving
         #########################
 
-
         if not conf["distributed"] or not self.local_rank:
             # logging training and validation loss and metrics
             @trainer.on(Events.EPOCH_COMPLETED)
@@ -358,27 +375,9 @@ class Runner(BaseRunner):
                     "vocabulary": vocabulary.idx2word
                 }
                 if crtrn_imprvd(engine.state.metrics["score"]):
-                    best_dump = dump.copy()
-                    del best_dump["optimizer"]
-                    del best_dump["lr_scheduler"]
-                    torch.save(best_dump, outputdir / "best.pth")
+                    torch.save(dump, outputdir / "best.pth")
                 torch.save(dump, outputdir / "last.pth")
-            # # regular checkpoint
-            # checkpoint_handler = ModelCheckpoint(
-                # outputdir,
-                # "run",
-                # n_saved=1,
-                # require_empty=False,
-                # create_dir=False,
-                # score_function=lambda engine: engine.state.metrics["score"],
-                # score_name="score")
-            # evaluator.add_event_handler(
-                # Events.EPOCH_COMPLETED, checkpoint_handler, {
-                    # "model": model,
-                # }
-            # )
             # dump configuration
-            del conf["vocabulary"]
             train_util.store_yaml(conf, outputdir / "config.yaml")
 
         #########################
