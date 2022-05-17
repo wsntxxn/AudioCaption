@@ -15,16 +15,16 @@ class CrossEntropyLoss(torch.nn.Module):
         self.reduction = reduction
 
     def forward(self, output: Dict):
-        # logits: [bs, max_len, c]
-        # targets: [bs, max_len]
-        # lens: [bs]
-        logits = output["logits"]
-        targets = output["targets"]
-        lens = output["lens"]
-        c = logits.size(-1)
-        loss = self.loss_fn(logits.reshape(-1, c), targets.reshape(-1))
-        loss = loss.reshape(*targets.shape)
-        mask = generate_length_mask(lens).to(logits.device)
+        # logit: [bs, max_len, c]
+        # tgt: [bs, max_len]
+        # tgt_len: [bs]
+        logit = output["logit"]
+        tgt = output["tgt"]
+        tgt_len = output["tgt_len"]
+        c = logit.size(-1)
+        loss = self.loss_fn(logit.reshape(-1, c), tgt.reshape(-1))
+        loss = loss.reshape(*tgt.shape)
+        mask = generate_length_mask(tgt_len).to(logit.device)
         loss *= mask
         if self.reduction == "none":
             return loss
@@ -45,20 +45,20 @@ class LabelSmoothingLoss(torch.nn.Module):
         self.reduction = reduction
 
     def forward(self, output: Dict):
-        # logits: [bs, max_len, c]
-        # targets: [bs, max_len]
-        # lens: [bs]
-        logits = output["logits"]
-        targets = output["targets"]
-        lens = output["lens"]
-        preds = logits.log_softmax(dim=self.dim)
+        # logit: [bs, max_len, c]
+        # tgt: [bs, max_len]
+        # tgt_len: [bs]
+        logit = output["logit"]
+        tgt = output["tgt"]
+        tgt_len = output["tgt_len"]
+        preds = logit.log_softmax(dim=self.dim)
         with torch.no_grad():
             # true_dist = pred.data.clone()
             true_dist = torch.zeros_like(preds)
-            true_dist.fill_(self.smoothing / (logits.size(-1) - 1))
-            true_dist.scatter_(self.dim, targets.data.unsqueeze(self.dim), self.confidence)
+            true_dist.fill_(self.smoothing / (logit.size(-1) - 1))
+            true_dist.scatter_(self.dim, tgt.data.unsqueeze(self.dim), self.confidence)
         loss = torch.sum(-true_dist * preds, dim=self.dim)
-        mask = generate_length_mask(lens).to(logits.device)
+        mask = generate_length_mask(tgt_len).to(logit.device)
         loss *= mask
         if self.reduction == "none":
             return loss
@@ -90,14 +90,14 @@ class AugmentLossWrapper(torch.nn.Module):
         aug_mask[~aug_mask] = use_aug
         aug_mask = torch.as_tensor(aug_mask).to(loss.device)
         loss *= aug_mask.reshape(-1, 1)
-        mask = generate_length_mask(output["lens"]).to(loss.device)
+        mask = generate_length_mask(output["tgt_len"]).to(loss.device)
         mask *= aug_mask.reshape(-1, 1)
         return loss.sum() / (mask.sum() + self.eps)
 
 
-def reparameterize_argmax(logits, dim=-1):
-    # y = torch.softmax(logits, dim)
-    y = logits
+def reparameterize_argmax(logit, dim=-1):
+    # y = torch.softmax(logit, dim)
+    y = logit
     shape = y.size()
     _, ind = y.max(dim=dim)
     y_hard = torch.zeros_like(y).view(-1, shape[-1])
@@ -109,16 +109,16 @@ def sample_gumbel(shape, eps=1e-20):
     U = torch.rand(shape)
     return -torch.log(-torch.log(U + eps) + eps)
 
-def gumbel_softmax_sample(logits, temperature):
-    y = logits + sample_gumbel(logits.size()).to(logits.device)
+def gumbel_softmax_sample(logit, temperature):
+    y = logit + sample_gumbel(logit.size()).to(logit.device)
     return torch.softmax(y / temperature, dim=-1)
 
-def gumbel_softmax(logits, temperature=1.0):
+def gumbel_softmax(logit, temperature=1.0):
     """
     input: [*, n_class]
     return: [*, n_class] an one-hot vector
     """
-    y = gumbel_softmax_sample(logits, temperature)
+    y = gumbel_softmax_sample(logit, temperature)
     shape = y.size()
     _, ind = y.max(dim=-1)
     y_hard = torch.zeros_like(y).view(-1, shape[-1])
@@ -138,21 +138,21 @@ class ConditionLossWrapper(torch.nn.Module):
 
     def forward(self, output: Dict):
         word_loss = self.loss_fn(output)
-        logits = output["logits"]
-        conditions = output["conditions"].to(logits.device)
-        # preds = reparameterize_argmax(logits).to(logits.device)
-        # preds = gumbel_softmax(logits).to(logits.device)
+        logit = output["logit"]
+        conditions = output["conditions"].to(logit.device)
+        # preds = reparameterize_argmax(logit).to(logit.device)
+        # preds = gumbel_softmax(logit).to(logit.device)
         if self.sample_method == "argmax":
-            preds = reparameterize_argmax(logits)
+            preds = reparameterize_argmax(logit)
         elif self.sample_method == "gumbel":
-            preds = gumbel_softmax(logits)
+            preds = gumbel_softmax(logit)
         elif self.sample_method == "weighted":
-            preds = torch.softmax(logits, -1)
+            preds = torch.softmax(logit, -1)
         else:
             raise Exception(f"sample method {self.sample_method} not supported")
-        preds = preds.to(logits.device)
-        lens = output["lens"] - 1 # remove <eos>
-        probs = self.dscrm({"caps": preds, "lens": lens})
+        preds = preds.to(logit.device)
+        tgt_len = output["tgt_len"] - 1 # remove <eos>
+        probs = self.dscrm({"caps": preds, "tgt_len": tgt_len})
         condition_loss = self.condition_fn(probs, conditions)
         loss = word_loss + self.alpha * condition_loss
         return loss, word_loss, condition_loss
@@ -169,34 +169,35 @@ class SpecificityLossWrapper(torch.nn.Module):
 
     def forward(self, output: Dict):
         word_loss = self.loss_fn(output)
-        logits = output["logits"]
-        conditions = output["conditions"].to(logits.device)
-        probs = torch.softmax(logits, dim=-1)
+        logit = output["logit"]
+        conditions = output["conditions"].to(logit.device)
+        probs = torch.softmax(logit, dim=-1)
         cond_pred = torch.matmul(probs, self.word_specificity) # [N, T]
-        lens = output["lens"] - 1 # remove <eos>
+        tgt_len = output["tgt_len"] - 1 # remove <eos>
         if self.sentence_reduce == "sum":
-            mask = generate_length_mask(lens, max_length=cond_pred.size(1)).to(logits.device)
+            mask = generate_length_mask(tgt_len, max_length=cond_pred.size(1)).to(logit.device)
             cond_pred *= mask
             cond_pred = cond_pred.sum(1)
         else:
-            cond_pred = mean_with_lens(cond_pred, lens)
+            cond_pred = mean_with_lens(cond_pred, tgt_len)
         condition_loss = self.condtion_fn(cond_pred, conditions)
         loss = word_loss + self.alpha * condition_loss
         return loss, word_loss, condition_loss
+
 
 class Loss(metrics.Loss):
 
     def update(self, output: Dict) -> None:
         # logit: [bs, max_len, c]
         # target: [bs, max_len]
-        # lens: [bs]
-        lens = output["lens"]
+        # tgt_len: [bs]
+        tgt_len = output["tgt_len"]
         average_loss = self._loss_fn(output).detach()
 
         if len(average_loss.shape) != 0:
             raise ValueError("loss_fn did not return the average loss.")
 
-        n = torch.sum(lens)
+        n = torch.sum(tgt_len)
         self._sum += average_loss.to(self._device) * n
         self._num_examples += n
 
