@@ -45,12 +45,12 @@ class StyleCaptionModel(CaptionModel):
         self.ref_encoder = ref_encoder
         n_style = kwargs.get("n_style", 2)
         style_embed_dim = kwargs.get("style_embed_dim", self.decoder.emb_dim)
-        n_head = kwargs.get("style_attn_heads", 4)
-        self.cls_idx = self.ref_encoder.vocab_size - 1
+        # n_head = kwargs.get("style_attn_heads", 4)
         self.style_embeddings = nn.Parameter(torch.randn(n_style, style_embed_dim))
         assert ref_encoder.embed_dim == self.decoder.emb_dim
         self.style_attn = Attention(style_embed_dim, ref_encoder.embed_dim,
                                     ref_encoder.embed_dim)
+        self.inference_forward_keys += ["style_weight"]
         self.init_params()
 
     def init_params(self):
@@ -61,78 +61,31 @@ class StyleCaptionModel(CaptionModel):
 
     def encode_style(self, input_dict):
         if input_dict["mode"] == "train":
-            caps = input_dict["caps"] # [N, T] <bos> + cap + <eos>
-            cap_lens = input_dict["cap_lens"] # [N,] max_length = max_cap_length + 2
-            cls_tokens = torch.empty(
-                caps.size(0), 1, dtype=torch.long).fill_(self.cls_idx).to(caps.device)
-            caps = torch.cat((cls_tokens, caps[:, 1:-1]), dim=-1)
-            cap_embeds = self.ref_encoder(
-                {"caps": caps, "cap_lens": cap_lens - 1}
-            )["ref_embs"] # [N, embed_dim]
-            style_embeddings = repeat_tensor(self.style_embeddings, caps.size(0)) # [N, n_style, style_embed_dim]
-            style_embeds, style_weights = self.style_attn(
-                cap_embeds.unsqueeze(1), style_embeddings, style_embeddings)
-            style_embeds = style_embeds.squeeze(1)
-            style_weights = style_weights.squeeze(1)
-        else:
-            weights = input_dict["style_weights"]
-            weights = weights.to(self.style_embeddings.device)
-            style_embeds, _ = self.style_attn(v=self.style_embeddings, weight=weights)
-            style_embeds = repeat_tensor(style_embeds, input_dict["raw_feats"].size(0)) # [N, style_embed_dim]
-        return style_embeds
-
-    def forward(self, input_dict):
-        """
-        input_dict: {
-            (required)
-            mode: train/inference,
-            raw_feats,
-            raw_feat_lens,
-            fc_feats,
-            attn_feats,
-            attn_feat_lens,
-            [sample_method: greedy],
-            [temp: 1.0] (in case of no teacher forcing)
-
-            (optional, mode=train)
-            caps,
-            cap_lens,
-            ss_ratio,
-
-            (optional, mode=inference)
-            sample_method: greedy/beam,
-            max_length,
-            temp,
-            beam_size (optional, sample_method=beam),
-        }
-        """
-        encoder_input_keys = ["raw_feats", "raw_feat_lens", "fc_feats", "attn_feats", "attn_feat_lens"]
-        encoder_input = { key: input_dict[key] for key in encoder_input_keys }
-        encoder_output_dict = self.encoder(encoder_input)
-        if input_dict["mode"] == "train":
-            forward_dict = { "mode": "train", "sample_method": "greedy", "temp": 1.0 }
-            for key in self.train_forward_keys:
-                forward_dict[key] = input_dict[key]
-            forward_dict.update(encoder_output_dict)
-            forward_dict["styles"] = self.encode_style(input_dict)
-            output = self.train_forward(forward_dict)
+            cap = input_dict["cap"] # [batch_size, max_len] <bos> + cap + <eos>
+            cap_len = input_dict["cap_len"] # [batch_size,] max_len = max_cap_len + 2
+            cap_emb = self.ref_encoder(
+                {"cap": cap[:, 1: -1], "cap_len": cap_len - 2}
+            )["ref_emb"] # [batch_size, embed_dim]
+            style_embeddings = repeat_tensor(self.style_embeddings, cap.size(0))
+            # [batch_size, n_style, style_embed_dim]
+            style_emb, style_weight = self.style_attn(
+                cap_emb.unsqueeze(1), style_embeddings, style_embeddings)
+            style_emb = style_emb.squeeze(1)
+            style_weight = style_weight.squeeze(1)
         elif input_dict["mode"] == "inference":
-            forward_dict = {"mode": "inference"}
-            default_args = { "sample_method": "greedy", "max_length": self.max_length, "temp": 1.0 }
-            for key in self.inference_forward_keys:
-                if key in input_dict:
-                    forward_dict[key] = input_dict[key]
-                else:
-                    forward_dict[key] = default_args[key]
-            if forward_dict["sample_method"] == "beam":
-                if "beam_size" in input_dict:
-                    forward_dict["beam_size"] = input_dict["beam_size"]
-                else:
-                    forward_dict["beam_size"] = 3
-            forward_dict.update(encoder_output_dict)
-            forward_dict["styles"] = self.encode_style(input_dict)
-            output = self.inference_forward(forward_dict)
+            weight = input_dict["style_weight"]
+            weight = weight.to(self.style_embeddings.device)
+            style_emb, _ = self.style_attn(v=self.style_embeddings, weight=weight)
+            style_emb = repeat_tensor(style_emb, input_dict["fc_emb"].size(0))
+            # [batch_size, style_emb_dim]
         else:
             raise Exception("mode should be either 'train' or 'inference'")
+        return style_emb
 
-        return output
+    def train_forward(self, input_dict):
+        input_dict["style"] = self.encode_style(input_dict)
+        return super().train_forward(input_dict)
+
+    def inference_forward(self, input_dict):
+        input_dict["style"] = self.encode_style(input_dict)
+        return super().inference_forward(input_dict)

@@ -7,7 +7,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from captioning.models.utils import mean_with_lens, max_with_lens, init, pack_wrapper, generate_length_mask
+from captioning.models.utils import mean_with_lens, max_with_lens, \
+    init, pack_wrapper, generate_length_mask, PositionalEncoding
 
 class BaseEncoder(nn.Module):
     
@@ -17,9 +18,9 @@ class BaseEncoder(nn.Module):
     All encoders should inherit from this class
     """
 
-    def __init__(self, raw_feat_dim, fc_feat_dim, attn_feat_dim):
+    def __init__(self, spec_dim, fc_feat_dim, attn_feat_dim):
         super(BaseEncoder, self).__init__()
-        self.raw_feat_dim = raw_feat_dim
+        self.spec_dim = spec_dim
         self.fc_feat_dim = fc_feat_dim
         self.attn_feat_dim = attn_feat_dim
 
@@ -81,22 +82,22 @@ class MeanPool(nn.Module):
 
 class AttentionPool(nn.Module):  
     """docstring for AttentionPool"""  
-    def __init__(self, inputdim, outputdim=10, pooldim=1, **kwargs):  
-        super().__init__()  
-        self.inputdim = inputdim  
-        self.outputdim = outputdim  
-        self.pooldim = pooldim  
-        self.transform = nn.Linear(inputdim, outputdim)  
-        self.activ = nn.Softmax(dim=self.pooldim)  
-        self.eps = 1e-7  
+    def __init__(self, inputdim, outputdim=10, pooldim=1, **kwargs):
+        super().__init__()
+        self.inputdim = inputdim
+        self.outputdim = outputdim
+        self.pooldim = pooldim
+        self.transform = nn.Linear(inputdim, outputdim)
+        self.activ = nn.Softmax(dim=self.pooldim)
+        self.eps = 1e-7
 
-    def forward(self, logits, decision):  
-        # Input is (B, T, D)  
-        # B, T , D  
-        w = self.activ(torch.clamp(self.transform(logits), -15, 15))  
-        detect = (decision * w).sum(  
-            self.pooldim) / (w.sum(self.pooldim) + self.eps)  
-        # B, T, D  
+    def forward(self, logits, decision):
+        # Input is (B, T, D)
+        # B, T, D
+        w = self.activ(torch.clamp(self.transform(logits), -15, 15))
+        detect = (decision * w).sum(
+            self.pooldim) / (w.sum(self.pooldim) + self.eps)
+        # B, T, D
         return detect
 
 
@@ -127,6 +128,7 @@ def parse_poolingfunction(poolingfunction_name='mean', **kwargs):
         return AttentionPool(inputdim=kwargs['inputdim'],  
                              outputdim=kwargs['outputdim'])
 
+
 def embedding_pooling(x, lens, pooling="mean"):
     if pooling == "max":
         fc_embs = max_with_lens(x, lens)
@@ -147,8 +149,8 @@ def embedding_pooling(x, lens, pooling="mean"):
 
 class Cdur5Encoder(BaseEncoder):
 
-    def __init__(self, raw_feat_dim, fc_feat_dim, attn_feat_dim, pooling="mean"):
-        super().__init__(raw_feat_dim, fc_feat_dim, attn_feat_dim)
+    def __init__(self, spec_dim, fc_feat_dim, attn_feat_dim, pooling="mean"):
+        super().__init__(spec_dim, fc_feat_dim, attn_feat_dim)
         self.pooling = pooling
         self.features = nn.Sequential(
             Block2D(1, 32),
@@ -163,7 +165,7 @@ class Cdur5Encoder(BaseEncoder):
         )
         with torch.no_grad():
             rnn_input_dim = self.features(
-                torch.randn(1, 1, 500, raw_feat_dim)).shape
+                torch.randn(1, 1, 500, spec_dim)).shape
             rnn_input_dim = rnn_input_dim[1] * rnn_input_dim[-1]
 
         self.gru = nn.GRU(rnn_input_dim,
@@ -173,8 +175,8 @@ class Cdur5Encoder(BaseEncoder):
         self.apply(init)
 
     def forward(self, input_dict):
-        x = input_dict["raw_feats"]
-        lens = input_dict["raw_feat_lens"]
+        x = input_dict["spec"]
+        lens = input_dict["spec_len"]
         if "upsample" not in input_dict:
             input_dict["upsample"] = False
         lens = torch.as_tensor(copy.deepcopy(lens))
@@ -191,12 +193,12 @@ class Cdur5Encoder(BaseEncoder):
                 align_corners=False).transpose(1, 2)
         else:
             lens //= 4
-        attn_embs = x
-        fc_embs = embedding_pooling(x, lens, self.pooling)
+        attn_emb = x
+        fc_emb = embedding_pooling(x, lens, self.pooling)
         return {
-            "attn_embs": attn_embs,
-            "fc_embs": fc_embs,
-            "attn_emb_lens": lens
+            "attn_emb": attn_emb,
+            "fc_emb": fc_emb,
+            "attn_emb_len": lens
         }
 
 
@@ -221,8 +223,8 @@ def conv_conv_block(in_channel, out_channel):
 
 class Cdur8Encoder(BaseEncoder):
     
-    def __init__(self, raw_feat_dim, fc_feat_dim, attn_feat_dim, pooling="mean"):
-        super().__init__(raw_feat_dim, fc_feat_dim, attn_feat_dim)
+    def __init__(self, spec_dim, fc_feat_dim, attn_feat_dim, pooling="mean"):
+        super().__init__(spec_dim, fc_feat_dim, attn_feat_dim)
         self.pooling = pooling
         self.features = nn.Sequential(
             conv_conv_block(1, 64),
@@ -239,14 +241,14 @@ class Cdur8Encoder(BaseEncoder):
             nn.Dropout(0.2, True),
             nn.AdaptiveAvgPool2d((None, 1)),
         )
-        self.init_bn = nn.BatchNorm2d(raw_feat_dim)
+        self.init_bn = nn.BatchNorm2d(spec_dim)
         self.embedding = nn.Linear(512, 512)
         self.gru = nn.GRU(512, 256, bidirectional=True, batch_first=True)
         self.apply(init)
 
     def forward(self, input_dict):
-        x = input_dict["raw_feats"]
-        lens = input_dict["raw_feat_lens"]
+        x = input_dict["spec"]
+        lens = input_dict["spec_len"]
         lens = torch.as_tensor(copy.deepcopy(lens))
         x = x.unsqueeze(1)  # B x 1 x T x D
         x = x.transpose(1, 3)
@@ -257,20 +259,20 @@ class Cdur8Encoder(BaseEncoder):
         x = F.dropout(x, p=0.5, training=self.training)
         x = F.relu_(self.embedding(x))
         x, _ = self.gru(x)
-        attn_embs = x
+        attn_emb = x
         lens //= 4
-        fc_embs = embedding_pooling(x, lens, self.pooling)
+        fc_emb = embedding_pooling(x, lens, self.pooling)
         return {
-            "attn_embs": attn_embs,
-            "fc_embs": fc_embs,
-            "attn_emb_lens": lens
+            "attn_emb": attn_emb,
+            "fc_emb": fc_emb,
+            "attn_emb_len": lens
         }
 
 
 class Cnn10Encoder(BaseEncoder):
 
-    def __init__(self, raw_feat_dim, fc_feat_dim, attn_feat_dim):
-        super().__init__(raw_feat_dim, fc_feat_dim, attn_feat_dim)
+    def __init__(self, spec_dim, fc_feat_dim, attn_feat_dim):
+        super().__init__(spec_dim, fc_feat_dim, attn_feat_dim)
         self.features = nn.Sequential(
             conv_conv_block(1, 64),
             nn.AvgPool2d((2, 2)),
@@ -286,13 +288,13 @@ class Cnn10Encoder(BaseEncoder):
             nn.Dropout(0.2, True),
             nn.AdaptiveAvgPool2d((None, 1)),
         )
-        self.init_bn = nn.BatchNorm2d(raw_feat_dim)
+        self.init_bn = nn.BatchNorm2d(spec_dim)
         self.embedding = nn.Linear(512, 512)
         self.apply(init)
 
     def forward(self, input_dict):
-        x = input_dict["raw_feats"]
-        lens = input_dict["raw_feat_lens"]
+        x = input_dict["spec"]
+        lens = input_dict["spec_len"]
         lens = torch.as_tensor(copy.deepcopy(lens))
         x = x.unsqueeze(1)  # [N, 1, T, D]
         x = x.transpose(1, 3)
@@ -300,23 +302,24 @@ class Cnn10Encoder(BaseEncoder):
         x = x.transpose(1, 3)
         x = self.features(x) # [N, 512, T/16, 1]
         x = x.transpose(1, 2).contiguous().flatten(-2) # [N, T/16, 512]
-        attn_embs = x
+        attn_emb = x
         lens //= 16
-        fc_embs = embedding_pooling(x, lens, "mean+max")
-        fc_embs = F.dropout(fc_embs, p=0.5, training=self.training)
-        fc_embs = self.embedding(fc_embs)
-        fc_embs = F.relu_(fc_embs)
+        fc_emb = embedding_pooling(x, lens, "mean+max")
+        fc_emb = F.dropout(fc_emb, p=0.5, training=self.training)
+        fc_emb = self.embedding(fc_emb)
+        fc_emb = F.relu_(fc_emb)
         return {
-            "attn_embs": attn_embs,
-            "fc_embs": fc_embs,
-            "attn_emb_lens": lens
+            "attn_emb": attn_emb,
+            "fc_emb": fc_emb,
+            "attn_emb_len": lens
         }
 
 
 class RnnEncoder(BaseEncoder):
 
-    def __init__(self, raw_feat_dim, fc_feat_dim, attn_feat_dim, pooling="mean", **kwargs):
-        super().__init__(raw_feat_dim, fc_feat_dim, attn_feat_dim)
+    def __init__(self, spec_dim, fc_feat_dim, attn_feat_dim,
+                 pooling="mean", **kwargs):
+        super().__init__(spec_dim, fc_feat_dim, attn_feat_dim)
         self.pooling = pooling
         self.hidden_size = kwargs.get('hidden_size', 512)
         self.bidirectional = kwargs.get('bidirectional', False)
@@ -337,144 +340,27 @@ class RnnEncoder(BaseEncoder):
         self.apply(init)
 
     def forward(self, input_dict):
-        x = input_dict["attn_feats"]
-        lens = input_dict["attn_feat_lens"]
+        x = input_dict["attn"]
+        lens = input_dict["attn_len"]
         lens = torch.as_tensor(lens)
         # x: [N, T, E]
         if self.in_bn:
             x = pack_wrapper(self.bn, x, lens)
         out = pack_wrapper(self.network, x, lens)
         # out: [N, T, hidden]
-        attn_embs = out
-        fc_embs = embedding_pooling(out, lens, self.pooling)
+        attn_emb = out
+        fc_emb = embedding_pooling(out, lens, self.pooling)
         return {
-            "attn_embs": attn_embs,
-            "fc_embs": fc_embs,
-            "attn_emb_lens": lens
+            "attn_emb": attn_emb,
+            "fc_emb": fc_emb,
+            "attn_emb_len": lens
         }
-
-
-class RnnEncoder2(RnnEncoder):
-
-    def __init__(self, raw_feat_dim, fc_feat_dim, attn_feat_dim, **kwargs):
-        super().__init__(raw_feat_dim, fc_feat_dim, attn_feat_dim, **kwargs)
-
-    def forward(self, input_dict):
-        output = super().forward(input_dict)
-        output["fc_embs"] = input_dict["fc_feats"]
-        return output
-
-
-class RnnEncoder3(RnnEncoder):
-
-    def __init__(self, raw_feat_dim, fc_feat_dim, attn_feat_dim, **kwargs):
-        super().__init__(raw_feat_dim, fc_feat_dim, attn_feat_dim, **kwargs)
-        self.network = getattr(nn, self.rnn_type)(
-            fc_feat_dim + attn_feat_dim,
-            self.hidden_size,
-            num_layers=self.num_layers,
-            bidirectional=self.bidirectional,
-            dropout=self.dropout,
-            batch_first=True)
-        self.fc_transform = nn.Linear(self.embed_dim, self.embed_dim)
-        self.apply(init)
-
-    def forward(self, input_dict):
-        fc_feats = input_dict["fc_feats"]
-        attn_feats = input_dict["attn_feats"]
-        lens = input_dict["attn_feat_lens"]
-        lens = torch.as_tensor(lens)
-        x = torch.cat((fc_feats.unsqueeze(1).repeat(1, attn_feats.size(1), 1), attn_feats), dim=-1)
-        packed = nn.utils.rnn.pack_padded_sequence(x, lens, batch_first=True, enforce_sorted=False)
-        packed_out, hid = self.network(packed)
-        # hid: [num_layers, N, hidden]
-        out, _ = nn.utils.rnn.pad_packed_sequence(packed_out, batch_first=True)
-        # out: [N, T, hidden]
-        attn_embs = out
-        fc_embs = embedding_pooling(out, lens, "mean+max")
-        fc_embs = F.dropout(fc_embs, p=0.5, training=self.training)
-        fc_embs = self.fc_transform(fc_embs)
-        if self.out_bn:
-            fc_embs = self.bn(fc_embs)
-        return {
-            "attn_embs": attn_embs,
-            "fc_embs": fc_embs,
-            "attn_emb_lens": lens
-        }
-
-class RnnEncoder4(RnnEncoder):
-
-    def __init__(self, raw_feat_dim, fc_feat_dim, attn_feat_dim, input_dim, **kwargs):
-        super().__init__(raw_feat_dim, fc_feat_dim, attn_feat_dim, **kwargs)
-        self.network = getattr(nn, self.rnn_type)(
-            input_dim,
-            self.hidden_size,
-            num_layers=self.num_layers,
-            bidirectional=self.bidirectional,
-            dropout=self.dropout,
-            batch_first=True)
-        self.init_norm = nn.LayerNorm(input_dim)
-        self.fc_in_proj = nn.Linear(fc_feat_dim, input_dim)
-        self.attn_in_proj = nn.Linear(attn_feat_dim, input_dim)
-        self.fc_out_transform = nn.Linear(self.embed_dim, self.embed_dim)
-        if hasattr(self, "bn"):
-            del self.bn
-        self.out_norm = nn.LayerNorm(self.embed_dim)
-        self.apply(init)
-
-    def forward(self, input_dict):
-        fc_feats = input_dict["fc_feats"]
-        attn_feats = input_dict["attn_feats"]
-        lens = input_dict["attn_feat_lens"]
-        lens = torch.as_tensor(lens)
-        p_fc_feats = self.fc_in_proj(fc_feats)
-        p_attn_feats = self.attn_in_proj(attn_feats)
-        x = p_fc_feats.unsqueeze(1) + p_attn_feats
-        x = self.init_norm(x)
-        x = F.dropout(x, p=0.5, training=self.training)
-        packed = nn.utils.rnn.pack_padded_sequence(x, lens, batch_first=True, enforce_sorted=False)
-        packed_out, hid = self.network(packed)
-        # hid: [num_layers, N, hidden]
-        out, _ = nn.utils.rnn.pad_packed_sequence(packed_out, batch_first=True)
-        # out: [N, T, hidden]
-        attn_embs = out
-        fc_embs = embedding_pooling(out, lens, "mean+max")
-        fc_embs = F.dropout(fc_embs, p=0.5, training=self.training)
-        fc_embs = self.fc_out_transform(fc_embs)
-        fc_embs = F.relu_(fc_embs)
-        fc_embs = F.dropout(fc_embs, p=0.5, training=self.training)
-        fc_embs = self.out_norm(fc_embs)
-        return {
-            "attn_embs": attn_embs,
-            "fc_embs": fc_embs,
-            "attn_emb_lens": lens
-        }
-
-
-class PositionalEncoding(nn.Module):
-
-    def __init__(self, d_model, dropout=0.1, max_len=100):
-        super(PositionalEncoding, self).__init__()
-        self.dropout = nn.Dropout(p=dropout)
-
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0).transpose(0, 1)
-        self.register_buffer("pe", pe)
-
-    def forward(self, x):
-        # x: [T, N, E]
-        x = x + self.pe[:x.size(0), :]
-        return self.dropout(x)
 
 
 class TransformerEncoder(BaseEncoder):
 
-    def __init__(self, raw_feat_dim, fc_feat_dim, attn_feat_dim, d_model, **kwargs):
-        super().__init__(raw_feat_dim, fc_feat_dim, attn_feat_dim)
+    def __init__(self, spec_dim, fc_feat_dim, attn_feat_dim, d_model, **kwargs):
+        super().__init__(spec_dim, fc_feat_dim, attn_feat_dim)
         self.d_model = d_model
         dropout = kwargs.get("dropout", 0.2)
         self.nhead = kwargs.get("nhead", self.d_model // 64)
@@ -501,37 +387,38 @@ class TransformerEncoder(BaseEncoder):
                 nn.init.xavier_uniform_(p)
 
     def forward(self, input_dict):
-        attn_feats = input_dict["attn_feats"]
-        attn_feat_lens = input_dict["attn_feat_lens"]
-        attn_feat_lens = torch.as_tensor(attn_feat_lens)
+        attn_feat = input_dict["attn"]
+        attn_feat_len = input_dict["attn_len"]
+        attn_feat_len = torch.as_tensor(attn_feat_len)
 
-        attn_feats = self.attn_proj(attn_feats) # [bs, T, d_model]
-        attn_feats = attn_feats.transpose(0, 1)
+        attn_feat = self.attn_proj(attn_feat) # [bs, T, d_model]
+        attn_feat = attn_feat.transpose(0, 1)
 
-        src_key_padding_mask = ~generate_length_mask(attn_feat_lens, attn_feats.size(0)).to(attn_feats.device)
-        output = self.model(attn_feats, src_key_padding_mask=src_key_padding_mask)
+        src_key_padding_mask = ~generate_length_mask(
+            attn_feat_len, attn_feat.size(0)).to(attn_feat.device)
+        output = self.model(attn_feat, src_key_padding_mask=src_key_padding_mask)
 
-        attn_embs = output.transpose(0, 1)
-        fc_embs = embedding_pooling(attn_embs, attn_feat_lens, "mean+max")
-        fc_embs = F.dropout(fc_embs, p=0.5, training=self.training)
-        fc_embs = self.fc_out_transform(fc_embs)
-        fc_embs = F.relu_(fc_embs)
-        fc_embs = F.dropout(fc_embs, p=0.5, training=self.training)
+        attn_emb = output.transpose(0, 1)
+        fc_emb = embedding_pooling(attn_emb, attn_feat_len, "mean+max")
+        fc_emb = F.dropout(fc_emb, p=0.5, training=self.training)
+        fc_emb = self.fc_out_transform(fc_emb)
+        fc_emb = F.relu_(fc_emb)
+        fc_emb = F.dropout(fc_emb, p=0.5, training=self.training)
         return {
-            "attn_embs": attn_embs,
-            "fc_embs": fc_embs,
-            "attn_emb_lens": attn_feat_lens
+            "attn_emb": attn_emb,
+            "fc_emb": fc_emb,
+            "attn_emb_len": attn_feat_len
         }
 
 
 class M2TransformerEncoder(BaseEncoder):
 
-    def __init__(self, raw_feat_dim, fc_feat_dim, attn_feat_dim, d_model, **kwargs):
+    def __init__(self, spec_dim, fc_feat_dim, attn_feat_dim, d_model, **kwargs):
         try:
             from m2transformer.models.transformer import MemoryAugmentedEncoder, ScaledDotProductAttentionMemory
         except:
             raise ImportError("meshed-memory-transformer not installed; please run `pip install git+https://github.com/ruotianluo/meshed-memory-transformer.git`")
-        super().__init__(raw_feat_dim, fc_feat_dim, attn_feat_dim)
+        super().__init__(spec_dim, fc_feat_dim, attn_feat_dim)
         self.d_model = d_model
         dropout = kwargs.get("dropout", 0.1)
         self.nhead = kwargs.get("nhead", self.d_model // 64)
@@ -556,12 +443,12 @@ class M2TransformerEncoder(BaseEncoder):
 
 
     def forward(self, input_dict):
-        attn_feats = input_dict["attn_feats"]
-        attn_embs, attn_emb_mask = self.model(attn_feats)
-        fc_embs = attn_embs.mean(-2)
+        attn_feat = input_dict["attn"]
+        attn_emb, attn_emb_mask = self.model(attn_feat)
+        fc_emb = attn_emb.mean(-2)
         return {
-            "fc_embs": fc_embs,
-            "attn_embs": attn_embs,
+            "fc_emb": fc_emb,
+            "attn_emb": attn_emb,
             "attn_emb_mask": attn_emb_mask
         }
 
@@ -570,18 +457,14 @@ if __name__ == "__main__":
     encoder = Cnn10Encoder(64, -1, -1)
     # encoder = RnnEncoder(64, -1, 512, pooling="mean+max")
     print(encoder)
-    raw_feats = torch.randn(4, 1571, 64)
-    raw_feat_lens = torch.tensor([1071, 666, 1571, 985])
-    attn_feats = torch.randn(4, 78, 512)
-    attn_feat_lens = torch.tensor([70, 78, 65, 55])
     input_dict = {
-        "raw_feats": raw_feats,
-        # "fc_feats": None,
-        "attn_feats": attn_feats,
-        "attn_feat_lens": attn_feat_lens,
-        "raw_feat_lens": raw_feat_lens
+        "spec": torch.randn(4, 1571, 64),
+        "spec_len": torch.tensor([1071, 666, 1571, 985]),
+        "fc": None,
+        "attn": torch.randn(4, 78, 512),
+        "attn_len": torch.tensor([70, 78, 65, 55]),
     }
     output_dict = encoder(input_dict)
-    print("attn embs: ", output_dict["attn_embs"].shape)
-    print("fc embs: ", output_dict["fc_embs"].shape)
-    print("attn emb lens: ", output_dict["attn_emb_lens"])
+    print("attn embed: ", output_dict["attn_emb"].shape)
+    print("fc embed: ", output_dict["fc_emb"].shape)
+    print("attn embed length: ", output_dict["attn_emb_len"])

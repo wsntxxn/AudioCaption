@@ -3,12 +3,12 @@
 import os
 import sys
 import logging
+from typing import Callable
 import yaml
 import torch
 from torch.optim.swa_utils import AveragedModel as torch_average_model
 import numpy as np
 import pandas as pd
-import sklearn.preprocessing as pre
 from pprint import pformat
 
 
@@ -17,20 +17,22 @@ def load_dict_from_csv(csv, cols):
     output = dict(zip(df[cols[0]], df[cols[1]]))
     return output
 
-def genlogger(outputfile, level="INFO"):
+
+def init_logger(filename, level="INFO"):
     formatter = logging.Formatter(
         "[ %(levelname)s : %(asctime)s ] - %(message)s")
-    logger = logging.getLogger(__name__ + "." + outputfile)
+    logger = logging.getLogger(__name__ + "." + filename)
     logger.setLevel(getattr(logging, level))
     # Log results to std
     # stdhandler = logging.StreamHandler(sys.stdout)
     # stdhandler.setFormatter(formatter)
     # Dump log to file
-    filehandler = logging.FileHandler(outputfile)
+    filehandler = logging.FileHandler(filename)
     filehandler.setFormatter(formatter)
     logger.addHandler(filehandler)
     # logger.addHandler(stdhandler)
     return logger
+
 
 def pprint_dict(in_dict, outputfun=sys.stdout.write, formatter='yaml'):
     """pprint_dict
@@ -45,21 +47,6 @@ def pprint_dict(in_dict, outputfun=sys.stdout.write, formatter='yaml'):
     for line in format_fun(in_dict).split('\n'):
         outputfun(line)
 
-def encode_labels(labels: pd.Series, encoder=None):
-    """encode_labels
-
-    Encodes labels
-
-    :param labels: pd.Series representing the raw labels e.g., Speech, Water
-    :param encoder (optional): Encoder already fitted 
-    returns encoded labels (one hot) and the encoder
-    """
-    assert isinstance(labels, pd.Series), "Labels need to series"
-    if not encoder:
-        encoder = pre.LabelEncoder()
-        encoder.fit(labels)
-    labels_encoded = encoder.transform(labels)
-    return labels_encoded.tolist(), encoder
 
 def merge_a_into_b(a, b):
     # merge dict a into dict b. values in a will overwrite b.
@@ -71,6 +58,7 @@ def merge_a_into_b(a, b):
             merge_a_into_b(v, b[k])
         else:
             b[k] = v
+
 
 def load_config(config_file):
     with open(config_file, "r") as reader:
@@ -88,58 +76,22 @@ def load_config(config_file):
         return base_config
     return config
 
+
 def parse_config_or_kwargs(config_file, **kwargs):
-    default_args = {
-        "distributed": False,
-        "swa": True,
-        "swa_start": 21,
-        "sampler_args": {"max_cap_num": None},
-    }
     yaml_config = load_config(config_file)
     # passed kwargs will override yaml config
     args = dict(yaml_config, **kwargs)
-    for key, value in default_args.items():
-        args.setdefault(key, value)
     return args
+
 
 def store_yaml(config, config_file):
     with open(config_file, "w") as con_writer:
-        yaml.dump(config, con_writer, default_flow_style=False)
+        yaml.dump(config, con_writer, indent=4, default_flow_style=False)
 
-def parse_augments(augment_list):
-    """parse_augments
-    parses the augmentation string in configuration file to corresponding methods
-
-    :param augment_list: list
-    """
-    from captioning.datasets import augment
-
-    specaug_kwargs = {
-        "timemask": False, 
-        "freqmask": False,
-        "timewarp": False,
-        "num_timemask": 2,
-        "T": 1,
-        "F": 600
-    }
-    augments = []
-    for transform in augment_list:
-        if transform == "timemask":
-            specaug_kwargs["timemask"] = True
-        elif transform == "freqmask":
-            specaug_kwargs["freqmask"] = True
-        elif transform == "timewarp":
-            specaug_kwargs["timewarp"] = True
-        elif transform == "randomcrop":
-            augments.append(augment.random_crop)
-        elif transform == "timeroll":
-            augments.append(augment.time_roll)
-    augments.append(augment.spec_augment(**specaug_kwargs))
-    return augments
 
 def criterion_improver(mode):
     assert mode in ("loss", "acc", "score")
-    best_value = np.inf if mode == "loss" else 0
+    best_value = np.inf if mode == "loss" else -np.inf
 
     def comparator(x, best_x):
         return x < best_x if mode == "loss" else x > best_x
@@ -153,8 +105,10 @@ def criterion_improver(mode):
         return False
     return inner
 
+
 def run_val(engine, evaluator, dataloader):
     evaluator.run(dataloader)
+
 
 def fix_batchnorm(model: torch.nn.Module):
     # classname = model.__class__.__name__
@@ -166,9 +120,11 @@ def fix_batchnorm(model: torch.nn.Module):
             module.eval()
     model.apply(inner)
 
-def load_pretrained_model(model: torch.nn.Module, pretrained, outputfun):
+
+def load_pretrained_model(model: torch.nn.Module, pretrained: str,
+                          output_fn: Callable):
     if not os.path.exists(pretrained):
-        outputfun(f"Loading pretrained model from {pretrained} failed!")
+        output_fn(f"Loading pretrained model from {pretrained} failed!")
         return
     state_dict = torch.load(pretrained, map_location="cpu")
     if "model" in state_dict:
@@ -178,6 +134,7 @@ def load_pretrained_model(model: torch.nn.Module, pretrained, outputfun):
         k: v for k, v in state_dict.items() if (k in model_dict) and (
             model_dict[k].shape == v.shape)
     }
+    output_fn(f"Loading pretrained keys {pretrained_dict.keys()}")
     model_dict.update(pretrained_dict)
     model.load_state_dict(model_dict, strict=True)
 

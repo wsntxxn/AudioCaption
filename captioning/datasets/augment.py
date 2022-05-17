@@ -91,33 +91,42 @@ def spec_augment(timemask: bool = True, num_timemask: int = 2,
     return wrapper
 
 
-def gaussian_noise(x, snr=30, mean=0):
-    E_x = (x**2).sum() / x.shape[0]
-    noise = torch.empty_like(x).normal_(mean, std=1)
-    E_noise = (noise**2).sum() / noise.shape[0]
-    alpha = np.sqrt(E_x / (E_noise * pow(10, snr / 10)))
-    x = x + alpha * noise
-    return x
+def gaussian_noise(snr=30, mean=0):
+    def wrapper(waveform):
+        x = waveform
+        E_x = (x ** 2).sum() / x.shape[0]
+        noise = torch.empty_like(x).normal_(mean, std=1)
+        E_noise = (noise ** 2).sum() / noise.shape[0]
+        alpha = np.sqrt(E_x / (E_noise * pow(10, snr / 10)))
+        x = x + alpha * noise
+        return x
+    return wrapper
 
-def random_crop(spec, size: int = 1000, p: float = 0.2):
-    time, freq = spec.shape
-    if time <= size or random.random() > p:
+
+def random_crop(size: int = 1000, p: float = 0.2):
+    def wrapper(spec):
+        time, freq = spec.shape
+        if time <= size or random.random() > p:
+            return spec
+        hi = time - size
+        start_ind = np.random.randint(0, hi)
+        spec = spec[start_ind: start_ind + size, :]
         return spec
-    hi = time - size
-    # start_ind = torch.empty(1, dtype=torch.long).random_(0, hi).item()
-    start_ind = np.random.randint(0, hi)
-    spec = spec[start_ind:start_ind + size, :]
-    return spec
+    return wrapper
 
-def time_roll(x, mean=0, std=10):
-    """
-    x: either wave or spectrogram
-    """
-    # shift = torch.empty(1).normal_(mean, std).int().item()
-    shift = int(np.random.normal(mean, std))
-    # x = torch.roll(x, shift, dims=0)
-    x = np.roll(x, shift, axis=0)
-    return x
+
+def time_roll(mean=0, std=10):
+    def wrapper(x):
+        """
+        x: either wave or spectrogram
+        """
+        # shift = torch.empty(1).normal_(mean, std).int().item()
+        shift = int(np.random.normal(mean, std))
+        # x = torch.roll(x, shift, dims=0)
+        x = np.roll(x, shift, axis=0)
+        return x
+    return wrapper
+
 
 if __name__ == "__main__":
     random.seed(1)

@@ -2,26 +2,7 @@ import torch
 import math
 import torch.nn as nn
 
-from captioning.models.utils import generate_length_mask
-
-class PositionalEncoding(nn.Module):
-
-    def __init__(self, d_model, dropout=0.1, max_len=100):
-        super(PositionalEncoding, self).__init__()
-        self.dropout = nn.Dropout(p=dropout)
-
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0).transpose(0, 1)
-        self.register_buffer("pe", pe)
-
-    def forward(self, x):
-        # x: [T, N, E]
-        x = x + self.pe[:x.size(0), :]
-        return self.dropout(x)
+from captioning.models.utils import generate_length_mask, PositionalEncoding
 
 
 class TransformerEncoder(nn.Module):
@@ -29,6 +10,7 @@ class TransformerEncoder(nn.Module):
     def __init__(self, vocab_size, d_model, embed_dim, **kwargs):
         super().__init__()
         self.vocab_size = vocab_size
+        self.cls_idx = self.vocab_size - 1
         self.embed_dim = embed_dim
         self.word_embedding = nn.Embedding(vocab_size, d_model)
         self.d_model = d_model
@@ -53,20 +35,25 @@ class TransformerEncoder(nn.Module):
                 nn.init.xavier_uniform_(p)
 
     def forward(self, input_dict):
-        caps = input_dict["caps"]
-        cap_lens = input_dict["cap_lens"]
-        cap_lens = torch.as_tensor(cap_lens)
+        cap = input_dict["cap"]
+        cap_len = input_dict["cap_len"]
+        cap_len = torch.as_tensor(cap_len)
 
-        embeds = self.in_dropout(self.word_embedding(caps)) * math.sqrt(self.d_model)
-        embeds = embeds.transpose(0, 1)
-        embeds = self.pos_encoder(embeds)
+        cls_tokens = torch.empty(
+            cap.size(0), 1, dtype=torch.long).fill_(self.cls_idx).to(cap.device)
+        cap = torch.cat((cls_tokens, cap), dim=-1)
+        cap_len = cap_len + 1
 
-        src_key_padding_mask = ~generate_length_mask(cap_lens, embeds.size(0)).to(embeds.device)
-        output = self.model(embeds, src_key_padding_mask=src_key_padding_mask)
+        embed = self.in_dropout(self.word_embedding(cap)) * math.sqrt(self.d_model)
+        embed = embed.transpose(0, 1)
+        embed = self.pos_encoder(embed)
+
+        src_key_padding_mask = ~generate_length_mask(cap_len, embed.size(0)).to(embed.device)
+        output = self.model(embed, src_key_padding_mask=src_key_padding_mask)
         output = output.transpose(0, 1) # [N, T, embed_dim]
-        cls_embeds = output[:, 0, :]
-        ref_embeds = self.out_transform(cls_embeds)
+        cls_emb = output[:, 0, :]
+        ref_emb = self.out_transform(cls_emb)
 
         return {
-            "ref_embs": ref_embeds,
+            "ref_emb": ref_emb,
         }
