@@ -52,7 +52,7 @@ AudioCaps is built on a subset of AudioSet so we prepare the dataset using `audi
 |Ya67ihfUaKUc.wav|/path/to/audioset/Ya67ihfUaKUc.wav|
 |...  |...   |
 
-We assume `audioset_wav_csv` is already prepared. It does not have to contain the full AudioSet samples but AudioCaps samples must be included. Also, `audio_id` must be in the form of `Y_[youtube_id].wav`.
+We assume `audioset_wav_csv` is already prepared. It does not have to contain the full AudioSet samples but AudioCaps samples must be included. Also, `audio_id` must be in the form of `Y[youtube_id].wav`.
 
 Then download the caption files from [AudioCaps](https://github.com/cdjkim/audiocaps). Assume the caption files are placed in `$AUDIOCAPS_ANNOTATION` and the processed data is in `AUDIOCAPS_DIR`.
 ```bash
