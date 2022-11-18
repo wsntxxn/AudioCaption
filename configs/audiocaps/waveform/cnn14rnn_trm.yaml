@@ -1,6 +1,6 @@
 inherit_from: ./train_data.yaml
 
-remark: cola_cnn14rnn_trm
+remark: cnn14rnn_trm
 
 # sync_file: /mnt/lustre/sjtu/home/xnx98/work/AudioCaption/ddp_sync/sync
 
@@ -9,8 +9,7 @@ model:
         type: Cnn14RnnEncoder
         args:
             sample_rate: 32000
-            # pretrained: sed/audioset_tagging_cnn/pretrained_weights/Cnn14_mAP=0.431.pth
-            pretrained: /mnt/lustre/sjtu/home/xnx98/work/Cola/experiments/audioset_cnn14/best.pth
+            pretrained: sed/audioset_tagging_cnn/pretrained_weights/Cnn14_mAP=0.431.pth
             freeze_cnn: True
             freeze_cnn_bn: True
             bidirectional: True
@@ -43,9 +42,6 @@ lr_scheduler:
         # warmup_iters: 3000
         final_lrs: !!float 5e-7
 
-# resume: experiments/audioset/label_any/TransformerModel/cnn14rnn_trm/retrieve_model_iteration_2/expdecay_scheduler/seed_1/best.pth
-
-max_aug_discount: 1.0
 
 trainer:
     max_grad_norm: 1.0
