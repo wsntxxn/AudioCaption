@@ -25,13 +25,13 @@
 - Run the preprocessing script in this directory, assuming the output directory is `$OUTPUT_PATH` (e.g. `clotho_v2`):
   ```bash
   OUTPUT_PATH=clotho_v2
-  python prepare_clotho.py $CLOTHO_ROOT $OUTPUT_PATH
+  python create_dataset/prepare_clotho.py $CLOTHO_ROOT $OUTPUT_PATH
   ```
 
 ### Extract log mel spectrogram feature (40ms window length and 20ms window shift)
 ```bash
 for SPLIT in dev val eval; 
-  do python extract_feature.py \
+  do python create_dataset/extract_feature.py \
     $OUTPUT_PATH/$SPLIT/wav.csv \
     $OUTPUT_PATH/$SPLIT/lms.h5 \
     $OUTPUT_PATH/$SPLIT/lms.csv \
@@ -51,7 +51,7 @@ python ../captioning/utils/build_vocab.py $OUTPUT_PATH/dev/text.json $OUTPUT_PAT
 In DCASE2021 task 6 challenge, we merge the official development and validation sets and redo the train / validation split to get more data for training. 
 ```bash
 mkdir $OUTPUT_PATH/dev_val
-python ../captioning/utils/concat_csv.py $OUTPUT_PATH/dev/lms.csv $OUTPUT_PATH/val/lms.csv $OUTPUT_PATH/dev_val/lms.csv
-python ../captioning/utils/concat_annotation_json.py $OUTPUT_PATH/dev/text.json $OUTPUT_PATH/val/text.json $OUTPUT_PATH/dev_val/text.json
+python utils/concat_csv.py $OUTPUT_PATH/dev/lms.csv $OUTPUT_PATH/val/lms.csv $OUTPUT_PATH/dev_val/lms.csv
+python utils/concat_anno_json.py $OUTPUT_PATH/dev/text.json $OUTPUT_PATH/val/text.json $OUTPUT_PATH/dev_val/text.json
 python ../captioning/utils/build_vocab.py $OUTPUT_PATH/dev_val/text.json $OUTPUT_PATH/dev_val/vocab.pkl --zh False
 ```

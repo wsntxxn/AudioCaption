@@ -191,13 +191,6 @@ class BaseRunner(object):
         output = {}
         if per_audio:
             output["per_audio"] = {}
-        for scorer in scorers:
-            if scorer.method() == "Fense":
-                score, scores = scorer.compute_score(key2refs, key2pred)
-                output[scorer.method()] = score
-                if per_audio:
-                    output["per_audio"][scorer.method()] = dict(zip(
-                        key2refs.keys(), scores))
 
         if not pretokenized:
             refs4eval = {}
@@ -227,20 +220,19 @@ class BaseRunner(object):
             key2pred = tokenizer.tokenize(preds4eval)
 
         for scorer in scorers:
-            if scorer.method() != "Fense":
-                score, scores = scorer.compute_score(key2refs, key2pred)
-                output[scorer.method()] = score
-                if per_audio:
-                    if scorer.method() == "Bleu":
-                        output["per_audio"][scorer.method()] = dict(zip(
-                            key2refs.keys(), scores[3]))
-                    elif scorer.method() == "SPICE":
-                        scores = np.array([item["All"]["f"] for item in scores])
-                        output["per_audio"][scorer.method()] = dict(zip(
-                            sorted(key2refs.keys()), scores))
-                    else:
-                        output["per_audio"][scorer.method()] = dict(zip(
-                            key2refs.keys(), scores))
+            score, scores = scorer.compute_score(key2refs, key2pred)
+            output[scorer.method()] = score
+            if per_audio:
+                if scorer.method() == "Bleu":
+                    output["per_audio"][scorer.method()] = dict(zip(
+                        key2refs.keys(), scores[3]))
+                elif scorer.method() == "SPICE":
+                    scores = np.array([item["All"]["f"] for item in scores])
+                    output["per_audio"][scorer.method()] = dict(zip(
+                        sorted(key2refs.keys()), scores))
+                else:
+                    output["per_audio"][scorer.method()] = dict(zip(
+                        key2refs.keys(), scores))
         return output
 
     def evaluate_prediction(self,
@@ -269,12 +261,10 @@ class BaseRunner(object):
         from pycocoevalcap.cider.cider import Cider
         from pycocoevalcap.meteor.meteor import Meteor
         from pycocoevalcap.spice.spice import Spice
-        from fense.fense import Fense
         scorers = [Bleu(n=4), Rouge(), Cider()]
         if not zh:
             scorers.append(Meteor())
             scorers.append(Spice())
-            scorers.append(Fense())
         scores_output = self._eval_prediction(key2refs, key2pred, scorers, pretokenized=zh)
         spider = 0
         for name, score in scores_output.items():
@@ -325,12 +315,10 @@ class BaseRunner(object):
         from pycocoevalcap.cider.cider import Cider
         from pycocoevalcap.meteor.meteor import Meteor
         from pycocoevalcap.spice.spice import Spice
-        from fense.fense import Fense
         scorers = [Bleu(n=4), Rouge(), Cider()]
         if not zh:
             scorers.append(Meteor())
             scorers.append(Spice())
-            scorers.append(Fense())
         scores_output = self._eval_prediction(key2refs, key2pred, scorers,
             pretokenized=zh, per_audio=True)
 
@@ -474,13 +462,11 @@ class BaseRunner(object):
         from pycocoevalcap.cider.cider import Cider
         from pycocoevalcap.meteor.meteor import Meteor
         from pycocoevalcap.spice.spice import Spice
-        from fense.fense import Fense
 
         scorers = [Bleu(n=4), Rouge(), Cider()]
         if not zh:
             scorers.append(Meteor())
             scorers.append(Spice())
-            scorers.append(Fense())
         scores_output = self._eval_prediction(key2refs, key2pred, scorers)
 
         with open(str(experiment_path / score_output), "w") as f:
