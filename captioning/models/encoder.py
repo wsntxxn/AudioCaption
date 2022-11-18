@@ -6,9 +6,27 @@ import copy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torchaudio import transforms
+from torchlibrosa.augmentation import SpecAugmentation
 
 from captioning.models.utils import mean_with_lens, max_with_lens, \
     init, pack_wrapper, generate_length_mask, PositionalEncoding
+
+
+def init_layer(layer):
+    """Initialize a Linear or Convolutional layer. """
+    nn.init.xavier_uniform_(layer.weight)
+ 
+    if hasattr(layer, 'bias'):
+        if layer.bias is not None:
+            layer.bias.data.fill_(0.)
+            
+    
+def init_bn(bn):
+    """Initialize a Batchnorm layer. """
+    bn.bias.data.fill_(0.)
+    bn.weight.data.fill_(1.)
+
 
 class BaseEncoder(nn.Module):
     
@@ -315,6 +333,189 @@ class Cnn10Encoder(BaseEncoder):
         }
 
 
+class ConvBlock(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        
+        super(ConvBlock, self).__init__()
+        
+        self.conv1 = nn.Conv2d(in_channels=in_channels,
+                              out_channels=out_channels,
+                              kernel_size=(3, 3), stride=(1, 1),
+                              padding=(1, 1), bias=False)
+                              
+        self.conv2 = nn.Conv2d(in_channels=out_channels,
+                              out_channels=out_channels,
+                              kernel_size=(3, 3), stride=(1, 1),
+                              padding=(1, 1), bias=False)
+                              
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+
+        self.init_weight()
+        
+    def init_weight(self):
+        init_layer(self.conv1)
+        init_layer(self.conv2)
+        init_bn(self.bn1)
+        init_bn(self.bn2)
+
+        
+    def forward(self, input, pool_size=(2, 2), pool_type='avg'):
+        
+        x = input
+        x = F.relu_(self.bn1(self.conv1(x)))
+        x = F.relu_(self.bn2(self.conv2(x)))
+        if pool_type == 'max':
+            x = F.max_pool2d(x, kernel_size=pool_size)
+        elif pool_type == 'avg':
+            x = F.avg_pool2d(x, kernel_size=pool_size)
+        elif pool_type == 'avg+max':
+            x1 = F.avg_pool2d(x, kernel_size=pool_size)
+            x2 = F.max_pool2d(x, kernel_size=pool_size)
+            x = x1 + x2
+        else:
+            raise Exception('Incorrect argument!')
+        
+        return x
+
+
+class Cnn14Encoder(nn.Module):
+    def __init__(self, sample_rate=32000):
+        super().__init__()
+        sr_to_fmax = {
+            32000: 14000,
+            16000: 8000
+        }
+        # Logmel spectrogram extractor
+        self.melspec_extractor = transforms.MelSpectrogram(
+            sample_rate=sample_rate,
+            n_fft=32 * sample_rate // 1000,
+            win_length=32 * sample_rate // 1000,
+            hop_length=10 * sample_rate // 1000,
+            f_min=50,
+            f_max=sr_to_fmax[sample_rate],
+            n_mels=64,
+            norm="slaney",
+            mel_scale="slaney"
+        )
+        self.hop_length = 10 * sample_rate // 1000
+        self.db_transform = transforms.AmplitudeToDB()
+        # Spec augmenter
+        self.spec_augmenter = SpecAugmentation(time_drop_width=64,
+            time_stripes_num=2, freq_drop_width=8, freq_stripes_num=2)
+
+        self.bn0 = nn.BatchNorm2d(64)
+
+        self.conv_block1 = ConvBlock(in_channels=1, out_channels=64)
+        self.conv_block2 = ConvBlock(in_channels=64, out_channels=128)
+        self.conv_block3 = ConvBlock(in_channels=128, out_channels=256)
+        self.conv_block4 = ConvBlock(in_channels=256, out_channels=512)
+        self.conv_block5 = ConvBlock(in_channels=512, out_channels=1024)
+        self.conv_block6 = ConvBlock(in_channels=1024, out_channels=2048)
+
+        self.downsample_ratio = 32
+
+        self.fc1 = nn.Linear(2048, 2048, bias=True)
+        
+        self.init_weight()
+
+    def init_weight(self):
+        init_bn(self.bn0)
+        init_layer(self.fc1)
+
+    def load_pretrained(self, pretrained):
+        checkpoint = torch.load(pretrained, map_location="cpu")
+
+        if "model" in checkpoint:
+            state_keys = checkpoint["model"].keys()
+            backbone = False
+            for key in state_keys:
+                if key.startswith("backbone."):
+                    backbone = True
+                    break
+
+            if backbone: # COLA
+                state_dict = {}
+                for key, value in checkpoint["model"].items():
+                    if key.startswith("backbone."):
+                        model_key = key.replace("backbone.", "")
+                        state_dict[model_key] = value
+            else: # PANNs
+                state_dict = checkpoint["model"]
+        elif "state_dict" in checkpoint: # CLAP
+            state_dict = checkpoint["state_dict"]
+            state_dict_keys = list(filter(
+                lambda x: "audio_encoder" in x, state_dict.keys()))
+            state_dict = {
+                key.replace('audio_encoder.', ''): state_dict[key]
+                    for key in state_dict_keys
+            }
+        else:
+            raise Exception("Unkown checkpoint format")
+
+        model_dict = self.state_dict()
+        pretrained_dict = {
+            k: v for k, v in state_dict.items() if (k in model_dict) and (
+                model_dict[k].shape == v.shape)
+        }
+        model_dict.update(pretrained_dict)
+        self.load_state_dict(model_dict, strict=True)
+ 
+    def forward(self, input_dict):
+        """
+        Input: (batch_size, n_samples)"""
+        waveform = input_dict["wav"]
+        wave_length = input_dict["wav_len"]
+        specaug = input_dict["specaug"]
+        x = self.melspec_extractor(waveform)
+        x = self.db_transform(x)    # (batch_size, mel_bins, time_steps)
+        x = x.transpose(1, 2)
+        x = x.unsqueeze(1)      # (batch_size, 1, time_steps, mel_bins)
+
+        # SpecAugment
+        if self.training and specaug:
+            x = self.spec_augmenter(x)
+
+        x = x.transpose(1, 3)
+        x = self.bn0(x)
+        x = x.transpose(1, 3)
+
+        x = self.conv_block1(x, pool_size=(2, 2), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = self.conv_block2(x, pool_size=(2, 2), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = self.conv_block3(x, pool_size=(2, 2), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = self.conv_block4(x, pool_size=(2, 2), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = self.conv_block5(x, pool_size=(2, 2), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = self.conv_block6(x, pool_size=(1, 1), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = torch.mean(x, dim=3)
+        attn_emb = x.transpose(1, 2)
+        
+        wave_length = torch.as_tensor(wave_length)
+        feat_length = torch.div(wave_length, self.hop_length,
+            rounding_mode="floor") + 1
+        feat_length = torch.div(feat_length, self.downsample_ratio,
+            rounding_mode="floor")
+        x_max = max_with_lens(attn_emb, feat_length)
+        x_mean = mean_with_lens(attn_emb, feat_length)
+        x = x_max + x_mean
+        x = F.dropout(x, p=0.5, training=self.training)
+        x = F.relu_(self.fc1(x))
+        fc_emb = F.dropout(x, p=0.5, training=self.training)
+        
+        output_dict = {
+            'fc_emb': fc_emb,
+            'attn_emb': attn_emb,
+            'attn_emb_len': feat_length
+        }
+
+        return output_dict
+
+
 class RnnEncoder(BaseEncoder):
 
     def __init__(self, spec_dim, fc_feat_dim, attn_feat_dim,
@@ -357,6 +558,40 @@ class RnnEncoder(BaseEncoder):
         }
 
 
+class Cnn14RnnEncoder(nn.Module):
+    def __init__(self, sample_rate=32000, pretrained=None,
+                 freeze_cnn=False, freeze_cnn_bn=False,
+                 pooling="mean", **kwargs):
+        super().__init__()
+        self.cnn = Cnn14Encoder(sample_rate)
+        self.rnn = RnnEncoder(64, 2048, 2048, pooling, **kwargs)
+        if pretrained is not None:
+            self.cnn.load_pretrained(pretrained)
+        if freeze_cnn:
+            assert pretrained is not None, "cnn is not pretrained but frozen"
+            for param in self.cnn.parameters():
+                param.requires_grad = False
+            self.freeze_cnn_bn = freeze_cnn_bn
+
+    def train(self, mode):
+        super().train(mode=mode)
+        if self.freeze_cnn_bn:
+            def bn_eval(module):
+                class_name = module.__class__.__name__
+                if class_name.find("BatchNorm") != -1:
+                    module.eval()
+            self.cnn.apply(bn_eval)
+        return self
+
+    def forward(self, input_dict):
+        output_dict = self.cnn(input_dict)
+        output_dict["attn"] = output_dict["attn_emb"]
+        output_dict["attn_len"] = output_dict["attn_emb_len"]
+        del output_dict["attn_emb"], output_dict["attn_emb_len"]
+        output_dict = self.rnn(output_dict)
+        return output_dict
+
+
 class TransformerEncoder(BaseEncoder):
 
     def __init__(self, spec_dim, fc_feat_dim, attn_feat_dim, d_model, **kwargs):
@@ -378,7 +613,7 @@ class TransformerEncoder(BaseEncoder):
                                            dim_feedforward=self.dim_feedforward,
                                            dropout=dropout)
         self.model = nn.TransformerEncoder(layer, self.nlayers)
-        self.fc_out_transform = nn.Linear(self.d_model, self.d_model)
+        self.cls_token = nn.Parameter(torch.zeros(d_model))
         self.init_params()
 
     def init_params(self):
@@ -392,23 +627,58 @@ class TransformerEncoder(BaseEncoder):
         attn_feat_len = torch.as_tensor(attn_feat_len)
 
         attn_feat = self.attn_proj(attn_feat) # [bs, T, d_model]
+
+        cls_emb = self.cls_token.reshape(1, 1, self.d_model).repeat(
+            attn_feat.size(0), 1, 1)
+        attn_feat = torch.cat((cls_emb, attn_feat), dim=1)
         attn_feat = attn_feat.transpose(0, 1)
 
+        attn_feat_len += 1
         src_key_padding_mask = ~generate_length_mask(
             attn_feat_len, attn_feat.size(0)).to(attn_feat.device)
         output = self.model(attn_feat, src_key_padding_mask=src_key_padding_mask)
 
         attn_emb = output.transpose(0, 1)
-        fc_emb = embedding_pooling(attn_emb, attn_feat_len, "mean+max")
-        fc_emb = F.dropout(fc_emb, p=0.5, training=self.training)
-        fc_emb = self.fc_out_transform(fc_emb)
-        fc_emb = F.relu_(fc_emb)
-        fc_emb = F.dropout(fc_emb, p=0.5, training=self.training)
+        fc_emb = attn_emb[:, 0]
         return {
             "attn_emb": attn_emb,
             "fc_emb": fc_emb,
             "attn_emb_len": attn_feat_len
         }
+
+
+class Cnn14TransformerEncoder(nn.Module):
+    def __init__(self, sample_rate=32000, pretrained=None,
+                 freeze_cnn=False, freeze_cnn_bn=False,
+                 d_model="mean", **kwargs):
+        super().__init__()
+        self.cnn = Cnn14Encoder(sample_rate)
+        self.trm = TransformerEncoder(64, 2048, 2048, d_model, **kwargs)
+        if pretrained is not None:
+            self.cnn.load_pretrained(pretrained)
+        if freeze_cnn:
+            assert pretrained is not None, "cnn is not pretrained but frozen"
+            for param in self.cnn.parameters():
+                param.requires_grad = False
+            self.freeze_cnn_bn = freeze_cnn_bn
+
+    def train(self, mode):
+        super().train(mode=mode)
+        if self.freeze_cnn_bn:
+            def bn_eval(module):
+                class_name = module.__class__.__name__
+                if class_name.find("BatchNorm") != -1:
+                    module.eval()
+            self.cnn.apply(bn_eval)
+        return self
+
+    def forward(self, input_dict):
+        output_dict = self.cnn(input_dict)
+        output_dict["attn"] = output_dict["attn_emb"]
+        output_dict["attn_len"] = output_dict["attn_emb_len"]
+        del output_dict["attn_emb"], output_dict["attn_emb_len"]
+        output_dict = self.trm(output_dict)
+        return output_dict
 
 
 class M2TransformerEncoder(BaseEncoder):
@@ -426,7 +696,6 @@ class M2TransformerEncoder(BaseEncoder):
         self.dim_feedforward = kwargs.get("dim_feedforward", self.d_model * 4)
 
         self.attn_proj = nn.Linear(attn_feat_dim, self.d_model)
-        self.pos_encoder = PositionalEncoding(self.d_model, dropout, 200)
         self.model = MemoryAugmentedEncoder(self.nlayers, 0, self.attn_feat_dim,
                                             d_model=self.d_model,
                                             h=self.nhead,
@@ -435,6 +704,7 @@ class M2TransformerEncoder(BaseEncoder):
                                             attention_module=ScaledDotProductAttentionMemory,
                                             attention_module_kwargs={"m": 40})
         self.init_params()
+
 
     def init_params(self):
         for p in self.parameters():

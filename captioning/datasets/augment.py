@@ -104,14 +104,14 @@ def gaussian_noise(snr=30, mean=0):
 
 
 def random_crop(size: int = 1000, p: float = 0.2):
-    def wrapper(spec):
-        time, freq = spec.shape
+    def wrapper(x):
+        time = x.shape[0]
         if time <= size or random.random() > p:
-            return spec
+            return x
         hi = time - size
         start_ind = np.random.randint(0, hi)
-        spec = spec[start_ind: start_ind + size, :]
-        return spec
+        x = x[start_ind: start_ind + size, ...]
+        return x
     return wrapper
 
 
