@@ -115,6 +115,7 @@ experiments*/*
 data/*
 !data/augment
 !data/create_dataset
+!data/utils
 !data/*.py
 !data/README.md
 

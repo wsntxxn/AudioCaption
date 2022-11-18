@@ -43,6 +43,7 @@ class BaseRunner(object):
             if "batch_sampler" in data_config:
                 bs_config = data_config["batch_sampler"]
                 batch_sampler = getattr(dataset_module, bs_config["type"])(
+                    dataset,
                     **bs_config["args"])
             else:
                 batch_sampler = None
@@ -73,13 +74,13 @@ class BaseRunner(object):
     def _get_model(self):
         raise NotImplementedError
 
-    def _forward(self, model, batch, training, **kwargs):
+    def _forward(self, batch, training=False):
         raise NotImplementedError
 
-    def _decode_to_sentence(self, word_ids, vocabulary):
+    def _decode_to_sentence(self, word_ids):
         words = []
         for word_id in word_ids:
-            word = vocabulary[word_id]
+            word = self.vocabulary[word_id]
             if word == "<end>":
                 break
             elif word == "<start>":
@@ -231,21 +232,23 @@ class BaseRunner(object):
                     if not zh:
                         print(f"SPIDEr: {spider / 2:6.3f}", file=f)
 
-    def _inference(self, model, dataloader, vocabulary, **inference_args):
-        model.eval()
+    def _inference(self, dataloader):
+        self.model.eval()
         key2pred = {}
         with torch.no_grad(), tqdm(total=len(dataloader),
             ncols=100, ascii=True, leave=False) as pbar:
             for batch in dataloader:
-                output = self._forward(model, batch, training=False,
-                                       **inference_args)
+                output = self._forward(batch, training=False)
                 keys = batch["audio_id"]
                 seqs = output["seq"].cpu().numpy()
                 for (idx, seq) in enumerate(seqs):
-                    candidate = self._decode_to_sentence(seq, vocabulary)
+                    candidate = self._decode_to_sentence(seq)
                     key2pred[keys[idx]] = [candidate,]
                 pbar.update()
         return key2pred
+
+    def resume_checkpoint(self, finetune=False):
+        raise NotImplementedError
 
     def predict(self,
                 experiment_path: str,
@@ -256,15 +259,13 @@ class BaseRunner(object):
         if not isinstance(eval_config, dict):
             eval_config = train_util.parse_config_or_kwargs(eval_config, **kwargs)
         resume_path = experiment_path / eval_config['resume']
-        checkpoint = torch.load(resume_path, "cpu")
-        # Previous training config
         self.config = train_util.parse_config_or_kwargs(
             experiment_path / "config.yaml")
+        self.config["resume"] = resume_path
 
-        self.vocabulary = checkpoint["vocabulary"]
-        model = self._get_model()
-        model.load_state_dict(checkpoint["model"])
-        model = model.to(self.device)
+        self.model = self._get_model()
+        self.resume_checkpoint(finetune=True)
+        self.model = self.model.to(self.device)
 
         dataset_config = eval_config["data"]["test"]["dataset"]
         dataset = getattr(dataset_module, dataset_config["type"])(
@@ -275,9 +276,10 @@ class BaseRunner(object):
         dataloader = torch.utils.data.DataLoader(
             dataset=dataset, collate_fn=collate_fn,
             **eval_config["data"]["test"]["dataloader_args"])
+        
+        self.config["inference_args"] = eval_config["inference_args"]
 
-        key2pred = self._inference(model, dataloader, self.vocabulary,
-            **eval_config["inference_args"])
+        key2pred = self._inference(dataloader)
 
         pred_data = []
         for key, pred in key2pred.items():
@@ -344,12 +346,9 @@ class BaseRunner(object):
             if not zh:
                 f.write("SPIDEr: {:6.3f}\n".format(spider / 2))
 
-    def train_evaluate(self, config, task, **kwargs):
-        experiment_path = self.train(config, **kwargs)
-        for save_type in ["best", "last", "swa"]:
-            self.evaluate(experiment_path, task, save_type=save_type,
-                score_output=f"{save_type}.txt", caption_output=f"{save_type}.json",
-                method="beam")
+    def train_evaluate(self, train_config, eval_config, **kwargs):
+        experiment_path = self.train(train_config, **kwargs)
+        self.evaluate(experiment_path, eval_config)
         return experiment_path
 
 

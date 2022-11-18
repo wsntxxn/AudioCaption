@@ -103,8 +103,8 @@ if __name__ == "__main__":
     optimizer = torch.optim.Adam(model.parameters(), 5e-4)
     epochs = 25
     iters = 600
-    # scheduler = CosineWithWarmup(optimizer, 600 * 25, 600 * 5)
-    scheduler = ExponentialDecayScheduler(optimizer, 600 * 25, 5e-7, 600 * 5)
+    scheduler = CosineWithWarmup(optimizer, 600 * 25, 600 * 5,)
+    # scheduler = ExponentialDecayScheduler(optimizer, 600 * 25, 5e-7, 600 * 5)
     criterion = torch.nn.MSELoss()
     lrs = []
     for epoch in range(1, epochs + 1):
@@ -121,7 +121,7 @@ if __name__ == "__main__":
             lrs.append(optimizer.param_groups[0]["lr"])
     import matplotlib.pyplot as plt
     plt.plot(list(range(1, len(lrs) + 1)), lrs, '-o', markersize=1)
-    plt.legend(loc="best")
+    # plt.legend(loc="best")
     plt.xlabel("Iteration")
     plt.ylabel("LR")
 

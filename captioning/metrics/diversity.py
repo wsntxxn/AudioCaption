@@ -5,6 +5,7 @@ import argparse
 from functools import partial
 from multiprocessing import Pool
 from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
+from tqdm import tqdm
 
 
 def calc_ngram(words, n=2):
@@ -52,7 +53,7 @@ num_total_words = 0
 pred_captions = []
 
 if "predictions" in output:
-    for cap_item in output["predictions"]:
+    for cap_item in tqdm(output["predictions"]):
         tokens = cap_item["tokens"]
         if isinstance(tokens, str):
             tokens_list = [tokens]
@@ -104,7 +105,7 @@ if "predictions" in output:
             print(f"Self-BLEU: {self_bleu:.2g}", file=writer)
 
 else:
-    for item in output["audios"]:
+    for item in tqdm(output["audios"]):
         cap_idx = random.randint(0, len(item["captions"]) - 1)
         cap_item = item["captions"][cap_idx]
         tokens = cap_item["tokens"]

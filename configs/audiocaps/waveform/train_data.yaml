@@ -1,0 +1,41 @@
+outputpath: experiments/audiocaps/pre_val
+
+data:
+    train:
+        dataset:
+            type: CaptionDataset
+            args:
+                features:
+                    wav: data/audiocaps/train/waveform_32k.csv
+                transforms:
+                    wav: Null
+                caption: data/audiocaps/train/text.json
+                vocabulary: data/audiocaps/train/vocab.pkl
+        collate_fn:
+            type: collate_fn
+            args:
+                pad_keys: [wav, cap]
+                sort_key: cap
+        dataloader_args:
+            shuffle: True
+            batch_size: 32
+            num_workers: 4
+    val:
+        dataset:
+            type: InferenceDataset
+            args:
+                features:
+                    wav: data/audiocaps/val/waveform_32k.csv
+                transforms:
+                    wav: Null
+        collate_fn:
+            type: collate_fn
+            args:
+                pad_keys: [wav]
+        caption: data/audiocaps/val/text.json
+        dataloader_args:
+            shuffle: False
+            batch_size: 64
+            num_workers: 4
+
+zh: False

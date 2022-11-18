@@ -34,7 +34,8 @@ class CaptionModel(nn.Module):
     def check_decoder_compatibility(self):
         compatible_decoders = [x.__class__.__name__ for x in self.compatible_decoders]
         assert isinstance(self.decoder, self.compatible_decoders), \
-            f"{self.decoder.__class__.__name__} is incompatible with {self.__class__.__name__}, please use decoder in {compatible_decoders} "
+            f"{self.decoder.__class__.__name__} is incompatible with " \
+            f"{self.__class__.__name__}, please use decoder in {compatible_decoders} "
 
     @classmethod
     def set_index(cls, start_idx, end_idx):
@@ -67,11 +68,13 @@ class CaptionModel(nn.Module):
             n_best (optional, sample_method=beam),
         }
         """
-        encoder_input_keys = ["spec", "spec_len", "fc", "attn", "attn_len"]
-        encoder_input = { key: input_dict[key] for key in encoder_input_keys }
-        encoder_output_dict = self.encoder(encoder_input)
+        # encoder_input_keys = ["spec", "spec_len", "fc", "attn", "attn_len"]
+        # encoder_input = { key: input_dict[key] for key in encoder_input_keys }
+        encoder_output_dict = self.encoder(input_dict)
         if input_dict["mode"] == "train":
-            forward_dict = { "mode": "train", "sample_method": "greedy", "temp": 1.0 }
+            forward_dict = {
+                "mode": "train", "sample_method": "greedy", "temp": 1.0
+            }
             for key in self.train_forward_keys:
                 forward_dict[key] = input_dict[key]
             forward_dict.update(encoder_output_dict)
@@ -112,10 +115,13 @@ class CaptionModel(nn.Module):
         else:
             raise Exception("mode should be either 'train' or 'inference'")
         device = input_dict["fc_emb"].device
-        output["seq"] = torch.full((batch_size, max_length), self.end_idx, dtype=torch.long)
-        output["logit"] = torch.empty(batch_size, max_length, self.vocab_size).to(device)
+        output["seq"] = torch.full((batch_size, max_length), self.end_idx,
+                                   dtype=torch.long)
+        output["logit"] = torch.empty(batch_size, max_length,
+                                      self.vocab_size).to(device)
         output["sampled_logprob"] = torch.zeros(batch_size, max_length)
-        output["embed"] = torch.empty(batch_size, max_length, self.decoder.d_model).to(device)
+        output["embed"] = torch.empty(batch_size, max_length,
+                                      self.decoder.d_model).to(device)
         return output
 
     def train_forward(self, input_dict):

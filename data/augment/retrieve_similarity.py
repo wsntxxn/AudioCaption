@@ -24,24 +24,29 @@ thresholds = args.thresholds
 max_caption_aug = args.max_caption_aug
 nearest = args.nearest
 
-with File(args.sim_store, "r") as store:
-    similarity = store["sim"][()]
-    audio_ids = store["audio_id"][()]
-    if "text_id" in store:
-        cap_ids = store["text_id"][()]
-        cap_ids = [_.decode("UTF-8") + "_1" for _ in cap_ids]
-    else:
-        cap_ids = [_.decode("UTF-8") + "_1" for _ in audio_ids]
-
-audio_ids = [_.decode("UTF-8") for _ in audio_ids]
-if len(audio_ids[0]) == 16:
-    audio_ids = [audio_id[1: 12] for audio_id in audio_ids]
-
 data = json.load(open(args.annotation, "r"))["audios"]
 cap_id_to_cap_item = {
     f"{item['audio_id']}_{cap_item['cap_id']}": cap_item
         for item in data for cap_item in item["captions"]
 }
+
+
+with File(args.sim_store, "r") as store:
+    similarity = store["sim"][()]
+    audio_ids = store["audio_id"][()]
+    if "text_id" in store:
+        cap_ids = store["text_id"][()]
+    else:
+        cap_ids = audio_ids
+    if len(data[0]["captions"]) == 1:
+        cap_ids = [_.decode("UTF-8") + "_1" for _ in cap_ids]
+    else:
+        cap_ids = [_.decode("UTF-8") for _ in cap_ids]
+
+audio_ids = [_.decode("UTF-8") for _ in audio_ids]
+if len(audio_ids[0]) == 16:
+    audio_ids = [audio_id[1: 12] for audio_id in audio_ids]
+
 ##########################################
 # only part of the annotations
 ##########################################

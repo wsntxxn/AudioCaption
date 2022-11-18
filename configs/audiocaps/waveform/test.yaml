@@ -1,0 +1,29 @@
+data:
+    test:
+        dataset:
+            type: InferenceDataset
+            args:
+                features:
+                    wav: data/audiocaps/test/waveform_32k.csv
+                transforms:
+                    wav: Null
+        collate_fn:
+            type: collate_fn
+            args:
+                pad_keys: [wav]
+        caption: data/audiocaps/test/text.json
+        dataloader_args:
+            shuffle: False
+            batch_size: 1
+            num_workers: 2
+
+inference_args:
+    sample_method: beam
+    beam_size: 3
+    max_length: 20
+
+resume: swa.pth
+
+caption_output: predictions/swa_beam3.json
+
+score_output: results/swa_beam3.txt

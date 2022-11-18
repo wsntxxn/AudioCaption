@@ -6,6 +6,7 @@ from collections import Counter
 import re
 import fire
 
+
 class Vocabulary(object):
     """Simple vocabulary wrapper."""
     def __init__(self):
@@ -24,8 +25,12 @@ class Vocabulary(object):
             return self.word2idx["<unk>"]
         return self.word2idx[word]
 
+    def __getitem__(self, word_id):
+        return self.idx2word[word_id]
+
     def __len__(self):
         return len(self.word2idx)
+
 
 def build_vocab(input_json: str,
                 threshold: int,
@@ -88,7 +93,7 @@ def build_vocab(input_json: str,
                     tokens = data[audio_idx]["captions"][cap_idx]["tokens"].split()
                     counter.update(tokens)
         else:
-            from captioning.pycocoevalcap.tokenizer.ptbtokenizer import PTBTokenizer
+            from pycocoevalcap.tokenizer.ptbtokenizer import PTBTokenizer
             captions = {}
             for audio_idx in range(len(data)):
                 audio_id = data[audio_idx]["audio_id"]
@@ -124,6 +129,7 @@ def build_vocab(input_json: str,
     for word in words:
         vocab.add_word(word)
     return vocab
+
 
 def process(input_json: str,
             output_file: str,
