@@ -3,7 +3,7 @@
 import os
 import sys
 import logging
-from typing import Callable
+from typing import Callable, Dict, Union
 import yaml
 import torch
 from torch.optim.swa_utils import AveragedModel as torch_average_model
@@ -32,6 +32,12 @@ def init_logger(filename, level="INFO"):
     logger.addHandler(filehandler)
     # logger.addHandler(stdhandler)
     return logger
+
+
+def init_obj(module, config, **kwargs):
+    obj_args = config["args"].copy()
+    obj_args.update(kwargs)
+    return getattr(module, config["type"])(**obj_args)
 
 
 def pprint_dict(in_dict, outputfun=sys.stdout.write, formatter='yaml'):
@@ -89,31 +95,31 @@ def store_yaml(config, config_file):
         yaml.dump(config, con_writer, indent=4, default_flow_style=False)
 
 
-def criterion_improver(mode):
-    assert mode in ("loss", "acc", "score")
-    best_value = np.inf if mode == "loss" else -np.inf
+class MetricImprover:
 
-    def comparator(x, best_x):
-        return x < best_x if mode == "loss" else x > best_x
+    def __init__(self, mode):
+        assert mode in ("min", "max")
+        self.mode = mode
+        # min: lower -> better; max: higher -> better
+        self.best_value = np.inf if mode == "min" else -np.inf
 
-    def inner(x):
-        nonlocal best_value
+    def compare(self, x, best_x):
+        return x < best_x if self.mode == "min" else x > best_x
 
-        if comparator(x, best_value):
-            best_value = x
+    def __call__(self, x):
+        if self.compare(x, self.best_value):
+            self.best_value = x
             return True
         return False
-    return inner
 
+    def state_dict(self):
+        return self.__dict__
 
-def run_val(engine, evaluator, dataloader):
-    evaluator.run(dataloader)
+    def load_state_dict(self, state_dict):
+        self.__dict__.update(state_dict)
 
 
 def fix_batchnorm(model: torch.nn.Module):
-    # classname = model.__class__.__name__
-    # if classname.find("BatchNorm") != -1:
-        # model.eval()
     def inner(module):
         class_name = module.__class__.__name__
         if class_name.find("BatchNorm") != -1:
@@ -121,12 +127,22 @@ def fix_batchnorm(model: torch.nn.Module):
     model.apply(inner)
 
 
-def load_pretrained_model(model: torch.nn.Module, pretrained: str,
-                          output_fn: Callable):
-    if not os.path.exists(pretrained):
-        output_fn(f"Loading pretrained model from {pretrained} failed!")
+def load_pretrained_model(model: torch.nn.Module,
+                          pretrained: Union[str, Dict],
+                          output_fn: Callable = sys.stdout.write):
+    if not isinstance(pretrained, dict) and not os.path.exists(pretrained):
+        output_fn(f"pretrained {pretrained} not exist!")
         return
-    state_dict = torch.load(pretrained, map_location="cpu")
+    
+    if hasattr(model, "load_pretrained"):
+        model.load_pretrained(pretrained)
+        return
+
+    if isinstance(pretrained, dict):
+        state_dict = pretrained
+    else:
+        state_dict = torch.load(pretrained, map_location="cpu")
+
     if "model" in state_dict:
         state_dict = state_dict["model"]
     model_dict = model.state_dict()

@@ -1,4 +1,4 @@
-# Audio Captioning recipe
+# Audio Captioning Recipe
 
 This repository provides a recipe for audio captioning with sequence to sequence models: data preprocessing, training, evaluation and inference.
 
