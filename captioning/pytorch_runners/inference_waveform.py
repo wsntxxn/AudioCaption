@@ -1,7 +1,6 @@
 import sys
 import os
 from pathlib import Path
-import multiprocessing
 import json
 
 import fire
@@ -16,40 +15,43 @@ import captioning.models
 import captioning.models.encoder
 import captioning.models.decoder
 import captioning.utils.train_util as train_util
-import captioning.models.panns_inference_models as panns_inference_models
 
 
 def load_model(config, checkpoint):
-    dump = torch.load(checkpoint, map_location="cpu")
-    encoder = getattr(
-        captioning.models.encoder, config["model"]["encoder"]["type"])(
-        **config["model"]["encoder"]["args"]
+    ckpt = torch.load(checkpoint, "cpu")
+    encoder_cfg = config["model"]["encoder"]
+    encoder = train_util.init_obj(
+        captioning.models.encoder,
+        encoder_cfg
     )
-    decoder = getattr(
-        captioning.models.decoder, config["model"]["decoder"]["type"])(
-        **config["model"]["decoder"]["args"]
+    if "pretrained" in encoder_cfg:
+        pretrained = encoder_cfg["pretrained"]
+        train_util.load_pretrained_model(encoder,
+                                         pretrained,
+                                         sys.stdout.write)
+    decoder_cfg = config["model"]["decoder"]
+    if "vocab_size" not in decoder_cfg["args"]:
+        decoder_cfg["args"]["vocab_size"] = len(ckpt["vocabulary"])
+    decoder = train_util.init_obj(
+        captioning.models.decoder,
+        decoder_cfg
     )
-    model = getattr(
-        captioning.models, config["model"]["type"])(
-        encoder, decoder, **config["model"]["args"]
-    )
-    model.load_state_dict(dump["model"], strict=True)
+    if "word_embedding" in decoder_cfg:
+        decoder.load_word_embedding(**decoder_cfg["word_embedding"])
+    if "pretrained" in decoder_cfg:
+        pretrained = decoder_cfg["pretrained"]
+        train_util.load_pretrained_model(decoder,
+                                         pretrained,
+                                         sys.stdout.write)
+    model = train_util.init_obj(captioning.models, config["model"],
+        encoder=encoder, decoder=decoder)
+    train_util.load_pretrained_model(model, ckpt)
     model.eval()
-    return model, dump["vocabulary"]
+    return {
+        "model": model,
+        "vocabulary": ckpt["vocabulary"]
+    }
 
-def load_feature_extractor(model_name, checkpoint):
-    model = getattr(panns_inference_models, model_name)(
-        sample_rate=32000,
-        window_size=1024,
-        hop_size=320,
-        mel_bins=64,
-        fmin=50,
-        fmax=14000,
-        classes_num=527)
-    checkpoint = torch.load(checkpoint, map_location='cpu')
-    model.load_state_dict(checkpoint['model'])
-    model.eval()
-    return model
 
 def load_audio(specifier: str):
     if specifier.endswith("|"):
@@ -104,8 +106,14 @@ def collate_wrapper(min_length=0.32):
         np_waveforms = np.zeros((len(waveforms), max(lengths)))
         for idx, waveform in enumerate(waveforms):
             np_waveforms[idx, :len(waveform)] = waveform
-        return np.array(aids), np_waveforms, np.array(lengths), blacklist_aids
+        return {
+            "aid": np.array(aids),
+            "wav": np_waveforms,
+            "wav_len": np.array(lengths), 
+            "blacklist_aid": blacklist_aids
+        }
     return collate_fn
+
 
 def decode_caption(word_ids, vocabulary):
     candidate = []
@@ -119,29 +127,23 @@ def decode_caption(word_ids, vocabulary):
     candidate = " ".join(candidate)
     return candidate
 
-name_to_dr = {
-    "Cnn10": 16,
-    "Cnn14": 32,
-    "Wavegram_Logmel_Cnn14": 32
-}
 
 def inference(input,
               output,
-              generator_checkpoint,
-              generator_config,
-              feature_extractor_name="Wavegram_Logmel_Cnn14",
-              feature_extractor_checkpoint="sed/audioset_tagging_cnn/pretrained_weights/Wavegram_Logmel_Cnn14_mAP=0.439.pth",
+              checkpoint,
               batch_size=32,
               num_process=4):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     device = torch.device(device)
 
-    config = train_util.parse_config_or_kwargs(generator_config)
-    model, vocabulary = load_model(config, generator_checkpoint)
+    
+    experiment_path = Path(checkpoint).parent
+
+    config = train_util.parse_config_or_kwargs(experiment_path / "config.yaml")
+    resumed = load_model(config, checkpoint)
+    model = resumed["model"]
+    vocabulary = resumed["vocabulary"]
     model = model.to(device)
-    feature_extractor = load_feature_extractor(feature_extractor_name,
-                                               feature_extractor_checkpoint)
-    feature_extractor = feature_extractor.to(device)
 
     if Path(input).suffix == ".csv":
         wav_df = pd.read_csv(input, sep="\t")
@@ -152,13 +154,11 @@ def inference(input,
     else:
         raise Exception("input should be wav.csv or audio file")
 
-    downsample_ratio = name_to_dr[feature_extractor_name]
-
     dataloader = torch.utils.data.DataLoader(
         InferenceDataset(aid_to_fname),
         batch_size=batch_size,
         shuffle=False,
-        collate_fn=collate_wrapper(0.01 * downsample_ratio),
+        collate_fn=collate_wrapper(0.32),
         num_workers=num_process
     )
 
@@ -166,26 +166,20 @@ def inference(input,
     audio_ids = []
     with torch.no_grad(), tqdm(total=len(dataloader)) as pbar:
         for batch in dataloader:
-            aids, waveforms, lengths, _ = batch
-            waveforms = torch.as_tensor(waveforms).float().to(device)
-            audio_feats = feature_extractor(waveforms)
-            audio_feat_lengths = np.floor((lengths / 320 + 1) / downsample_ratio)
-            for sample_idx in range(audio_feat_lengths.shape[0]):
-                if audio_feat_lengths[sample_idx] > audio_feats["attn_feat"][sample_idx].shape[0]:
-                    audio_feat_lengths[sample_idx] = audio_feats["attn_feat"][sample_idx].shape[0]
+            wav = torch.as_tensor(batch["wav"]).float().to(device)
             input_dict = {
                 "mode": "inference",
-                "spec": None,
-                "spec_len": None,
-                "fc": audio_feats["fc_feat"],
-                "attn": audio_feats["attn_feat"],
-                "attn_len": torch.as_tensor(audio_feat_lengths, dtype=torch.long),
+                "wav": wav,
+                "wav_len": torch.as_tensor(batch["wav_len"], dtype=torch.long),
+                "specaug": False,
                 "sample_method": "beam",
+                # "beam_size": 2
             }
             output_dict = model(input_dict)
-            caption_batch = [decode_caption(seq, vocabulary) for seq in output_dict["seq"].cpu().numpy()]
+            caption_batch = [decode_caption(seq, vocabulary) for seq in \
+                output_dict["seq"].cpu().numpy()]
             captions.extend(caption_batch)
-            audio_ids.extend(aids)
+            audio_ids.extend(batch["aid"])
             pbar.update()
     
     assert len(audio_ids) == len(captions)

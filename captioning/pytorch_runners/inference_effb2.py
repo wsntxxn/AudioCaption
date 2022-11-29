@@ -41,7 +41,9 @@ def EfficientNet_B2(**kwargs) -> _EffiNet:
     model._change_in_channels(1)
     return model
 
-def load_feature_extractor(model_file_path: str = None, device: str = None) -> nn.Module:
+
+def load_feature_extractor(model_file_path: str = None,
+                           device: str = None) -> nn.Module:
     if device is None:
         torch_device = torch.device(
             'cuda' if torch.cuda.is_available() else 'cpu')
@@ -69,13 +71,11 @@ def load_feature_extractor(model_file_path: str = None, device: str = None) -> n
     model.eval()
     return model
 
+
 def load_model(config, checkpoint):
     encoder = getattr(
-        captioning.models.encoder, config["encoder"])(
-        config["data"]["raw_feat_dim"],
-        config["data"]["fc_feat_dim"],
-        config["data"]["attn_feat_dim"],
-        **config["encoder_args"]
+        captioning.models.encoder, config["encoder"]["type"])(
+        **config["encoder"]["args"]
     )
     decoder = getattr(
         captioning.models.decoder, config["decoder"])(
@@ -89,6 +89,7 @@ def load_model(config, checkpoint):
     model.load_state_dict(checkpoint["model"])
     model.eval()
     return model, checkpoint["vocabulary"]
+
 
 def load_audio(specifier: str):
     assert Path(specifier).exists(), specifier + " not exists!"
@@ -137,6 +138,7 @@ def collate_wrapper(min_length=0.32):
         return np.array(aids), np_waveforms, np.array(lengths), blacklist_aids
     return collate_fn
 
+
 def decode_caption(word_ids, vocabulary):
     candidate = []
     for word_id in word_ids:
@@ -149,6 +151,7 @@ def decode_caption(word_ids, vocabulary):
     candidate = " ".join(candidate)
     return candidate
 
+
 def inference(input,
               output,
               batch_size=32,
@@ -156,28 +159,27 @@ def inference(input,
     device = "cuda" if torch.cuda.is_available() else "cpu"
     device = torch.device(device)
     config = {
-        "data": {
-            "raw_feat_dim": 64,
-            "fc_feat_dim": 1408,
-            "attn_feat_dim": 1408
+        "encoder": {
+            "type": "RnnEncoder",
+            "args":{
+                "bidirectional": True,
+                "dropout": 0.5,
+                "hidden_size": 256,
+                "num_layers": 3
+            },
         },
-        "encoder": "RnnEncoder",
-        "encoder_args":{
-            "bidirectional": True,
-            "dropout": 0.5,
-            "hidden_size": 256,
-            "num_layers": 3
+        "decoder": {
+            "type": "TransformerDecoder",
+            "args": {
+                "attn_emb_dim": 512,
+                "dropout": 0.2,
+                "emb_dim": 256,
+                "fc_emb_dim": 512,
+                "nlayers": 2
+            },
         },
-        "decoder": "TransformerDecoder",
-        "decoder_args": {
-            "attn_emb_dim": 512,
-            "dropout": 0.2,
-            "emb_dim": 256,
-            "fc_emb_dim": 512,
-            "nlayers": 2
-        },
-        "model": "TransformerModel",
-        "model_args": {}
+        "type": "TransformerModel",
+        "args": {}
     }
     checkpoint = torch.hub.load_state_dict_from_url(
         "https://github.com/wsntxxn/AudioCaption/releases/download/v0.0.1/audiocaps_effb2_rnn_trm.pth",
