@@ -41,3 +41,21 @@ Using the trained model (checkpoint in `$CKPT`) to inference on new audio files:
 ```bash
 $ python captioning/pytorch_runners/inference_waveform.py test.wav test.json $CKPT
 ```
+## Using off-the-shelf models
+We release the models trained on Clotho and AudioCaps for easy use. They use contrastive pre-trained feature extractor:
+```bash
+$ mkdir pretrained_feature_extractors
+$ wget https://github.com/wsntxxn/AudioCaption/releases/download/v0.0.2/contrastive_pretrain_cnn14_bertm.pth -O pretrained_feature_extractors/contrastive_pretrain_cnn14_bertm.pth
+```
+AudioCaps:
+```bash
+$ wget https://github.com/wsntxxn/AudioCaption/releases/download/v0.0.2/audiocaps_cntrstv_cnn14rnn_trm.zip
+$ unzip audiocaps_cntrstv_cnn14rnn_trm.zip
+$ python captioning/pytorch_runners/inference_waveform.py test.wav test.json audiocaps_cntrstv_cnn14rnn_trm/swa.pth
+```
+Clotho:
+```bash
+$ wget https://github.com/wsntxxn/AudioCaption/releases/download/v0.0.2/clotho_cntrstv_cnn14rnn_trm.zip
+$ unzip clotho_cntrstv_cnn14rnn_trm.zip
+$ python captioning/pytorch_runners/inference_waveform.py test.wav test.json clotho_cntrstv_cnn14rnn_trm/swa.pth
+```
