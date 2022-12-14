@@ -59,3 +59,9 @@ $ wget https://github.com/wsntxxn/AudioCaption/releases/download/v0.0.2/clotho_c
 $ unzip clotho_cntrstv_cnn14rnn_trm.zip
 $ python captioning/pytorch_runners/inference_waveform.py test.wav test.json clotho_cntrstv_cnn14rnn_trm/swa.pth
 ```
+
+# Related Papers
+The following papers are related to this repository:
+* [A CRNN-GRU Based Reinforcement Learning Approach to Audio Captioning](https://dcase.community/documents/workshop2020/proceedings/DCASE2020Workshop_Xu_83.pdf)
+* [Investigating Local and Global Information for Automated Audio Captioning with Transfer Learning](https://ieeexplore.ieee.org/abstract/document/9413982)
+* [Diversity-Controllable and Accurate Audio Captioning Based on Neural Condition](https://ieeexplore.ieee.org/document/9746834)
