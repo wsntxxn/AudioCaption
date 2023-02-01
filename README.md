@@ -41,6 +41,13 @@ Using the trained model (checkpoint in `$CKPT`) to inference on new audio files:
 ```bash
 $ python captioning/pytorch_runners/inference_waveform.py test.wav test.json $CKPT
 ```
+
+## Ensemble
+Several models can be used to ensemble for inference, especially in challenges. We provide a sample configuration `configs/dcase2022/ensemble/config.yaml`:
+```bash
+$ python captioning/pytorch_runners/ensemble.py evaluate configs/dcase2022/ensemble/config.yaml
+```
+
 ## Using off-the-shelf models
 We release the models trained on Clotho and AudioCaps for easy use. They use contrastive pre-trained feature extractor:
 ```bash

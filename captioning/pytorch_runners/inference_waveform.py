@@ -173,7 +173,6 @@ def inference(input,
                 "wav_len": torch.as_tensor(batch["wav_len"], dtype=torch.long),
                 "specaug": False,
                 "sample_method": "beam",
-                # "beam_size": 2
             }
             output_dict = model(input_dict)
             caption_batch = [decode_caption(seq, vocabulary) for seq in \

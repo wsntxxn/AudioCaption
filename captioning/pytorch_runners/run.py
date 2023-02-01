@@ -49,6 +49,15 @@ class Runner(BaseRunner):
                                              print_fn)
         model = train_util.init_obj(captioning.models, self.config["model"],
             encoder=encoder, decoder=decoder)
+
+        if "modelwrapper" in self.config:
+            self.rl_train = True
+            model = train_util.init_obj(captioning.models,
+                                        self.config["modelwrapper"],
+                                        model=model)
+        else:
+            self.rl_train = False
+
         return model
 
     def _forward(self, batch, training=True):
@@ -65,6 +74,13 @@ class Runner(BaseRunner):
         input_dict.update(batch)
 
         if training:
+            if self.rl_train:
+                rl_ref = {
+                    "key2refs": self.train_key2refs,
+                    "vocabulary": self.vocabulary,
+                    "scorer": Cider(),
+                }
+                input_dict.update(rl_ref)
             input_dict["ss_ratio"] = self.ss_ratio
             if "specaug" in self.config:
                 input_dict["specaug"] = self.config["specaug"]
@@ -123,7 +139,10 @@ class Runner(BaseRunner):
             #####################################################################
             self.optimizer.zero_grad()
             output = self._forward(batch, training=True)
-            loss = self.loss_fn(output)
+            if self.rl_train:
+                loss = output["loss"]
+            else:
+                loss = self.loss_fn(output)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(
                 self.model.parameters(), self.max_grad_norm)
@@ -212,6 +231,7 @@ class Runner(BaseRunner):
         dataloaders = self._get_dataloaders()
         self.train_dataloader = dataloaders["dataloader"]["train"]
         self.val_dataloader = dataloaders["dataloader"]["val"]
+        self.train_key2refs = dataloaders["key2refs"]["train"]
         self.val_key2refs = dataloaders["key2refs"]["val"]
         self.logger.info(f"the training dataset has "
             f"{len(self.train_dataloader.dataset)} samples")
