@@ -69,12 +69,14 @@ $ python captioning/pytorch_runners/inference_waveform.py test.wav test.json clo
 
 If you find the models useful, please cite our technical report:
 
+```
 @techreport{xu2022sjtu,
     author={Xu, Xuenan and Xie, Zeyu and Wu, Mengyue and Yu, Kai},
     title={The SJTU System for DCASE2022 Challenge Task 6: Audio Captioning with Audio-Text Retrieval Pre-training},
     institution={DCASE2022 Challenge},
     year={2022}
 }
+```
 
 # Related Papers
 The following papers are related to this repository:
