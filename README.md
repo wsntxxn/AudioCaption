@@ -67,6 +67,15 @@ $ unzip clotho_cntrstv_cnn14rnn_trm.zip
 $ python captioning/pytorch_runners/inference_waveform.py test.wav test.json clotho_cntrstv_cnn14rnn_trm/swa.pth
 ```
 
+If you find the models useful, please cite our technical report:
+
+@techreport{xu2022sjtu,
+    author={Xu, Xuenan and Xie, Zeyu and Wu, Mengyue and Yu, Kai},
+    title={The SJTU System for DCASE2022 Challenge Task 6: Audio Captioning with Audio-Text Retrieval Pre-training},
+    institution={DCASE2022 Challenge},
+    year={2022}
+}
+
 # Related Papers
 The following papers are related to this repository:
 * [A CRNN-GRU Based Reinforcement Learning Approach to Audio Captioning](https://dcase.community/documents/workshop2020/proceedings/DCASE2020Workshop_Xu_83.pdf)
