@@ -211,7 +211,7 @@ class EnsembleRunner(BaseRunner):
                     decoder_outputs_t.append(output_n_t)
                 logprob_t = torch.stack(
                     [
-                        torch.log_softmax(output["logit"].squeeze(1), -1)
+                        torch.log_softmax(output["logit"], -1)
                             for output in decoder_outputs_t
                     ]).mean(dim=0)
                 #######################################
