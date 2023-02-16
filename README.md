@@ -24,6 +24,9 @@ We now support [Clotho](https://arxiv.org/abs/1910.09387) and [AudioCaps](https:
 ## Configuration
 The training configuration is written in a YAML file and passed to the training script. Examples are in `configs`.
 
+## Contrastive Audio-text Pre-training
+We use contrastive learning for audio-text pre-training. The code is in [another repo](https://github.com/wsntxxn/DCASE2022T6_CLAP). We also provide [the pre-trained audio-text retrieval model](https://github.com/wsntxxn/AudioCaption/releases/download/v0.0.2/contrastive_pretrain_cnn14_bertm.pth) used for audio captioning training.
+
 ## Start training
 For example, train a Cnn14_Rnn-Transformer model on Clohto:
 ```bash
