@@ -1,9 +1,13 @@
 outputpath: experiments/clotho_v2/
 remark: pretraincnn10_xe
 
-h5_csv: data/clotho_v2/dev_val/lms.csv
-caption_file: data/clotho_v2/dev_val/text.json
-vocab_file: data/clotho_v2/dev_val/vocab.pkl
+data:
+    raw_feat_csv: data/clotho_v2/dev_val/lms.csv
+    fc_feat_csv: data/clotho_v2/dev_val/lms.csv
+    attn_feat_csv: data/clotho_v2/dev_val/lms.csv
+    caption_file: data/clotho_v2/dev_val/text.json
+
+vocabulary: data/clotho_v2/dev_val/vocab.pkl
 zh: False
 dataloader_args:
     batch_size: 32
