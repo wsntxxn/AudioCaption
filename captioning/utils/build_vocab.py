@@ -35,9 +35,10 @@ class Vocabulary(object):
 def build_vocab(input_json: str,
                 threshold: int,
                 keep_punctuation: bool,
+                force_tokenization: bool,
                 host_address: str,
                 character_level: bool = False,
-                zh: bool = True ):
+                zh: bool = False):
     """Build vocabulary from csv file with a given threshold to drop all counts < threshold
 
     Args:
@@ -64,7 +65,10 @@ def build_vocab(input_json: str,
 """
     data = json.load(open(input_json, "r"))["audios"]
     counter = Counter()
-    pretokenized = "tokens" in data[0]["captions"][0]
+    if force_tokenization:
+        pretokenized = False
+    else:
+        pretokenized = "tokens" in data[0]["captions"][0]
     
     if zh:
         from nltk.parse.corenlp import CoreNLPParser
@@ -137,13 +141,15 @@ def process(input_json: str,
             keep_punctuation: bool = False,
             character_level: bool = False,
             host_address: str = "http://localhost:9000",
+            force_tokenization: bool = False,
             zh: bool = False):
     logfmt = "%(asctime)s (%(module)s:%(lineno)d) %(levelname)s: %(message)s"
     logging.basicConfig(level=logging.INFO, format=logfmt)
     logging.info("Build Vocab")
     vocabulary = build_vocab(
         input_json=input_json, threshold=threshold, keep_punctuation=keep_punctuation,
-        host_address=host_address, character_level=character_level, zh=zh)
+        host_address=host_address, character_level=character_level, force_tokenization=force_tokenization,
+        zh=zh)
     pickle.dump(vocabulary, open(output_file, "wb"))
     logging.info("Total vocabulary size: {}".format(len(vocabulary)))
     logging.info("Saved vocab to '{}'".format(output_file))

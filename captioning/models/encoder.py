@@ -165,10 +165,29 @@ def embedding_pooling(x, lens, pooling="mean"):
     return fc_embs
 
 
-class Cdur5Encoder(BaseEncoder):
+class Cdur5Encoder(nn.Module):
 
-    def __init__(self, spec_dim, fc_feat_dim, attn_feat_dim, pooling="mean"):
-        super().__init__(spec_dim, fc_feat_dim, attn_feat_dim)
+    def __init__(self, sample_rate=16000, win_length=40, hop_length=20,
+                 n_mels=64, pooling="mean"):
+        super().__init__()
+        sr_to_fmax = {
+            32000: 14000,
+            16000: 8000
+        }
+        # Logmel spectrogram extractor
+        self.melspec_extractor = transforms.MelSpectrogram(
+            sample_rate=sample_rate,
+            n_fft=win_length * sample_rate // 1000,
+            win_length=win_length * sample_rate // 1000,
+            hop_length=hop_length * sample_rate // 1000,
+            f_min=50,
+            f_max=sr_to_fmax[sample_rate],
+            n_mels=n_mels,
+            norm="slaney",
+            mel_scale="slaney"
+        )
+        self.hop_length = hop_length * sample_rate // 1000
+        self.db_transform = transforms.AmplitudeToDB()
         self.pooling = pooling
         self.features = nn.Sequential(
             Block2D(1, 32),
@@ -181,9 +200,10 @@ class Cdur5Encoder(BaseEncoder):
             nn.LPPool2d(4, (1, 4)),
             nn.Dropout(0.3),
         )
+        self.downsample_ratio = 4
         with torch.no_grad():
             rnn_input_dim = self.features(
-                torch.randn(1, 1, 500, spec_dim)).shape
+                torch.randn(1, 1, 100, n_mels)).shape
             rnn_input_dim = rnn_input_dim[1] * rnn_input_dim[-1]
 
         self.gru = nn.GRU(rnn_input_dim,
@@ -193,30 +213,27 @@ class Cdur5Encoder(BaseEncoder):
         self.apply(init)
 
     def forward(self, input_dict):
-        x = input_dict["spec"]
-        lens = input_dict["spec_len"]
-        if "upsample" not in input_dict:
-            input_dict["upsample"] = False
-        lens = torch.as_tensor(copy.deepcopy(lens))
-        N, T, _ = x.shape
-        x = x.unsqueeze(1)
+        waveform = input_dict["wav"]
+        wave_length = input_dict["wav_len"]
+        wave_length = torch.as_tensor(wave_length)
+        x = self.melspec_extractor(waveform)
+        x = self.db_transform(x)    # (batch_size, mel_bins, time_steps)
+        x = x.transpose(1, 2)
+        x = x.unsqueeze(1)      # (batch_size, 1, time_steps, mel_bins)
+
         x = self.features(x)
         x = x.transpose(1, 2).contiguous().flatten(-2)
         x, _ = self.gru(x)
-        if input_dict["upsample"]:
-            x = nn.functional.interpolate(
-                x.transpose(1, 2),
-                T,
-                mode='linear',
-                align_corners=False).transpose(1, 2)
-        else:
-            lens //= 4
+        feat_length = torch.div(wave_length, self.hop_length,
+            rounding_mode="floor") + 1
+        feat_length = torch.div(feat_length, self.downsample_ratio,
+            rounding_mode="floor")
         attn_emb = x
-        fc_emb = embedding_pooling(x, lens, self.pooling)
+        fc_emb = embedding_pooling(x, feat_length, self.pooling)
         return {
             "attn_emb": attn_emb,
             "fc_emb": fc_emb,
-            "attn_emb_len": lens
+            "attn_emb_len": feat_length
         }
 
 

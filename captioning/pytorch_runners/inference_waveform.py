@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 import torch
 import kaldiio
+import h5py
 
 import captioning.models
 import captioning.models.encoder
@@ -53,7 +54,7 @@ def load_model(config, checkpoint):
     }
 
 
-def load_audio(specifier: str):
+def load_audio(specifier: str, target_sr: int):
     if specifier.endswith("|"):
         fd = kaldiio.utils.open_like_kaldi(specifier, "rb")
         mat = kaldiio.matio._load_mat(fd, None)
@@ -65,28 +66,52 @@ def load_audio(specifier: str):
         y, sr = librosa.core.load(specifier, sr=None)
     if y.shape[0] == 0:
         return None
-    y = librosa.core.resample(y, sr, 32000)
+    y = librosa.core.resample(y, sr, target_sr)
     return y
+
+
+def read_from_h5(key, key_to_h5, cache):
+    hdf5_path = key_to_h5[key]
+    if hdf5_path not in cache:
+        cache[hdf5_path] = h5py.File(hdf5_path, "r")
+    return cache[hdf5_path][key][()]
 
 
 class InferenceDataset(torch.utils.data.Dataset):
 
-    def __init__(self, aid_to_fname):
+    def __init__(self, aid_to_fname, original_sr, target_sr):
         super().__init__()
         self.aid_to_fname = aid_to_fname
         self.aids = list(aid_to_fname.keys())
+        first_fname = self.aid_to_fname[self.aids[0]]
+        if first_fname.endswith(".h5") or first_fname.endswith(".hdf5"):
+            self.source = "hdf5"
+            assert original_sr is not None, "original sample rate must be provided"
+        else:
+            self.source = "wav"
+        self.cache = {}
+        self.original_sr = original_sr
+        self.target_sr = target_sr
 
     def __getitem__(self, idx):
         aid = self.aids[idx]
-        waveform = load_audio(self.aid_to_fname[aid])
+        if self.source == "hdf5":
+            waveform = read_from_h5(aid, self.aid_to_fname, self.cache)
+            waveform = librosa.core.resample(waveform, self.original_sr, self.target_sr)
+        elif self.source == "wav":
+            waveform = load_audio(self.aid_to_fname[aid], self.target_sr)
         return aid, waveform
 
     def __len__(self):
         return len(self.aids)
 
 
-def collate_wrapper(min_length=0.32):
-    def collate_fn(data_list):
+class WavPadCollate:
+
+    def __init__(self, min_duration=0.32, sample_rate=32000):
+        self.min_length = int(min_duration * sample_rate)
+
+    def __call__(self, data_list):
         """
         data_list: [(aid1, waveform1), (aid2, waveform2), ...]
         """
@@ -97,7 +122,7 @@ def collate_wrapper(min_length=0.32):
         for item in data_list:
             waveform = item[1]
             audio_id = item[0]
-            if waveform is None or len(waveform) < min_length * 32000:
+            if waveform is None or len(waveform) < self.min_length:
                 blacklist_aids.append(audio_id)
                 continue
             aids.append(audio_id)
@@ -112,7 +137,6 @@ def collate_wrapper(min_length=0.32):
             "wav_len": np.array(lengths), 
             "blacklist_aid": blacklist_aids
         }
-    return collate_fn
 
 
 def decode_caption(word_ids, vocabulary):
@@ -132,11 +156,14 @@ def inference(input,
               output,
               checkpoint,
               batch_size=32,
-              num_process=4):
+              num_process=4,
+              original_sr=None,
+              target_sr=32000,
+              min_duration=0.32,
+              **sampling_kwargs):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     device = torch.device(device)
 
-    
     experiment_path = Path(checkpoint).parent
 
     config = train_util.parse_config_or_kwargs(experiment_path / "config.yaml")
@@ -147,18 +174,24 @@ def inference(input,
 
     if Path(input).suffix == ".csv":
         wav_df = pd.read_csv(input, sep="\t")
-        aid_to_fname = dict(zip(wav_df["audio_id"], wav_df["file_name"]))
-    elif Path(input).suffix in [".wav", ".mp3", ".flac"]:
+        if "file_name" in wav_df.columns:
+            aid_to_fname = dict(zip(wav_df["audio_id"], wav_df["file_name"]))
+        elif "hdf5_path" in wav_df.columns:
+            aid_to_fname = dict(zip(wav_df["audio_id"], wav_df["hdf5_path"]))
+    elif Path(input).suffix in [".wav", ".mp3", ".flac", ".mp4"]:
         audio_id = Path(input).name
         aid_to_fname = {audio_id: input}
     else:
         raise Exception("input should be wav.csv or audio file")
 
     dataloader = torch.utils.data.DataLoader(
-        InferenceDataset(aid_to_fname),
+        InferenceDataset(aid_to_fname, original_sr, target_sr),
         batch_size=batch_size,
         shuffle=False,
-        collate_fn=collate_wrapper(0.32),
+        collate_fn=WavPadCollate(
+            min_duration=min_duration,
+            sample_rate=target_sr
+        ),
         num_workers=num_process
     )
 
@@ -172,8 +205,10 @@ def inference(input,
                 "wav": wav,
                 "wav_len": torch.as_tensor(batch["wav_len"], dtype=torch.long),
                 "specaug": False,
-                "sample_method": "beam",
+                "sample_method": sampling_kwargs.get("sample_method", "beam"),
             }
+            if input_dict["sample_method"] == "beam":
+                input_dict["beam_size"] = sampling_kwargs.get("beam_size", 3)
             output_dict = model(input_dict)
             caption_batch = [decode_caption(seq, vocabulary) for seq in \
                 output_dict["seq"].cpu().numpy()]

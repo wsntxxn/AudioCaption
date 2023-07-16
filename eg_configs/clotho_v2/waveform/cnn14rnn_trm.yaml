@@ -2,8 +2,6 @@ inherit_from: ./train_data.yaml
 
 remark: cnn14rnn_trm
 
-# sync_file: /mnt/lustre/sjtu/home/xnx98/work/AudioCaption/ddp_sync/sync
-
 model:
     encoder:
         type: Cnn14RnnEncoder
@@ -41,7 +39,6 @@ lr_scheduler:
     args:
         # warmup_iters: 3000
         final_lrs: !!float 5e-7
-
 
 trainer:
     max_grad_norm: 1.0
