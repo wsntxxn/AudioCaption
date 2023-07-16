@@ -22,7 +22,7 @@ We now support [Clotho](https://arxiv.org/abs/1910.09387) and [AudioCaps](https:
 # Training
 
 ## Configuration
-The training configuration is written in a YAML file and passed to the training script. Examples are in `configs`.
+The training configuration is written in a YAML file and passed to the training script. Examples are in `eg_configs`.
 
 ## Contrastive Audio-text Pre-training
 We use contrastive learning for audio-text pre-training. The code is in [another repo](https://github.com/wsntxxn/DCASE2022T6_CLAP). We also provide [the pre-trained audio-text retrieval model](https://github.com/wsntxxn/AudioCaption/releases/download/v0.0.2/contrastive_pretrain_cnn14_bertm.pth) used for audio captioning training.
@@ -30,13 +30,13 @@ We use contrastive learning for audio-text pre-training. The code is in [another
 ## Start training
 For example, train a Cnn14_Rnn-Transformer model on Clohto:
 ```bash
-$ python captioning/pytorch_runners/run.py train configs/clotho_v2/waveform/cnn14rnn_trm.yaml
+$ python captioning/pytorch_runners/run.py train eg_configs/clotho_v2/waveform/cnn14rnn_trm.yaml
 ```
 
 # Evaluation
-Assume the experiment directory is `$EXP_PATH`. Evaluation under the configuration in `configs/clotho_v2/waveform/test.yaml`:
+Assume the experiment directory is `$EXP_PATH`. Evaluation under the configuration in `eg_configs/clotho_v2/waveform/test.yaml`:
 ```bash
-$ python captioning/pytorch_runners/run.py evaluate $EXP_PATH configs/clotho_v2/waveform/test.yaml
+$ python captioning/pytorch_runners/run.py evaluate $EXP_PATH eg_configs/clotho_v2/waveform/test.yaml
 ```
 
 # Inference
@@ -46,9 +46,9 @@ $ python captioning/pytorch_runners/inference_waveform.py test.wav test.json $CK
 ```
 
 ## Ensemble
-Several models can be used to ensemble for inference, especially in challenges. We provide a sample configuration `configs/dcase2022/ensemble/config.yaml`:
+Several models can be used to ensemble for inference, especially in challenges. We provide a sample configuration `eg_configs/dcase2022/ensemble/config.yaml`:
 ```bash
-$ python captioning/pytorch_runners/ensemble.py evaluate configs/dcase2022/ensemble/config.yaml
+$ python captioning/pytorch_runners/ensemble.py evaluate eg_configs/dcase2022/ensemble/config.yaml
 ```
 
 ## Using off-the-shelf models

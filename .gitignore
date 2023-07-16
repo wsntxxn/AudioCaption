@@ -124,6 +124,10 @@ utils/dataserver/*
 
 # Backup files
 .backup
+untracked/
+
+# Temporary files
+*tmp
 
 # Vscode files
 .vscode/*
@@ -133,3 +137,6 @@ logs/
 
 # Sed support
 sed/
+
+# Configuration
+configs/

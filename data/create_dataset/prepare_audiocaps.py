@@ -31,6 +31,7 @@ def process(file_name, audioset_df, output_path, audio_link_path):
                 }
                 wav_csv_df.append({
                     "audio_id": audio_id,
+                    "file_name": link_path.absolute().__str__()
                 })
             if "captions" not in data[audio_id]:
                 data[audio_id]["captions"] = []

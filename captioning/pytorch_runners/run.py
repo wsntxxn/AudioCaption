@@ -397,5 +397,23 @@ class Runner(BaseRunner):
         return exp_dir
 
 
+    def debug(self, config, **kwargs):
+        self.config = train_util.parse_config_or_kwargs(config)
+        dataloaders = self._get_dataloaders()
+        self.train_dataloader = dataloaders["dataloader"]["train"]
+        self.vocabulary = self.train_dataloader.dataset.vocabulary
+        self.model = self._get_model(print).to(self.device)
+        self.loss_fn = train_util.init_obj(losses, self.config["loss"])
+        self.__dict__.update(self.config["trainer"])
+
+        self.ss_ratio = 1.0
+        self.iteration = 1
+        batch = next(iter(self.train_dataloader))
+        output = self._forward(batch, training=True)
+        loss = self.loss_fn(output)
+        loss.backward()
+
+
+
 if __name__ == "__main__":
     fire.Fire(Runner)

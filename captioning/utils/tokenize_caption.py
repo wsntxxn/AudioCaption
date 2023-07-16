@@ -8,7 +8,7 @@ def tokenize_caption(input_json: str,
                      keep_punctuation: bool = False,
                      host_address: str = None,
                      character_level: bool = False,
-                     zh: bool = True,
+                     zh: bool = False,
                      output_json: str = None):
     """Build vocabulary from csv file with a given threshold to drop all counts < threshold
 
