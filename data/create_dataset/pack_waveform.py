@@ -47,7 +47,7 @@ def load_audio(row):
         if y.ndim > 1:
             y = y.mean(1)
         if args.sample_rate is not None:
-            y = librosa.core.resample(y, sr, args.sample_rate)
+            y = librosa.core.resample(y, orig_sr=sr, target_sr=args.sample_rate)
         waveform = y.astype(np.float16)
         return audio_id, waveform
     except Exception as e:

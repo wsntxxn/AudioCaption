@@ -2,10 +2,13 @@
 
 import math
 from functools import partial
+from typing import Union, Callable, Optional
 
 import numpy as np
 import torch
 import torch.nn as nn
+from torch import Tensor
+import torch.nn.functional as F
 
 from captioning.models.utils import generate_length_mask, init, PositionalEncoding
 
@@ -782,3 +785,81 @@ class KeywordProbTransformerDecoder(TransformerDecoder):
             "logit": self.classifier(output),
         }
         return output
+
+
+class Adapter(nn.Module):
+
+    def __init__(self, d_model, d_adapter):
+        super().__init__()
+        self.down_mlp = nn.Linear(d_model, d_adapter)
+        self.non_linear = nn.LeakyReLU()
+        self.up_mlp = nn.Linear(d_adapter, d_model)
+    
+    def forward(self, x):
+        x = self.up_mlp(self.non_linear(self.down_mlp(x))) + x
+        return x
+
+
+class TransformerLayerWithAdapter(nn.TransformerDecoderLayer):
+
+    def __init__(self,
+                 d_model: int,
+                 nhead: int,
+                 dim_feedforward: int = 2048,
+                 d_adapter: int = 16,
+                 dropout: float = 0.1,
+                 activation: Union[str, Callable[[Tensor], Tensor]] = F.relu,
+                 layer_norm_eps: float = 0.00001,
+                 batch_first: bool = False,
+                 norm_first: bool = False,
+                 device=None,
+                 dtype=None) -> None:
+        super().__init__(d_model, nhead, dim_feedforward, dropout, activation, layer_norm_eps, batch_first, norm_first, device, dtype)
+        self.adapter1 = Adapter(d_model, d_adapter)
+        self.adapter2 = Adapter(d_model, d_adapter)
+        for param in self.parameters():
+            param.requires_grad = False
+        for module in [self.adapter1, self.adapter2, self.norm1, self.norm2,
+                       self.norm3]:
+            for param in module.parameters():
+                param.requires_grad = True
+
+
+    def forward(self,
+                tgt: Tensor,
+                memory: Tensor,
+                tgt_mask: Optional[Tensor] = None,
+                memory_mask: Optional[Tensor] = None,
+                tgt_key_padding_mask: Optional[Tensor] = None,
+                memory_key_padding_mask: Optional[Tensor] = None) -> Tensor:
+        x = tgt
+        if self.norm_first:
+            x = x + self._sa_block(self.norm1(x), tgt_mask, tgt_key_padding_mask)
+            x = x + self.adapter1(self._mha_block(self.norm2(x), memory, memory_mask, memory_key_padding_mask))
+            x = x + self.adapter2(self._ff_block(self.norm3(x)))
+        else:
+            x = self.norm1(x + self._sa_block(x, tgt_mask, tgt_key_padding_mask))
+            x = self.norm2(x + self.adapter1(self._mha_block(x, memory, memory_mask, memory_key_padding_mask)))
+            x = self.norm3(x + self.adapter2(self._ff_block(x)))
+
+        return x
+
+
+class TransformerDecoderWithAdapter(TransformerDecoder):
+
+    def __init__(self,
+                 emb_dim,
+                 vocab_size,
+                 fc_emb_dim,
+                 attn_emb_dim,
+                 adapter_dim,
+                 dropout,
+                 **kwargs):
+        super().__init__(emb_dim, vocab_size, fc_emb_dim, attn_emb_dim, dropout, **kwargs)
+        layer = TransformerLayerWithAdapter(d_model=self.d_model,
+                                            nhead=self.nhead,
+                                            dim_feedforward=self.dim_feedforward,
+                                            d_adapter=adapter_dim,
+                                            dropout=dropout)
+        self.model = nn.TransformerDecoder(layer, self.nlayers)
+

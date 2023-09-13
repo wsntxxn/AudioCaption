@@ -18,6 +18,10 @@ import captioning.models.decoder
 import captioning.utils.train_util as train_util
 
 
+def print_pass(*args, **kwargs):
+    pass
+
+
 def load_model(config, checkpoint):
     ckpt = torch.load(checkpoint, "cpu")
     encoder_cfg = config["model"]["encoder"]
@@ -29,7 +33,7 @@ def load_model(config, checkpoint):
         pretrained = encoder_cfg["pretrained"]
         train_util.load_pretrained_model(encoder,
                                          pretrained,
-                                         sys.stdout.write)
+                                         print_pass)
     decoder_cfg = config["model"]["decoder"]
     if "vocab_size" not in decoder_cfg["args"]:
         decoder_cfg["args"]["vocab_size"] = len(ckpt["vocabulary"])
@@ -46,7 +50,7 @@ def load_model(config, checkpoint):
                                          sys.stdout.write)
     model = train_util.init_obj(captioning.models, config["model"],
         encoder=encoder, decoder=decoder)
-    train_util.load_pretrained_model(model, ckpt)
+    train_util.load_pretrained_model(model, ckpt, print_pass)
     model.eval()
     return {
         "model": model,
@@ -66,7 +70,9 @@ def load_audio(specifier: str, target_sr: int):
         y, sr = librosa.core.load(specifier, sr=None)
     if y.shape[0] == 0:
         return None
-    y = librosa.core.resample(y, sr, target_sr)
+    y = librosa.core.resample(y, orig_sr=sr, target_sr=target_sr)
+
+    # y = np.array(np.array(y, dtype=np.float16), dtype=np.float32)
     return y
 
 
@@ -97,7 +103,8 @@ class InferenceDataset(torch.utils.data.Dataset):
         aid = self.aids[idx]
         if self.source == "hdf5":
             waveform = read_from_h5(aid, self.aid_to_fname, self.cache)
-            waveform = librosa.core.resample(waveform, self.original_sr, self.target_sr)
+            waveform = np.array(waveform, dtype=np.float32)
+            waveform = librosa.core.resample(waveform, orig_sr=self.original_sr, target_sr=self.target_sr)
         elif self.source == "wav":
             waveform = load_audio(self.aid_to_fname[aid], self.target_sr)
         return aid, waveform

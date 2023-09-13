@@ -24,10 +24,7 @@ class Runner(BaseRunner):
 
     def _get_model(self, print_fn=sys.stdout.write):
         encoder_cfg = self.config["model"]["encoder"]
-        encoder = train_util.init_obj(
-            captioning.models.encoder,
-            encoder_cfg
-        )
+        encoder = train_util.init_obj_from_str(encoder_cfg)
         if "pretrained" in encoder_cfg:
             pretrained = encoder_cfg["pretrained"]
             train_util.load_pretrained_model(encoder,
@@ -36,10 +33,7 @@ class Runner(BaseRunner):
         decoder_cfg = self.config["model"]["decoder"]
         if "vocab_size" not in decoder_cfg["args"]:
             decoder_cfg["args"]["vocab_size"] = len(self.vocabulary)
-        decoder = train_util.init_obj(
-            captioning.models.decoder,
-            decoder_cfg
-        )
+        decoder = train_util.init_obj_from_str(decoder_cfg)
         if "word_embedding" in decoder_cfg:
             decoder.load_word_embedding(**decoder_cfg["word_embedding"])
         if "pretrained" in decoder_cfg:
@@ -47,14 +41,16 @@ class Runner(BaseRunner):
             train_util.load_pretrained_model(decoder,
                                              pretrained,
                                              print_fn)
-        model = train_util.init_obj(captioning.models, self.config["model"],
-            encoder=encoder, decoder=decoder)
+        model = train_util.init_obj_from_str(
+            self.config["model"],
+            encoder=encoder,
+            decoder=decoder)
 
         if "modelwrapper" in self.config:
             self.rl_train = True
-            model = train_util.init_obj(captioning.models,
-                                        self.config["modelwrapper"],
-                                        model=model)
+            model = train_util.init_obj_from_str(
+                self.config["modelwrapper"],
+                model=model)
         else:
             self.rl_train = False
 
@@ -213,8 +209,9 @@ class Runner(BaseRunner):
         #####################################################################
         # Create checkpoint directory
         #####################################################################
+        model_type = self.config["model"]["type"].split(".")[-1]
         exp_dir = Path(self.config["outputpath"]) / \
-            self.config["model"]["type"] / self.config["remark"] / \
+            model_type / self.config["remark"] / \
             f"seed_{self.seed}"
         exp_dir.mkdir(parents=True, exist_ok=True)
         self.logger = train_util.init_logger(str(exp_dir / "train.log"))
@@ -267,9 +264,9 @@ class Runner(BaseRunner):
         #####################################################################
         # Build loss function and optimizer
         #####################################################################
-        self.optimizer = train_util.init_obj(torch.optim,
+        self.optimizer = train_util.init_obj_from_str(
             self.config["optimizer"], params=self.model.parameters())
-        self.loss_fn = train_util.init_obj(losses, self.config["loss"])
+        self.loss_fn = train_util.init_obj_from_str(self.config["loss"])
         train_util.pprint_dict(self.optimizer, self.logger.info,
                                formatter="pretty")
 
@@ -281,14 +278,14 @@ class Runner(BaseRunner):
         #####################################################################
         # Create learning rate scheduler
         #####################################################################
+        
         try:
-            self.lr_scheduler = train_util.init_obj(torch.optim.lr_scheduler,
+            self.lr_scheduler = train_util.init_obj_from_str(
                 self.config["lr_scheduler"], optimizer=self.optimizer)
-        except AttributeError:
-            import captioning.utils.lr_scheduler as lr_scheduler
+        except Exception:
             lr_scheduler_config = self.config["lr_scheduler"]
-            if lr_scheduler_config["type"] in [
-                    "ExponentialDecayScheduler", "CosineWithWarmup"]:
+            scheduler_type = lr_scheduler_config["type"].split(".")[-1]
+            if scheduler_type in ["ExponentialDecayScheduler", "CosineWithWarmup"]:
                 lr_scheduler_config["args"]["total_iters"] = self.iterations
             if "warmup_iters" not in lr_scheduler_config["args"]:
                 warmup_iters = self.iterations // 5
@@ -296,7 +293,7 @@ class Runner(BaseRunner):
             else:
                 warmup_iters = lr_scheduler_config["args"]["warmup_iters"]
             self.logger.info(f"Warm up iterations: {warmup_iters}")
-            self.lr_scheduler = train_util.init_obj(lr_scheduler,
+            self.lr_scheduler = train_util.init_obj_from_str(
                 lr_scheduler_config, optimizer=self.optimizer)
 
         if "inference_args" not in self.config:
@@ -403,7 +400,7 @@ class Runner(BaseRunner):
         self.train_dataloader = dataloaders["dataloader"]["train"]
         self.vocabulary = self.train_dataloader.dataset.vocabulary
         self.model = self._get_model(print).to(self.device)
-        self.loss_fn = train_util.init_obj(losses, self.config["loss"])
+        self.loss_fn = train_util.init_obj_from_str(self.config["loss"])
         self.__dict__.update(self.config["trainer"])
 
         self.ss_ratio = 1.0
