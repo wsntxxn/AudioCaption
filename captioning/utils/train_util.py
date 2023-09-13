@@ -3,8 +3,10 @@
 import os
 import sys
 import logging
+import importlib
 from typing import Callable, Dict, Union
 import yaml
+import toml
 import torch
 from torch.optim.swa_utils import AveragedModel as torch_average_model
 import numpy as np
@@ -38,6 +40,26 @@ def init_obj(module, config, **kwargs):
     obj_args = config["args"].copy()
     obj_args.update(kwargs)
     return getattr(module, config["type"])(**obj_args)
+
+
+def get_obj_from_str(string, reload=False):
+    module, cls = string.rsplit('.', 1)
+    if reload:
+        module_imp = importlib.import_module(module)
+        importlib.reload(module_imp)
+    return getattr(importlib.import_module(module, package=None), cls)
+
+
+def init_obj_from_str(config, **kwargs):
+    obj_args = config["args"].copy()
+    obj_args.update(kwargs)
+    for k in config:
+        if k not in ["type", "args"] and isinstance(config[k], dict) and \
+            k not in kwargs:
+            obj_args[k] = init_obj_from_str(config[k])
+    cls = get_obj_from_str(config["type"])
+    obj = cls(**obj_args)
+    return obj
 
 
 def pprint_dict(in_dict, outputfun=sys.stdout.write, formatter='yaml'):
@@ -84,10 +106,20 @@ def load_config(config_file):
 
 
 def parse_config_or_kwargs(config_file, **kwargs):
+    toml_list = []
+    for k, v in kwargs.items():
+        if isinstance(v, str):
+            toml_list.append(f"{k}='{v}'")
+        elif isinstance(v, bool):
+            toml_list.append(f"{k}={str(v).lower()}")
+        else:
+            toml_list.append(f"{k}={v}")
+    toml_str = "\n".join(toml_list)
+    cmd_config = toml.loads(toml_str)
     yaml_config = load_config(config_file)
     # passed kwargs will override yaml config
-    args = dict(yaml_config, **kwargs)
-    return args
+    merge_a_into_b(cmd_config, yaml_config)
+    return yaml_config
 
 
 def store_yaml(config, config_file):

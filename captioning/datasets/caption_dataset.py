@@ -23,7 +23,12 @@ def read_from_h5(key: str, key_to_h5: Dict, cache: Dict):
     try:
         return cache[hdf5_path][key][()]
     except KeyError: # audiocaps compatibility
-        key = "Y" + key + ".wav"
+        if key.startswith("0902_50000_"):
+            key = key[11:]
+        elif key.startswith("0906_2000_"):
+            key = key[10:]
+        else:
+            key = "Y" + key + ".wav"
         return cache[hdf5_path][key][()]
 
 
@@ -140,12 +145,17 @@ class CaptionDataset(InferenceDataset):
                  caption: str,
                  vocabulary: str,
                  load_into_mem: bool = False,
+                 max_audio_len: float = None,
+                 sample_rate: int = 32000,
                  max_cap_len: int = 20):
         self.caption_info = json.load(open(caption))["audios"]
         self.vocabulary = pickle.load(open(vocabulary, "rb"))
         self.bos = self.vocabulary('<start>')
         self.eos = self.vocabulary('<end>')
         self.max_cap_len = max_cap_len
+        self.max_audio_len = max_audio_len
+        if max_audio_len is not None:
+            self.num_audio_samples = int(max_audio_len * sample_rate)
         self.key_to_tokens = {}
         self.keys = []
         audio_ids = []
@@ -166,13 +176,22 @@ class CaptionDataset(InferenceDataset):
     def __getitem__(self, index):
         audio_id, cap_id = self.keys[index]
         output = super().load_audio(audio_id)
+
+        if self.max_audio_len is not None:
+            waveform = output["wav"]
+            start = random.randint(0, waveform.shape[0] - self.num_audio_samples)
+            output["wav"] = output["wav"][start: start + self.num_audio_samples]
+
         for feat_type in self.feat_types:
             transform = self.transforms[feat_type]
             if transform is not None:
                 for fn in transform:
                     output[feat_type] = fn(output[feat_type])
 
-        tokens = self.key_to_tokens[audio_id][cap_id].split()
+        tokens = self.key_to_tokens[audio_id][cap_id]
+        # TODO temporary
+        # tokens = tokens.replace("the sound of", "")
+        tokens = tokens.split()
         caption = [self.vocabulary(token) for token in tokens][:self.max_cap_len]
         caption = [self.bos] + caption + [self.eos]
         caption = np.array(caption)

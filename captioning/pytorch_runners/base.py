@@ -10,7 +10,6 @@ import fire
 import torch
 
 import captioning.utils.train_util as train_util
-import captioning.datasets as dataset_module
 
 
 class BaseRunner(object):
@@ -35,16 +34,12 @@ class BaseRunner(object):
         for split in ["train", "val"]:
             data_config = self.config["data"][split]
             dataset_config = data_config["dataset"]
-            dataset = getattr(dataset_module, dataset_config["type"])(
-                **dataset_config["args"])
+            dataset = train_util.init_obj_from_str(dataset_config)
             collate_config = data_config["collate_fn"]
-            collate_fn = getattr(dataset_module, collate_config["type"])(
-                **collate_config["args"])
+            collate_fn = train_util.init_obj_from_str(collate_config)
             if "batch_sampler" in data_config:
                 bs_config = data_config["batch_sampler"]
-                batch_sampler = getattr(dataset_module, bs_config["type"])(
-                    dataset,
-                    **bs_config["args"])
+                batch_sampler = train_util.init_obj_from_str(bs_config, dataset=dataset)
             else:
                 batch_sampler = None
             dataloader = torch.utils.data.DataLoader(
@@ -251,28 +246,30 @@ class BaseRunner(object):
         raise NotImplementedError
 
     def predict(self,
-                experiment_path: str,
+                experiment_path: Union[str, Path],
                 eval_config: Union[str, Dict],
                 return_pred: bool = False,
                 **kwargs):
         experiment_path = Path(experiment_path)
         if not isinstance(eval_config, dict):
             eval_config = train_util.parse_config_or_kwargs(eval_config, **kwargs)
+        self.config = train_util.parse_config_or_kwargs(experiment_path / "config.yaml")
+
+        # TODO first resume the checkpoint in training config
+        self.model = self._get_model()
+        if "resume" in self.config:
+            self.resume_checkpoint(finetune=True)
+
         resume_path = experiment_path / eval_config['resume']
-        self.config = train_util.parse_config_or_kwargs(
-            experiment_path / "config.yaml")
         self.config["resume"] = resume_path
 
-        self.model = self._get_model()
         self.resume_checkpoint(finetune=True)
         self.model = self.model.to(self.device)
 
         dataset_config = eval_config["data"]["test"]["dataset"]
-        dataset = getattr(dataset_module, dataset_config["type"])(
-            **dataset_config["args"])
+        dataset = train_util.init_obj_from_str(dataset_config)
         collate_config = eval_config["data"]["test"]["collate_fn"]
-        collate_fn = getattr(dataset_module, collate_config["type"])(
-            **collate_config["args"])
+        collate_fn = train_util.init_obj_from_str(collate_config)
         dataloader = torch.utils.data.DataLoader(
             dataset=dataset, collate_fn=collate_fn,
             **eval_config["data"]["test"]["dataloader_args"])
