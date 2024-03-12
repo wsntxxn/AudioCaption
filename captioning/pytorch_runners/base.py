@@ -264,7 +264,7 @@ class BaseRunner(object):
             self.lr_scheduler.load_state_dict(ckpt["lr_scheduler"])
 
     def predict(self,
-                experiment_path: str,
+                experiment_path: Union[str, Path],
                 eval_config: Union[str, Dict],
                 return_pred: bool = False,
                 **kwargs):
