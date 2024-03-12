@@ -5,11 +5,10 @@ import sys
 from pathlib import Path
 
 import fire
-import numpy as np
 import torch
 from torch.utils.tensorboard import SummaryWriter
-from tqdm import tqdm, trange
 import wandb
+from tqdm import tqdm, trange
 
 import captioning.utils.train_util as train_util
 from captioning.pytorch_runners.base import BaseRunner
@@ -26,23 +25,72 @@ class Runner(BaseRunner):
                 else:
                     batch[k] = v.float().to(self.device)
 
+        # student forward
         input_dict = {
             "mode": "train" if training else "inference",
         }
         input_dict.update(batch)
 
         if training:
-            if self.rl_train:
-                rl_ref = {
-                    "key2refs": self.train_key2refs,
-                    "vocabulary": self.vocabulary,
-                    "scorer": Cider(),
-                }
-                input_dict.update(rl_ref)
             input_dict["ss_ratio"] = self.ss_ratio
             if "specaug" in self.config:
                 input_dict["specaug"] = self.config["specaug"]
-            output = self.model(input_dict)
+            output = {}
+            # teacher forward
+            with torch.no_grad():
+                if "token" in self.config["kd_type"]:
+                    text_input_dict = {
+                        "input_ids": batch["cap"],
+                        "attention_mask": batch["attention_mask"],
+                    }
+                    tchr_output = self.teacher(audio=batch["teacher_wav"],
+                                               text=text_input_dict,
+                                               return_status=True)
+                    output["tchr_logit"] = tchr_output["logits"]
+                if "seq" in self.config["kd_type"]:
+                    if all([aid in self.aid_to_tchr_seq for aid in batch["audio_id"]]):
+                        tchr_seq = [self.aid_to_tchr_seq[aid] for aid in batch["audio_id"]]
+                    else:
+                        tchr_seq = []
+                        for aid, teacher_sample in zip(batch["audio_id"], batch["teacher_wav"]):
+                            seq = self.teacher.generate(
+                                samples=teacher_sample.unsqueeze(0),
+                                num_beams=3
+                            )["caption"][0]
+                            self.aid_to_tchr_seq[aid] = seq
+                            tchr_seq.append(seq)
+                    tokenized_seq = self.tokenizer(tchr_seq)
+                    for k, v in tokenized_seq.items():
+                        if isinstance(v, torch.Tensor):
+                            if k == "cap":
+                                tokenized_seq[k] = v.long().to(self.device)
+                            else:
+                                tokenized_seq[k] = v.float().to(self.device)
+                    output["tchr_tgt"] = tokenized_seq["cap"][:, 1:]
+                    output["tchr_tgt_len"] = tokenized_seq["cap_len"] - 1
+
+                if "enc" in self.config["kd_type"]:
+                    tchr_enc_output = {}
+                    for teacher_sample in batch["teacher_wav"]:
+                        tchr_enc_output_i = self.teacher.forward_encoder(teacher_sample.unsqueeze(0))
+                        for k, v in tchr_enc_output_i.items():
+                            if isinstance(v, torch.Tensor):
+                                if k not in tchr_enc_output:
+                                    tchr_enc_output[k] = []
+                                tchr_enc_output[k].append(v)
+                    for k, v in tchr_enc_output.items():
+                        tchr_enc_output[k] = torch.cat(v, dim=0)
+
+            if "seq" in self.config["kd_type"]:
+                input_dict.update(tokenized_seq)
+                tchr_output = self.model(input_dict)
+                output["tchr_cap_logit"] = tchr_output["logit"]
+
+            input_dict.update(batch)
+            if "enc" in self.config["kd_type"]:
+                input_dict["tchr_output"] = tchr_enc_output
+            stdnt_output = self.model(input_dict)
+            output.update(stdnt_output)
             output["tgt"] = batch["cap"][:, 1:]
             output["tgt_len"] = torch.as_tensor(batch["cap_len"] - 1)
         else:
@@ -72,7 +120,29 @@ class Runner(BaseRunner):
             self.rl_train = False
         if hasattr(self, "tokenizer"):
             model.set_index(self.tokenizer.bos, self.tokenizer.eos, self.tokenizer.pad)
+
+        if "kd_pretrained" in self.config:
+            prt_ckpt_path = self.config["kd_pretrained"]
+            prt_cfg_path = Path(prt_ckpt_path).parent / "config.yaml"
+            prt_cfg = train_util.load_config(prt_cfg_path)
+            prt_model = train_util.init_model_from_config(prt_cfg["model"], print_fn)
+            prt_ckpt = torch.load(prt_ckpt_path, "cpu")
+            train_util.load_pretrained_model(prt_model, prt_ckpt, print_fn)
+            if prt_model.__class__.__name__ == "ContraEncoderKdWrapper":
+                model.encoder.load_state_dict(prt_model.model.state_dict())
+                
         return model
+
+    def _get_teacher(self, print_fn=sys.stdout.write):
+        sys.path.append("/mnt/fast/nobackup/scratch4weeks/xx00336/workspace/wavcaps/captioning")
+        from models.bart_captioning import BartCaptionModel
+        checkpoint_path = self.config["teacher"]
+        ckpt = torch.load(checkpoint_path, "cpu")
+        model = BartCaptionModel(ckpt["config"])
+        model.load_state_dict(ckpt["model"])
+        model.eval()
+        return model
+
     
     def _train_epoch(self):
         total_loss, nsamples = 0, 0
@@ -118,6 +188,7 @@ class Runner(BaseRunner):
             if self.rl_train:
                 loss = output["loss"]
             else:
+                output["step"] = self.iteration
                 loss = self.loss_fn(output)
 
             if not torch.isnan(loss):
@@ -200,19 +271,23 @@ class Runner(BaseRunner):
         #####################################################################
         # Build model
         #####################################################################
-        model = self._get_model(self.logger.info)
-        self.model = model.to(self.device)
-        swa_model = train_util.AveragedModel(model)
+
+        if "teacher" in self.config:
+            self.teacher = self._get_teacher(self.logger.info).to(self.device)
+        self.aid_to_tchr_seq = {}
+
+        self.model = self._get_model(self.logger.info).to(self.device)
+        swa_model = train_util.AveragedModel(self.model)
         train_util.pprint_dict(self.model, self.logger.info, formatter="pretty")
         num_params = 0
         num_trainable_params = 0
         self.saving_keys = []
-        for name, param in model.named_parameters():
+        for name, param in self.model.named_parameters():
             num_params += param.numel()
             if param.requires_grad:
                 num_trainable_params += param.numel()
                 self.saving_keys.append(name)
-        for name, buffer in model.named_buffers():
+        for name, buffer in self.model.named_buffers():
             self.saving_keys.append(name)
 
         self.logger.info(f"{num_params} parameters in total")
@@ -366,11 +441,14 @@ class Runner(BaseRunner):
         self.train_dataloader = dataloaders["dataloader"]["train"]
         self.tokenizer = self.train_dataloader.collate_fn.tokenizer
         self.model = self._get_model(print).to(self.device)
+        if "teacher" in self.config:
+            self.teacher = self._get_teacher(print).to(self.device)
         self.loss_fn = train_util.init_obj_from_dict(self.config["loss"])
         self.__dict__.update(self.config["trainer"])
 
         self.ss_ratio = 1.0
         self.iteration = 1
+        self.aid_to_tchr_seq = {}
         batch = next(iter(self.train_dataloader))
         output = self._forward(batch, training=True)
         loss = self.loss_fn(output)
