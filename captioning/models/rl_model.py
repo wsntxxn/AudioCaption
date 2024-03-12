@@ -5,9 +5,10 @@ import torch
 import torch.nn as nn
 
 from captioning.models.utils import compute_batch_score
+from captioning.models.base_model import CaptionMetaMixin
 
 
-class ScstWrapper(nn.Module):
+class ScstWrapper(nn.Module, CaptionMetaMixin):
 
     def __init__(self, model):
         super(ScstWrapper, self).__init__()

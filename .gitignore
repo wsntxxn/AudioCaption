@@ -119,6 +119,8 @@ data/*
 !data/*.py
 !data/README.md
 
+raw_data
+
 # Chinese tokenizer and BERT server
 utils/dataserver/*
 

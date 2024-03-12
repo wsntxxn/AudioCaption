@@ -321,85 +321,8 @@ class DistributedBatchSampler:
         self.epoch = epoch
 
 
-def pad_sequence(data):
-    if isinstance(data[0], np.ndarray):
-        data = [torch.as_tensor(arr) for arr in data]
-    padded_seq = torch.nn.utils.rnn.pad_sequence(data,
-                                                 batch_first=True)
-    length = [x.shape[0] for x in data]
-    return padded_seq, length
-
-
-def collate_fn(pad_keys=[], sort_key=None):
-
-    def wrapper(data_batch):
-        if sort_key:
-            data_batch.sort(key=lambda x: len(x[sort_key]), reverse=True)
-        
-        output = {}
-        for data in data_batch:
-            for key in data:
-                if key not in output:
-                    output[key] = []
-                output[key].append(data[key])
-
-        for key in data_batch[0].keys():
-            try:
-                if key in pad_keys:
-                    padded_seq, length = pad_sequence(output[key])
-                    output[key] = padded_seq
-                    output[f"{key}_len"] = np.array(length)
-                else:
-                    data = np.array(output[key])
-                    if isinstance(output[key][0], np.ndarray):
-                        output[key] = torch.as_tensor(data)
-                    else:
-                        output[key] = data
-            except Exception:
-                print(f"error occurred when collating {key}")
-                import ipdb; ipdb.set_trace()
-
-        return output
-
-    return wrapper
 
 
 if __name__ == "__main__":
-    import sys
-    from tqdm import tqdm
-    from captioning.utils.build_vocab import Vocabulary
-    random.seed(1)
-    np.random.seed(1)
-    torch.manual_seed(1)
-    args = {
-        "features": {
-            "spec": "data/clotho_v2/dev/lms.csv",
-            "fc": "data/clotho_v2/dev/clap_features/cnn14/fc.csv",
-            "attn": "data/clotho_v2/dev/clap_features/cnn14/attn.csv"
-        },
-        "transforms": {
-            "spec": None,
-            "fc": None,
-            "attn": None
-        },
-        "load_into_mem": False,
-        "caption": "data/clotho_v2/dev/text.json",
-        "vocabulary": "data/clotho_v2/dev/vocab.pkl"
-    }
-    dataset = CaptionDataset(**args)
-    dataloader = torch.utils.data.DataLoader(
-        dataset,
-        batch_size=32,
-        collate_fn=collate_fn(["spec", "attn", "cap"], "cap"),
-        num_workers=4)
-    idx = 0
-    import time
-    start = time.time()
-    for batch in tqdm(dataloader, unit="batch"):
-        idx += 1
-        end = time.time()
-        print("batch ", idx, "{:.3f} seconds".format(end - start))
-        start = end
-        pass
-
+    pass
 

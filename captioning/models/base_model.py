@@ -8,15 +8,23 @@ import torch.nn as nn
 from captioning.models.utils import mean_with_lens, repeat_tensor
 
 
-class CaptionModel(nn.Module):
-    """
-    Encoder-decoder captioning model.
-    """
-
+class CaptionMetaMixin:
     pad_idx = 0
     start_idx = 1
     end_idx = 2
     max_length = 20
+
+    @classmethod
+    def set_index(cls, start_idx, end_idx, pad_idx):
+        cls.start_idx = start_idx
+        cls.end_idx = end_idx
+        cls.pad_idx = pad_idx
+
+
+class CaptionModel(nn.Module, CaptionMetaMixin):
+    """
+    Encoder-decoder captioning model.
+    """
 
     def __init__(self, encoder: nn.Module, decoder: nn.Module, **kwargs):
         super().__init__()
@@ -37,21 +45,15 @@ class CaptionModel(nn.Module):
             f"{self.decoder.__class__.__name__} is incompatible with " \
             f"{self.__class__.__name__}, please use decoder in {compatible_decoders} "
 
-    @classmethod
-    def set_index(cls, start_idx, end_idx):
-        cls.start_idx = start_idx
-        cls.end_idx = end_idx
-
     def forward(self, input_dict: Dict):
         """
         input_dict: {
             (required)
             mode: train/inference,
-            spec,
-            spec_len,
-            fc,
-            attn,
-            attn_len,
+            [spec, spec_len],
+            [fc],
+            [attn, attn_len],
+            [wav, wav_len],
             [sample_method: greedy],
             [temp: 1.0] (in case of no teacher forcing)
 
@@ -68,9 +70,11 @@ class CaptionModel(nn.Module):
             n_best (optional, sample_method=beam),
         }
         """
-        # encoder_input_keys = ["spec", "spec_len", "fc", "attn", "attn_len"]
-        # encoder_input = { key: input_dict[key] for key in encoder_input_keys }
         encoder_output_dict = self.encoder(input_dict)
+        output = self.forward_decoder(input_dict, encoder_output_dict)
+        return output
+
+    def forward_decoder(self, input_dict: Dict, encoder_output_dict: Dict):
         if input_dict["mode"] == "train":
             forward_dict = {
                 "mode": "train", "sample_method": "greedy", "temp": 1.0
@@ -102,7 +106,7 @@ class CaptionModel(nn.Module):
             output = self.inference_forward(forward_dict)
         else:
             raise Exception("mode should be either 'train' or 'inference'")
-
+        output.update(encoder_output_dict)
         return output
 
     def prepare_output(self, input_dict):
@@ -470,7 +474,7 @@ class CaptionModel(nn.Module):
         pass
 
 
-class CaptionSequenceModel(nn.Module):
+class CaptionSequenceModel(nn.Module, CaptionMetaMixin):
 
     def __init__(self, model, seq_output_size):
         super().__init__()
