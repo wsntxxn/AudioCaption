@@ -5,7 +5,7 @@ import torch.nn as nn
 
 from captioning.models.base_model import CaptionModel
 from captioning.models.utils import repeat_tensor
-import captioning.models.decoder
+import captioning.models.transformer_decoder
 
 
 class TransformerModel(CaptionModel):
@@ -13,7 +13,7 @@ class TransformerModel(CaptionModel):
     def __init__(self, encoder: nn.Module, decoder: nn.Module, **kwargs):
         if not hasattr(self, "compatible_decoders"):
             self.compatible_decoders = (
-                captioning.models.decoder.TransformerDecoder,
+                captioning.models.transformer_decoder.TransformerDecoder,
             )
         super().__init__(encoder, decoder, **kwargs)
 
@@ -91,7 +91,7 @@ class M2TransformerModel(CaptionModel):
     def __init__(self, encoder: nn.Module, decoder: nn.Module, **kwargs):
         if not hasattr(self, "compatible_decoders"):
             self.compatible_decoders = (
-                captioning.models.decoder.M2TransformerDecoder,
+                captioning.models.transformer_decoder.M2TransformerDecoder,
             )
         super().__init__(encoder, decoder, **kwargs)
         self.check_encoder_compatibility()
@@ -183,7 +183,7 @@ class EventCondTransformerModel(TransformerModel):
     def __init__(self, encoder: nn.Module, decoder: nn.Module, **kwargs):
         if not hasattr(self, "compatible_decoders"):
             self.compatible_decoders = (
-                captioning.models.decoder.EventTransformerDecoder,
+                captioning.models.transformer_decoder.EventTransformerDecoder,
             )
         super().__init__(encoder, decoder, **kwargs)
         self.label_encoder = EventEncoder(decoder.emb_dim, 527)
@@ -225,7 +225,7 @@ class KeywordCondTransformerModel(TransformerModel):
     def __init__(self, encoder: nn.Module, decoder: nn.Module, **kwargs):
         if not hasattr(self, "compatible_decoders"):
             self.compatible_decoders = (
-                captioning.models.decoder.KeywordProbTransformerDecoder,
+                captioning.models.transformer_decoder.KeywordProbTransformerDecoder,
             )
         super().__init__(encoder, decoder, **kwargs)
         self.train_forward_keys += ["keyword"]

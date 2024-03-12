@@ -6,56 +6,28 @@ import json
 import fire
 from tqdm import tqdm, trange
 import librosa
+import torchaudio
 import numpy as np
 import pandas as pd
 import torch
 import kaldiio
 import h5py
 
-import captioning.models
-import captioning.models.encoder
-import captioning.models.decoder
 import captioning.utils.train_util as train_util
 
 
-def print_pass(*args, **kwargs):
-    pass
-
-
-def load_model(config, checkpoint):
-    ckpt = torch.load(checkpoint, "cpu")
-    encoder_cfg = config["model"]["encoder"]
-    encoder = train_util.init_obj(
-        captioning.models.encoder,
-        encoder_cfg
-    )
-    if "pretrained" in encoder_cfg:
-        pretrained = encoder_cfg["pretrained"]
-        train_util.load_pretrained_model(encoder,
-                                         pretrained,
-                                         print_pass)
-    decoder_cfg = config["model"]["decoder"]
-    if "vocab_size" not in decoder_cfg["args"]:
-        decoder_cfg["args"]["vocab_size"] = len(ckpt["vocabulary"])
-    decoder = train_util.init_obj(
-        captioning.models.decoder,
-        decoder_cfg
-    )
-    if "word_embedding" in decoder_cfg:
-        decoder.load_word_embedding(**decoder_cfg["word_embedding"])
-    if "pretrained" in decoder_cfg:
-        pretrained = decoder_cfg["pretrained"]
-        train_util.load_pretrained_model(decoder,
-                                         pretrained,
-                                         sys.stdout.write)
-    model = train_util.init_obj(captioning.models, config["model"],
-        encoder=encoder, decoder=decoder)
-    train_util.load_pretrained_model(model, ckpt, print_pass)
+def load_model(cfg, ckpt_path, device):
+    model = train_util.init_model_from_config(cfg["model"])
+    ckpt = torch.load(ckpt_path, "cpu")
+    train_util.load_pretrained_model(model, ckpt)
     model.eval()
-    return {
-        "model": model,
-        "vocabulary": ckpt["vocabulary"]
-    }
+    model = model.to(device)
+    tokenizer = train_util.init_obj_from_dict(cfg["data"]["train"][
+        "collate_fn"]["tokenizer"])
+    if not tokenizer.loaded:
+        tokenizer.load_state_dict(ckpt["tokenizer"])
+    model.set_index(tokenizer.bos, tokenizer.eos, tokenizer.pad)
+    return model, tokenizer
 
 
 def load_audio(specifier: str, target_sr: int):
@@ -70,9 +42,8 @@ def load_audio(specifier: str, target_sr: int):
         y, sr = librosa.core.load(specifier, sr=None)
     if y.shape[0] == 0:
         return None
-    y = librosa.core.resample(y, orig_sr=sr, target_sr=target_sr)
-
-    # y = np.array(np.array(y, dtype=np.float16), dtype=np.float32)
+    y = torch.as_tensor(y)
+    y = torchaudio.functional.resample(y, orig_freq=sr, new_freq=target_sr)
     return y
 
 
@@ -98,13 +69,15 @@ class InferenceDataset(torch.utils.data.Dataset):
         self.cache = {}
         self.original_sr = original_sr
         self.target_sr = target_sr
+        if original_sr is not None:
+            self.resampler = torchaudio.transforms.Resample(original_sr, target_sr)
 
     def __getitem__(self, idx):
         aid = self.aids[idx]
         if self.source == "hdf5":
             waveform = read_from_h5(aid, self.aid_to_fname, self.cache)
-            waveform = np.array(waveform, dtype=np.float32)
-            waveform = librosa.core.resample(waveform, orig_sr=self.original_sr, target_sr=self.target_sr)
+            waveform = torch.as_tensor(waveform)
+            waveform = self.resampler(waveform)
         elif self.source == "wav":
             waveform = load_audio(self.aid_to_fname[aid], self.target_sr)
         return aid, waveform
@@ -146,19 +119,6 @@ class WavPadCollate:
         }
 
 
-def decode_caption(word_ids, vocabulary):
-    candidate = []
-    for word_id in word_ids:
-        word = vocabulary[word_id]
-        if word == "<end>":
-            break
-        elif word == "<start>":
-            continue
-        candidate.append(word)
-    candidate = " ".join(candidate)
-    return candidate
-
-
 def inference(input,
               output,
               checkpoint,
@@ -171,13 +131,10 @@ def inference(input,
     device = "cuda" if torch.cuda.is_available() else "cpu"
     device = torch.device(device)
 
-    experiment_path = Path(checkpoint).parent
+    exp_dir = Path(checkpoint).parent
 
-    config = train_util.parse_config_or_kwargs(experiment_path / "config.yaml")
-    resumed = load_model(config, checkpoint)
-    model = resumed["model"]
-    vocabulary = resumed["vocabulary"]
-    model = model.to(device)
+    cfg = train_util.parse_config_or_kwargs(exp_dir / "config.yaml")
+    model, tokenizer = load_model(cfg, checkpoint, device)
 
     if Path(input).suffix == ".csv":
         wav_df = pd.read_csv(input, sep="\t")
@@ -217,8 +174,7 @@ def inference(input,
             if input_dict["sample_method"] == "beam":
                 input_dict["beam_size"] = sampling_kwargs.get("beam_size", 3)
             output_dict = model(input_dict)
-            caption_batch = [decode_caption(seq, vocabulary) for seq in \
-                output_dict["seq"].cpu().numpy()]
+            caption_batch = tokenizer.decode(output_dict["seq"].cpu().numpy())
             captions.extend(caption_batch)
             audio_ids.extend(batch["aid"])
             pbar.update()
