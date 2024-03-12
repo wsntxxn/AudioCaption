@@ -4,7 +4,7 @@ import torch
 from captioning.models.base_model import CaptionModel
 from captioning.models.style_model import StyleCaptionModel
 from captioning.models.utils import repeat_tensor
-import captioning.models.decoder
+import captioning.models.rnn_decoder
 
 
 class Seq2SeqAttnModel(CaptionModel):
@@ -12,9 +12,9 @@ class Seq2SeqAttnModel(CaptionModel):
     def __init__(self, encoder, decoder, **kwargs):
         if not hasattr(self, "compatible_decoders"):
             self.compatible_decoders = (
-                captioning.models.decoder.BahAttnDecoder,
-                captioning.models.decoder.BahAttnDecoder2,
-                captioning.models.decoder.BahAttnDecoder3,
+                captioning.models.rnn_decoder.BahAttnDecoder,
+                captioning.models.rnn_decoder.BahAttnCatFcDecoder,
+                captioning.models.rnn_decoder.BahAttnAddFcDecoder,
             )
         super().__init__(encoder, decoder, **kwargs)
 
@@ -193,8 +193,8 @@ class ConditionalSeq2SeqAttnModel(Seq2SeqAttnModel):
     def __init__(self, encoder, decoder, **kwargs):
         if not hasattr(self, "compatible_decoders"):
             self.compatible_decoders = (
-                captioning.models.decoder.ConditionalBahAttnDecoder,
-                captioning.models.decoder.SpecificityBahAttnDecoder
+                captioning.models.rnn_decoder.ConditionalBahAttnDecoder,
+                captioning.models.rnn_decoder.SpecificityBahAttnDecoder
             )
         super().__init__(encoder, decoder, **kwargs)
         self.train_forward_keys.append("condition")

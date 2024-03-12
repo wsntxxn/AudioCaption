@@ -17,13 +17,14 @@ def process(file_name, audioset_df, output_path, audio_link_path):
     yid_to_filename = dict(zip(audioset_df["youtube_id"], audioset_df["file_name"]))
     with tqdm(total=df.shape[0]) as pbar:
         for _, row in df.iterrows():
-            audio_id = row["youtube_id"]
-            if audio_id not in yid_to_filename:
+            youtube_id = row["youtube_id"]
+            audio_id = "Y" + youtube_id + ".wav"
+            if youtube_id not in yid_to_filename:
                 pbar.update()
                 continue
             if audio_id not in data:
-                real_path = yid_to_filename[audio_id]
-                audio_id_to_cur_cap_id[audio_id] = 0
+                real_path = yid_to_filename[youtube_id]
+                audio_id_to_cur_cap_id[youtube_id] = 0
                 link_path = audio_link_path / Path(real_path).name
                 link_path.symlink_to(real_path)
                 data[audio_id] = {
@@ -35,11 +36,11 @@ def process(file_name, audioset_df, output_path, audio_link_path):
                 })
             if "captions" not in data[audio_id]:
                 data[audio_id]["captions"] = []
-            audio_id_to_cur_cap_id[audio_id] += 1
+            audio_id_to_cur_cap_id[youtube_id] += 1
             data[audio_id]["captions"].append({
                 "caption": row["caption"],
                 "audiocap_id": row["audiocap_id"],
-                "cap_id": str(audio_id_to_cur_cap_id[audio_id])
+                "cap_id": str(audio_id_to_cur_cap_id[youtube_id])
             })
             pbar.update()
     pd.DataFrame(wav_csv_df).to_csv(output_path / "wav.csv", sep="\t", index=False)
@@ -49,7 +50,7 @@ def process(file_name, audioset_df, output_path, audio_link_path):
         item = {"audio_id": audio_id}
         item.update(captions)
         data["audios"].append(item)
-    json.dump(data, open(output_path / "text.json", "w"), indent=4)
+    json.dump(data, open(output_path / "text.json", "w"), indent=2)
 
 
 if __name__ == "__main__":

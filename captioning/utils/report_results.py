@@ -3,15 +3,16 @@ import argparse
 import numpy as np
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--input", help="input filename", type=str, nargs="+")
+parser.add_argument("--exp_dir", help="experiment path", type=str, required=True)
+parser.add_argument("--fname", help="result filename", type=str, required=True)
 parser.add_argument("--output", help="output result file", default=None)
 
 args = parser.parse_args()
 
 
 scores = {}
-for path in args.input:
-    with open(path, "r") as reader:
+for path in Path(args.exp_dir).iterdir():
+    with open(path / "results" / args.fname, "r") as reader:
         for line in reader.readlines():
             metric, score = line.strip().split(": ")
             score = float(score)

@@ -31,6 +31,8 @@ def generate_length_mask(lens, max_length=None):
     N = lens.size(0)
     if max_length is None:
         max_length = max(lens)
+        if isinstance(max_length, torch.Tensor):
+            max_length = max_length.item()
     idxs = torch.arange(max_length).repeat(N).view(N, max_length)
     idxs = idxs.to(lens.device)
     mask = (idxs < lens.view(-1, 1))
@@ -66,7 +68,12 @@ def max_with_lens(features, lens):
     lens: [N,]
     """
     lens = torch.as_tensor(lens)
-    mask = generate_length_mask(lens).to(features.device) # [N, T]
+    if max(lens) != features.size(1):
+        max_length = features.size(1)
+        mask = generate_length_mask(lens, max_length)
+    else:
+        mask = generate_length_mask(lens)
+    mask = mask.to(features.device) # [N, T]
 
     feature_max = features.clone()
     feature_max[~mask] = float("-inf")

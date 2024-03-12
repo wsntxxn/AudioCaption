@@ -1,3 +1,4 @@
+import sys
 import json
 import pickle
 import random
@@ -10,21 +11,15 @@ import fire
 import torch
 
 import captioning.utils.train_util as train_util
-import captioning.datasets as dataset_module
 
 
 class BaseRunner(object):
     """Main class to run experiments"""
-    def __init__(self, seed=1):
+    def __init__(self,):
         super(BaseRunner, self).__init__()
-        self.seed = seed
-        random.seed(seed)
-        np.random.seed(seed)
-        torch.manual_seed(seed)
         device = "cpu"
         if torch.cuda.is_available():
             device = "cuda"
-            torch.cuda.manual_seed_all(seed)
             # torch.use_deterministic_algorithms(True)
             torch.backends.cudnn.deterministic = True
             torch.backends.cudnn.benchmark = False
@@ -34,17 +29,11 @@ class BaseRunner(object):
         dataloaders, key2refses = {}, {}
         for split in ["train", "val"]:
             data_config = self.config["data"][split]
-            dataset_config = data_config["dataset"]
-            dataset = getattr(dataset_module, dataset_config["type"])(
-                **dataset_config["args"])
-            collate_config = data_config["collate_fn"]
-            collate_fn = getattr(dataset_module, collate_config["type"])(
-                **collate_config["args"])
+            dataset = train_util.init_obj_from_dict(data_config["dataset"])
+            collate_fn = train_util.init_obj_from_dict(data_config["collate_fn"])
             if "batch_sampler" in data_config:
-                bs_config = data_config["batch_sampler"]
-                batch_sampler = getattr(dataset_module, bs_config["type"])(
-                    dataset,
-                    **bs_config["args"])
+                batch_sampler = train_util.init_obj_from_dict(
+                    data_config["batch_sampler"], dataset=dataset)
             else:
                 batch_sampler = None
             dataloader = torch.utils.data.DataLoader(
@@ -71,23 +60,11 @@ class BaseRunner(object):
             "key2refs": key2refses
         }
 
-    def _get_model(self):
+    def _get_model(self, print_fn=sys.stdout.write):
         raise NotImplementedError
 
     def _forward(self, batch, training=False):
         raise NotImplementedError
-
-    def _decode_to_sentence(self, word_ids):
-        words = []
-        for word_id in word_ids:
-            word = self.vocabulary[word_id]
-            if word == "<end>":
-                break
-            elif word == "<start>":
-                continue
-            words.append(word)
-        sentence = " ".join(words)
-        return sentence
 
     def train(self, config, **kwargs):
         raise NotImplementedError
@@ -241,14 +218,50 @@ class BaseRunner(object):
                 output = self._forward(batch, training=False)
                 keys = batch["audio_id"]
                 seqs = output["seq"].cpu().numpy()
-                for (idx, seq) in enumerate(seqs):
-                    candidate = self._decode_to_sentence(seq)
-                    key2pred[keys[idx]] = [candidate,]
+                for (idx, seq) in enumerate(self.tokenizer.decode(seqs)):
+                    key2pred[keys[idx]] = [seq,]
                 pbar.update()
         return key2pred
 
+    def load_tokenizer(self):
+        cfg = self.config["data"]["train"]["collate_fn"]["tokenizer"]
+        tokenizer = train_util.init_obj_from_dict(cfg)
+        return tokenizer
+
+    def save_checkpoint(self, ckpt_path):
+        model_dict = self.model.state_dict()
+        ckpt = {
+            "model": { k: model_dict[k] for k in self.saving_keys },
+            "epoch": self.epoch,
+            "metric_monitor": self.metric_monitor.state_dict(),
+            "not_improve_cnt": self.not_improve_cnt,
+        }
+        if self.tokenizer.__class__.__name__ == "DictTokenizer":
+            ckpt["tokenizer"] = self.tokenizer.state_dict()
+        if self.include_optim_in_ckpt:
+            ckpt["optimizer"] = self.optimizer.state_dict()
+            ckpt["lr_scheduler"] = self.lr_scheduler.state_dict()
+        torch.save(ckpt, ckpt_path)
+
     def resume_checkpoint(self, finetune=False):
-        raise NotImplementedError
+        ckpt = torch.load(self.config["resume"], "cpu")
+        train_util.load_pretrained_model(self.model, ckpt)
+        if not hasattr(self, "tokenizer"):
+            self.tokenizer = self.load_tokenizer()
+            if not self.tokenizer.loaded:
+                self.tokenizer.load_state_dict(ckpt["tokenizer"])
+            self.model.set_index(self.tokenizer.bos, self.tokenizer.eos, self.tokenizer.pad)
+        if not finetune:
+            self.epoch = ckpt["statistics"]["epoch"]
+            self.metric_monitor.load_state_dict(ckpt["metric_monitor"])
+            self.not_improve_cnt = ckpt["not_improve_cnt"]
+            if self.optimizer.__class__.__name__ == "Adam":
+                for state in self.optimizer.state.values():
+                    for k, v in state.items():
+                        if isinstance(v, torch.Tensor):
+                            state[k] = v.to(self.device)
+            self.optimizer.load_state_dict(ckpt["optimizer"])
+            self.lr_scheduler.load_state_dict(ckpt["lr_scheduler"])
 
     def predict(self,
                 experiment_path: str,
@@ -268,11 +281,9 @@ class BaseRunner(object):
         self.model = self.model.to(self.device)
 
         dataset_config = eval_config["data"]["test"]["dataset"]
-        dataset = getattr(dataset_module, dataset_config["type"])(
-            **dataset_config["args"])
+        dataset = train_util.init_obj_from_dict(dataset_config)
         collate_config = eval_config["data"]["test"]["collate_fn"]
-        collate_fn = getattr(dataset_module, collate_config["type"])(
-            **collate_config["args"])
+        collate_fn = train_util.init_obj_from_dict(collate_config)
         dataloader = torch.utils.data.DataLoader(
             dataset=dataset, collate_fn=collate_fn,
             **eval_config["data"]["test"]["dataloader_args"])

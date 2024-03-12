@@ -1,26 +1,29 @@
-from typing import Dict
+from typing import Dict, List
 
 import numpy as np
 import torch
 import ignite.metrics as metrics
 from ignite.engine.engine import Engine
+import wandb
 
 from captioning.models.utils import generate_length_mask, mean_with_lens
 
 
 class CrossEntropyLoss(torch.nn.Module):
-    def __init__(self, reduction="mean"):
+    def __init__(self, reduction="mean", logit_name="logit", target_name="tgt"):
         super().__init__()
         self.loss_fn = torch.nn.CrossEntropyLoss(reduction="none")
         self.reduction = reduction
+        self.logit_name = logit_name
+        self.target_name = target_name
 
     def forward(self, output: Dict):
         # logit: [bs, max_len, c]
         # tgt: [bs, max_len]
         # tgt_len: [bs]
-        logit = output["logit"]
-        tgt = output["tgt"]
-        tgt_len = output["tgt_len"]
+        logit = output[self.logit_name]
+        tgt = output[self.target_name]
+        tgt_len = output[f"{self.target_name}_len"]
         c = logit.size(-1)
         loss = self.loss_fn(logit.reshape(-1, c), tgt.reshape(-1))
         loss = loss.reshape(*tgt.shape)
@@ -37,20 +40,23 @@ class CrossEntropyLoss(torch.nn.Module):
 
 
 class LabelSmoothingLoss(torch.nn.Module):
-    def __init__(self, smoothing=0.0, dim=-1, reduction="mean"):
+    def __init__(self, smoothing=0.0, dim=-1, reduction="mean", logit_name="logit",
+                 target_name="tgt"):
         super().__init__()
         self.confidence = 1.0 - smoothing
         self.smoothing = smoothing
         self.dim = dim
         self.reduction = reduction
+        self.logit_name = logit_name
+        self.target_name = target_name
 
     def forward(self, output: Dict):
         # logit: [bs, max_len, c]
         # tgt: [bs, max_len]
         # tgt_len: [bs]
-        logit = output["logit"]
-        tgt = output["tgt"]
-        tgt_len = output["tgt_len"]
+        logit = output[self.logit_name]
+        tgt = output[self.target_name]
+        tgt_len = output[f"{self.target_name}_len"]
         preds = logit.log_softmax(dim=self.dim)
         with torch.no_grad():
             # true_dist = pred.data.clone()
@@ -68,6 +74,33 @@ class LabelSmoothingLoss(torch.nn.Module):
         elif self.reduction == "sum":
             loss = loss.sum()
             return loss
+
+
+class MultipleLossSum(torch.nn.Module):
+
+    def __init__(self,
+                 names: List[str],
+                 weights: List[float],
+                 **loss_fns):
+        super().__init__()
+        self.names = names
+        self.weights = weights
+        for name, loss_fn in loss_fns.items():
+            self.add_module(name, loss_fn)
+
+    def forward(self, output: Dict):
+        verbose = output.get("verbose", True)
+        tot_loss = 0
+        for name, weight in zip(self.names, self.weights):
+            if name in output:
+                loss = output[name]
+            else:
+                loss = getattr(self, name)(output)
+            tot_loss += weight * loss
+            if self.training and verbose and wandb.run is not None:
+                wandb.log({f"train/{name}": loss.item()},
+                          step=output["step"])
+        return tot_loss
 
 
 class AugmentLossWrapper(torch.nn.Module):
@@ -105,13 +138,16 @@ def reparameterize_argmax(logit, dim=-1):
     y_hard = y_hard.view(*shape)
     return (y_hard - y).detach() + y
 
+
 def sample_gumbel(shape, eps=1e-20):
     U = torch.rand(shape)
     return -torch.log(-torch.log(U + eps) + eps)
 
+
 def gumbel_softmax_sample(logit, temperature):
     y = logit + sample_gumbel(logit.size()).to(logit.device)
     return torch.softmax(y / temperature, dim=-1)
+
 
 def gumbel_softmax(logit, temperature=1.0):
     """
