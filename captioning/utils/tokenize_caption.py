@@ -9,7 +9,8 @@ def tokenize_caption(input_json: str,
                      host_address: str = None,
                      character_level: bool = False,
                      zh: bool = False,
-                     output_json: str = None):
+                     output_json: str = None,
+                     indent: int = None):
     """Build vocabulary from csv file with a given threshold to drop all counts < threshold
 
     Args:
@@ -75,11 +76,11 @@ def tokenize_caption(input_json: str,
     if output_json:
         json.dump(
             { "audios": data }, open(output_json, "w"),
-            indent=4, ensure_ascii=not zh)
+            indent=indent, ensure_ascii=not zh)
     else:
         json.dump(
             { "audios": data }, open(input_json, "w"),
-            indent=4, ensure_ascii=not zh)
+            indent=indent, ensure_ascii=not zh)
 
 
 if __name__ == "__main__":

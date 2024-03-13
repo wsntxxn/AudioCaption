@@ -35,8 +35,12 @@ class Runner(BaseRunner):
         return dataloader
 
     def _update_aug_factor(self):
-        self.aug_discount = self.iteration / self.iterations * \
-            self.config["max_aug_discount"]
+        scheduler = self.config["aug_discount"]["scheduler"]
+        if scheduler == "linear":
+            self.aug_discount = self.iteration / self.iterations * \
+                self.config["max_aug_discount"]
+        elif scheduler == "constant":
+            self.aug_discount = self.config["aug_discount"]["max_discount"]
 
     def _train_epoch(self):
         loss_history = {"real": [], "aug": []}
