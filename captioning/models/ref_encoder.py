@@ -2,7 +2,7 @@ import torch
 import math
 import torch.nn as nn
 
-from captioning.models.utils import generate_length_mask, PositionalEncoding
+from captioning.utils.model_util import generate_length_mask, PositionalEncoding
 
 
 class TransformerEncoder(nn.Module):

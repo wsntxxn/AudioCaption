@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 
-from captioning.models.utils import generate_length_mask, mean_with_lens
+from captioning.utils.model_util import generate_length_mask, mean_with_lens
 
 
 class TokenLevelKdLoss(nn.Module):

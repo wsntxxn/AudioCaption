@@ -3,8 +3,8 @@ import random
 import torch
 import torch.nn as nn
 
-from captioning.models.base_model import CaptionModel
-from captioning.models.utils import repeat_tensor
+from captioning.models.base import CaptionModel
+from captioning.utils.model_util import repeat_tensor
 import captioning.models.transformer_decoder
 
 

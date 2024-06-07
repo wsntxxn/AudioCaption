@@ -4,8 +4,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from captioning.models.utils import compute_batch_score
-from captioning.models.base_model import CaptionMetaMixin
+from captioning.utils.model_util import compute_batch_score
+from captioning.models.base import CaptionMetaMixin
 
 
 class ScstWrapper(nn.Module, CaptionMetaMixin):

@@ -2,9 +2,9 @@ import random
 import torch
 import torch.nn as nn
 
-from captioning.models.base_model import CaptionModel
-from captioning.models.utils import repeat_tensor
-import captioning.models.decoder
+from captioning.models.base import CaptionModel
+from captioning.utils.model_util import repeat_tensor
+import captioning.models.rnn_decoder
 
 
 class FcModel(CaptionModel):
@@ -12,7 +12,7 @@ class FcModel(CaptionModel):
     def __init__(self, encoder: nn.Module, decoder: nn.Module, **kwargs):
         if not hasattr(self, "compatible_decoders"):
             self.compatible_decoders = (
-                captioning.models.decoder.RnnFcDecoder,
+                captioning.models.rnn_decoder.RnnFcDecoder
             )
         super().__init__(encoder, decoder, **kwargs)
 

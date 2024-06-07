@@ -214,10 +214,10 @@ def get_pruned_model(pretrained: bool = True,
 
     blocks_args, global_params = efficientnet_utils.get_model_params(
         'efficientnet-b2', {'include_top': False})
-    print("num blocks: ", len(blocks_args))
-    print("block args: ")
-    for block_arg in blocks_args:
-        print(block_arg)
+    # print("num blocks: ", len(blocks_args))
+    # print("block args: ")
+    # for block_arg in blocks_args:
+    #     print(block_arg)
     model = _EffiNet(blocks_args=blocks_args,
                      global_params=global_params,
                      prune_start_layer=prune_start_layer,
@@ -241,7 +241,7 @@ def get_pruned_model(pretrained: bool = True,
         state_dict = {}
         for key in ckpt["model"].keys():
             if key.startswith("model.encoder.backbone"):
-                state_dict[key[len("model.encoder.backbone."):]] = ckpt["model"][key]
+                state_dict[key[len("model.encoder.backbone.eff_net."):]] = ckpt["model"][key]
     elif isinstance(pretrained, bool):
         model_path = os.path.join(model_dir, "effb2.pt")
         if not os.path.exists(model_path):
@@ -292,7 +292,6 @@ def get_pruned_model(pretrained: bool = True,
     
     key_to_w_b_idx = {}
     model_dict = model.eff_net.state_dict()
-    
     for conv_key in tqdm(mod_dep_path):
         weight = state_dict[f"{conv_key}.weight"]
         ptr_n_filter = weight.size(0)
@@ -304,7 +303,7 @@ def get_pruned_model(pretrained: bool = True,
 
     pruned_state_dict = {}
     for conv_key, prev_conv_key in zip(mod_dep_path, [None] + mod_dep_path[:-1]):
-
+    
         for sub_key in ["weight", "bias"]: # adjust the conv layer
             cur_key = f"{conv_key}.{sub_key}"
 
@@ -324,6 +323,9 @@ def get_pruned_model(pretrained: bool = True,
                 conv_out_idx = key_to_w_b_idx[prev_conv_key]
             else:
                 conv_out_idx = key_to_w_b_idx[conv_key]
+            
+            # if conv_key == "_blocks.16._se_reduce":
+            #     print(len(conv_out_idx), len(conv_in_idx))
 
             if sub_key == "weight":
                 pruned_state_dict[cur_key] = state_dict[cur_key][

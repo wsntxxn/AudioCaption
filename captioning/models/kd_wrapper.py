@@ -6,8 +6,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import repeat
 
-from captioning.models.base_model import CaptionMetaMixin
-from captioning.models.utils import init
+from captioning.models.base import CaptionMetaMixin
+from captioning.utils.model_util import init
 
 
 class WmlEncoderKdWrapper(nn.Module, CaptionMetaMixin):

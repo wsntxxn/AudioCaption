@@ -1,9 +1,9 @@
 import random
 import torch
 
-from captioning.models.base_model import CaptionModel
+from captioning.models.base import CaptionModel
 from captioning.models.style_model import StyleCaptionModel
-from captioning.models.utils import repeat_tensor
+from captioning.utils.model_util  import repeat_tensor
 import captioning.models.rnn_decoder
 
 

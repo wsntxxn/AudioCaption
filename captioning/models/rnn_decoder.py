@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 
 from captioning.models import BaseDecoder
-from captioning.models.utils import init
+from captioning.utils.model_util import init
 
 
 class RnnDecoder(BaseDecoder):

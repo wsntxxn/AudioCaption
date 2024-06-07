@@ -9,10 +9,10 @@ import torch
 from torch.utils.tensorboard import SummaryWriter
 import wandb
 from tqdm import tqdm, trange
-
-import captioning.utils.train_util as train_util
-from captioning.pytorch_runners.base import BaseRunner
 from pycocoevalcap.cider.cider import Cider
+import captioning.utils.train_util as train_util
+
+from python_scripts.train_eval.base import BaseRunner
 
 
 class Runner(BaseRunner):
@@ -38,26 +38,24 @@ class Runner(BaseRunner):
             output = {}
             # teacher forward
             with torch.no_grad():
-                tchr_output = {}
                 if "token" in self.config["kd_type"]:
-                    text_input_dict = {
-                        "input_ids": batch["cap"],
-                        "attention_mask": batch["attention_mask"],
-                    }
-                    tchr_output = self.teacher(audio=batch["teacher_wav"],
-                                               text=text_input_dict,
-                                               return_status=True)
-                    output["tchr_logit"] = tchr_output["logits"]
+                    tchr_output = self.teacher(input_dict)
+                    output["tchr_logit"] = tchr_output["logit"]
+                    output["tchr_output"] = {"embedding": tchr_output["fc_emb"]}
                 if "seq" in self.config["kd_type"]:
                     if all([aid in self.aid_to_tchr_seq for aid in batch["audio_id"]]):
                         tchr_seq = [self.aid_to_tchr_seq[aid] for aid in batch["audio_id"]]
                     else:
-                        tchr_output = self.teacher.generate(
-                            samples=batch["teacher_wav"],
-                            num_beams=3
-                        )
                         tchr_seq = []
-                        for aid, seq in zip(batch["audio_id"], tchr_output["caption"]):
+                        for aid, teacher_sample in zip(batch["audio_id"], batch["wav"]):
+                            tmp_in_dict = input_dict.copy()
+                            tmp_in_dict["wav"] = teacher_sample.unsqueeze(0)
+                            tmp_in_dict["mode"] = "inference"
+                            tmp_in_dict["wav_len"] = torch.as_tensor([teacher_sample.size(0)])
+                            tmp_in_dict["specaug"] = False
+                            tmp_in_dict.update(self.config["inference_args"])
+                            seq = self.teacher(tmp_in_dict)["seq"][0].cpu().numpy()
+                            seq = self.tokenizer.decode([seq])[0]
                             self.aid_to_tchr_seq[aid] = seq
                             tchr_seq.append(seq)
                     tokenized_seq = self.tokenizer(tchr_seq)
@@ -71,10 +69,9 @@ class Runner(BaseRunner):
                     output["tchr_tgt_len"] = tokenized_seq["cap_len"] - 1
 
                 if "enc" in self.config["kd_type"]:
-                    if "encoder_output" in tchr_output:
-                        tchr_enc_output = tchr_output["encoder_output"]
-                    else:
-                        tchr_enc_output = self.teacher.forward_encoder(batch["teacher_wav"])
+                    if "embedding" not in output["tchr_output"]:
+                        tchr_output = self.teacher.encoder(input_dict)
+                        output["tchr_output"]["embedding"] = tchr_output["fc_emb"]
 
             if "seq" in self.config["kd_type"]:
                 input_dict.update(tokenized_seq)
@@ -83,81 +80,15 @@ class Runner(BaseRunner):
 
             input_dict.update(batch)
             if "enc" in self.config["kd_type"]:
-                input_dict["tchr_output"] = tchr_enc_output
-
+                input_dict["tchr_output"] = output["tchr_output"]
             stdnt_output = self.model(input_dict)
             output.update(stdnt_output)
-            
             output["tgt"] = batch["cap"][:, 1:]
             output["tgt_len"] = torch.as_tensor(batch["cap_len"] - 1)
         else:
             input_dict["specaug"] = False
             input_dict.update(self.config["inference_args"])
             output = self.model(input_dict)
-
-        return output
-
-    def _forward_unsup(self, batch): 
-        for k, v in batch.items():
-            if isinstance(v, torch.Tensor):
-                batch[k] = v.float().to(self.device)
-
-        # student forward
-        input_dict = { "mode": "train" }
-        input_dict.update(batch)
-        input_dict["ss_ratio"] = self.ss_ratio
-
-        if "specaug" in self.config:
-            input_dict["specaug"] = self.config["specaug"]
-        output = {}
-        # teacher forward
-        with torch.no_grad():
-            tchr_output = {}
-            if "token" in self.config["kd_type"]:
-                text_input_dict = {
-                    "input_ids": batch["cap"],
-                    "attention_mask": batch["attention_mask"],
-                }
-                tchr_output = self.teacher(audio=batch["teacher_wav"],
-                                           text=text_input_dict,
-                                           return_status=True)
-                output["tchr_logit"] = tchr_output["logits"]
-            if "seq" in self.config["kd_type"]:
-                tchr_output = self.teacher.generate(
-                    samples=batch["teacher_wav"],
-                    num_beams=3
-                )
-                tchr_seq = []
-                for aid, seq in zip(batch["audio_id"], tchr_output["caption"]):
-                    self.aid_to_tchr_seq[aid] = seq
-                    tchr_seq.append(seq)
-                tokenized_seq = self.tokenizer(tchr_seq)
-                for k, v in tokenized_seq.items():
-                    if isinstance(v, torch.Tensor):
-                        if k == "cap":
-                            tokenized_seq[k] = v.long().to(self.device)
-                        else:
-                            tokenized_seq[k] = v.float().to(self.device)
-                output["tchr_tgt"] = tokenized_seq["cap"][:, 1:]
-                output["tchr_tgt_len"] = tokenized_seq["cap_len"] - 1
-
-            if "enc" in self.config["kd_type"]:
-                if "encoder_output" in tchr_output:
-                    tchr_enc_output = tchr_output["encoder_output"]
-                else:
-                    tchr_enc_output = self.teacher.forward_encoder(batch["teacher_wav"])
-
-        if "seq" in self.config["kd_type"]:
-            input_dict.update(tokenized_seq)
-            tchr_output = self.model(input_dict)
-            output["tchr_cap_logit"] = tchr_output["logit"]
-
-        input_dict.update(batch)
-        if "enc" in self.config["kd_type"]:
-            input_dict["tchr_output"] = tchr_enc_output
-        input_dict["unsup"] = True
-        stdnt_output = self.model(input_dict)
-        output.update(stdnt_output)
 
         return output
 
@@ -195,18 +126,16 @@ class Runner(BaseRunner):
         return model
 
     def _get_teacher(self, print_fn=sys.stdout.write):
-        sys.path.append("/mnt/fast/nobackup/scratch4weeks/xx00336/workspace/wavcaps/captioning")
-        from models.bart_captioning import BartCaptionModel
-        checkpoint_path = self.config["teacher"]
-        ckpt = torch.load(checkpoint_path, "cpu")
-        model = BartCaptionModel(ckpt["config"])
-        model.load_state_dict(ckpt["model"])
+        model = train_util.init_model_from_config(self.config["teacher"], print_fn)
+        train_util.load_pretrained_model(model,
+                                         self.config["teacher"]["pretrained"],
+                                         print_fn)
         model.eval()
         return model
 
     
     def _train_epoch(self):
-        losses = []
+        total_loss, nsamples = 0, 0
         self.model.train()
 
         for iteration in trange(self.epoch_length, ascii=True, ncols=100,
@@ -246,25 +175,14 @@ class Runner(BaseRunner):
             #####################################################################
             self.optimizer.zero_grad()
             output = self._forward(batch, training=True)
-            output["verbose"] = False
             if self.rl_train:
                 loss = output["loss"]
             else:
                 output["step"] = self.iteration
                 loss = self.loss_fn(output)
 
-            try:
-                unsup_batch = next(self.unsup_iter)
-            except StopIteration:
-                self.unsup_iter = iter(self.unsup_dataloader)
-                unsup_batch = next(self.unsup_iter)
-            output = self._forward_unsup(unsup_batch)
-            output["verbose"] = False
-            unsup_loss = self.unsup_loss_fn(output)
-
-            if not torch.isnan(loss) and not torch.isnan(unsup_loss):
-                tot_loss = loss + unsup_loss
-                tot_loss.backward()
+            if not torch.isnan(loss):
+                loss.backward()
                 torch.nn.utils.clip_grad_norm_(
                     self.model.parameters(), self.max_grad_norm)
                 self.optimizer.step()
@@ -274,11 +192,12 @@ class Runner(BaseRunner):
                 #####################################################################
                 if wandb.run is not None:
                     wandb.log({"train/loss": loss.item()}, step=self.iteration)
-                    wandb.log({"train/unsup_loss": unsup_loss.item()}, step=self.iteration)
                 else:
                     self.tb_writer.add_scalar("loss/train", loss.item(), self.iteration)
-                    self.tb_writer.add_scalar("unsup_loss/train", unsup_loss.item(), self.iteration)
-                losses.append(tot_loss.item())
+                cap_len = batch["cap_len"]
+                nsample = sum(cap_len - 1)
+                total_loss += loss.item() * nsample
+                nsamples += nsample
             else:
                 # import pdb; pdb.set_trace()
                 pass
@@ -286,7 +205,7 @@ class Runner(BaseRunner):
             self.iteration += 1
 
         return {
-            "loss": sum(losses) / len(losses),
+            "loss": total_loss / nsamples
         }
 
     def _eval_epoch(self):
@@ -295,23 +214,6 @@ class Runner(BaseRunner):
         result = self._eval_prediction(self.val_key2refs, key2pred, [scorer])
         result = result[scorer.method()]
         return { "score": result }
-
-
-    def _get_dataloaders(self):
-        dataloaders = super()._get_dataloaders()
-        unsup_config = self.config["data"]["unsupervised"]
-        dataset = train_util.init_obj_from_dict(unsup_config["dataset"])
-        collate_fn = train_util.init_obj_from_dict(unsup_config["collate_fn"])
-        if "batch_sampler" in unsup_config:
-            batch_sampler = train_util.init_obj_from_dict(
-                unsup_config["batch_sampler"], dataset=dataset)
-        else:
-            batch_sampler = None
-        dataloader = torch.utils.data.DataLoader(
-            dataset=dataset, collate_fn=collate_fn,
-            batch_sampler=batch_sampler, **unsup_config["dataloader_args"])
-        dataloaders["dataloader"]["unsup"] = dataloader
-        return dataloaders
 
     
     def train(self, config, **kwargs):
@@ -346,7 +248,6 @@ class Runner(BaseRunner):
         self.val_dataloader = dataloaders["dataloader"]["val"]
         self.train_key2refs = dataloaders["key2refs"]["train"]
         self.val_key2refs = dataloaders["key2refs"]["val"]
-        self.unsup_dataloader = dataloaders["dataloader"]["unsup"]
         self.logger.info(f"the training dataset has "
             f"{len(self.train_dataloader.dataset)} samples")
         self.tokenizer = self.train_dataloader.collate_fn.tokenizer
@@ -388,7 +289,6 @@ class Runner(BaseRunner):
         self.optimizer = train_util.init_obj_from_dict(
             self.config["optimizer"], params=self.model.parameters())
         self.loss_fn = train_util.init_obj_from_dict(self.config["loss"])
-        self.unsup_loss_fn = train_util.init_obj_from_dict(self.config["unsup_loss"])
         train_util.pprint_dict(self.optimizer, self.logger.info,
                                formatter="pretty")
 
@@ -444,7 +344,6 @@ class Runner(BaseRunner):
         self.iteration = 1
 
         self.train_iter = iter(self.train_dataloader)
-        self.unsup_iter = iter(self.unsup_dataloader)
 
         self.not_improve_cnt = 0
 
@@ -535,7 +434,6 @@ class Runner(BaseRunner):
         if "teacher" in self.config:
             self.teacher = self._get_teacher(print).to(self.device)
         self.loss_fn = train_util.init_obj_from_dict(self.config["loss"])
-        self.unsup_loss_fn = train_util.init_obj_from_dict(self.config["unsup_loss"])
         self.__dict__.update(self.config["trainer"])
 
         self.ss_ratio = 1.0
@@ -544,13 +442,7 @@ class Runner(BaseRunner):
         batch = next(iter(self.train_dataloader))
         output = self._forward(batch, training=True)
         loss = self.loss_fn(output)
-
-        self.unsup_dataloader = dataloaders["dataloader"]["unsup"]
-        unsup_batch = next(iter(self.unsup_dataloader))
-        output = self._forward_unsup(unsup_batch)
-        unsup_loss = self.unsup_loss_fn(output)
-        tot_loss = loss + unsup_loss
-        tot_loss.backward()
+        loss.backward()
         print("forward and backward done")
 
 
