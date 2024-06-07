@@ -8,95 +8,94 @@ import fire
 import numpy as np
 import torch
 from torch.utils.tensorboard import SummaryWriter
-from tqdm import tqdm, trange
 import wandb
-
-import captioning.utils.train_util as train_util
-from captioning.pytorch_runners.base import BaseRunner
+from tqdm import tqdm, trange
 from pycocoevalcap.cider.cider import Cider
+import captioning.utils.train_util as train_util
+
+from python_scripts.train_eval.base import BaseRunner
 
 
 class Runner(BaseRunner):
 
+    def _get_dataloaders(self):
+        dataloaders = {}
+        for split in ["train", "val"]:
+            data_config = self.config["data"][split]
+            dataset = train_util.init_obj_from_dict(data_config["dataset"])
+            collate_fn = train_util.init_obj_from_dict(data_config["collate_fn"])
+            if "batch_sampler" in data_config:
+                batch_sampler = train_util.init_obj_from_dict(
+                    data_config["batch_sampler"], dataset=dataset)
+            else:
+                batch_sampler = None
+            dataloader = torch.utils.data.DataLoader(
+                dataset=dataset, collate_fn=collate_fn,
+                batch_sampler=batch_sampler, **data_config["dataloader_args"])
+            dataloaders[split] = dataloader
+
+        return dataloaders
+
+    def save_checkpoint(self, ckpt_path):
+        model_dict = self.model.state_dict()
+        ckpt = {
+            "model": { k: model_dict[k] for k in self.saving_keys },
+            "epoch": self.epoch,
+            "metric_monitor": self.metric_monitor.state_dict(),
+            "not_improve_cnt": self.not_improve_cnt,
+        }
+        if self.include_optim_in_ckpt:
+            ckpt["optimizer"] = self.optimizer.state_dict()
+            ckpt["lr_scheduler"] = self.lr_scheduler.state_dict()
+        torch.save(ckpt, ckpt_path)
+
     def _forward(self, batch, training=True):
         for k, v in batch.items():
             if isinstance(v, torch.Tensor):
-                if k == "cap":
-                    batch[k] = v.long().to(self.device)
-                else:
-                    batch[k] = v.float().to(self.device)
+                batch[k] = v.float().to(self.device)
 
-        input_dict = {
-            "mode": "train" if training else "inference",
-        }
-        input_dict.update(batch)
+        # student forward
+        input_dict = batch.copy()
 
         if training:
-            if self.rl_train:
-                rl_ref = {
-                    "key2refs": self.train_key2refs,
-                    "vocabulary": self.vocabulary,
-                    "scorer": Cider(),
-                }
-                input_dict.update(rl_ref)
-            input_dict["ss_ratio"] = self.ss_ratio
             if "specaug" in self.config:
                 input_dict["specaug"] = self.config["specaug"]
+
+            # teacher forward
+            with torch.no_grad():
+                tchr_enc_output = self.teacher(batch["teacher_wav"])
+
+            input_dict["tchr_output"] = tchr_enc_output
             output = self.model(input_dict)
-            output["tgt"] = batch["cap"][:, 1:]
-            output["tgt_len"] = torch.as_tensor(batch["cap_len"] - 1)
         else:
             input_dict["specaug"] = False
-            input_dict.update(self.config["inference_args"])
             output = self.model(input_dict)
 
         return output
 
-    def _update_ss_ratio(self):
-        if not self.config["scheduled_sampling"]["use"]:
-            return
-        ss_cfg = self.config["scheduled_sampling"]
-        total_iters = self.iterations
-        if ss_cfg["mode"] == "exponential":
-            self.ss_ratio *= 0.01 ** (1.0 / total_iters)
-        elif ss_cfg["mode"] == "linear":
-            self.ss_ratio -= (1.0 - ss_cfg["final_ratio"]) / total_iters
-        else:
-            raise Exception(f"mode {ss_cfg['mode']} not supported")
-
-    def _get_model(self, print_fn=sys.stdout.write):
-        model = train_util.init_model_from_config(self.config["model"], print_fn)
-        if model.__class__.__name__ == "ScstWrapper":
-            self.rl_train = True
-        else:
-            self.rl_train = False
-        if hasattr(self, "tokenizer"):
-            model.set_index(self.tokenizer.bos, self.tokenizer.eos, self.tokenizer.pad)
-        return model
+    def _get_teacher(self, print_fn=sys.stdout.write):
+        sys.path.append("/mnt/fast/nobackup/scratch4weeks/xx00336/workspace/wavcaps/captioning")
+        from models.bart_captioning import BartCaptionModel
+        checkpoint_path = self.config["teacher"]
+        ckpt = torch.load(checkpoint_path, "cpu")
+        model = BartCaptionModel(ckpt["config"])
+        model.load_state_dict(ckpt["model"])
+        model.eval()
+        return model.encoder
     
     def _train_epoch(self):
-        total_loss, nsamples = 0, 0
+        epoch_loss = []
         self.model.train()
+        self.loss_fn.train()
 
         for iteration in trange(self.epoch_length, ascii=True, ncols=100,
-                                desc=f"Epoch {self.epoch}/{self.epochs}"):
+                                desc=f"Epoch {self.epoch}/{self.epochs} (train)"):
 
             try:
                 batch = next(self.train_iter)
             except StopIteration:
                 self.train_iter = iter(self.train_dataloader)
                 batch = next(self.train_iter)
-
-            #####################################################################
-            # Update scheduled sampling ratio
-            #####################################################################
-            self._update_ss_ratio()
-            if wandb.run is not None:
-                wandb.log({"scheduled_sampling_prob": self.ss_ratio},
-                          step=self.iteration)
-            else:
-                self.tb_writer.add_scalar("scheduled_sampling_prob",
-                    self.ss_ratio, self.iteration)
 
             #####################################################################
             # Update learning rate
@@ -115,10 +114,8 @@ class Runner(BaseRunner):
             #####################################################################
             self.optimizer.zero_grad()
             output = self._forward(batch, training=True)
-            if self.rl_train:
-                loss = output["loss"]
-            else:
-                loss = self.loss_fn(output)
+            output["step"] = self.iteration
+            loss = self.loss_fn(output)
 
             if not torch.isnan(loss):
                 loss.backward()
@@ -133,10 +130,7 @@ class Runner(BaseRunner):
                     wandb.log({"train/loss": loss.item()}, step=self.iteration)
                 else:
                     self.tb_writer.add_scalar("loss/train", loss.item(), self.iteration)
-                cap_len = batch["cap_len"]
-                nsample = sum(cap_len - 1)
-                total_loss += loss.item() * nsample
-                nsamples += nsample
+                epoch_loss.append(loss.item())
             else:
                 # import pdb; pdb.set_trace()
                 pass
@@ -144,15 +138,23 @@ class Runner(BaseRunner):
             self.iteration += 1
 
         return {
-            "loss": total_loss / nsamples
+            "loss": np.mean(epoch_loss),
         }
 
     def _eval_epoch(self):
-        key2pred = self._inference(self.val_dataloader)
-        scorer = Cider()
-        result = self._eval_prediction(self.val_key2refs, key2pred, [scorer])
-        result = result[scorer.method()]
-        return { "score": result }
+        eval_loss = []
+        self.model.eval()
+        self.loss_fn.eval()
+
+        with torch.no_grad():
+            for batch in tqdm(self.val_dataloader, ascii=True, ncols=100,
+                              desc=f"Epoch {self.epoch}/{self.epochs} (val)"):
+
+                output = self._forward(batch, training=True)
+                loss = self.loss_fn(output)
+                eval_loss.append(loss.item())
+
+        return np.mean(eval_loss)
 
     
     def train(self, config, **kwargs):
@@ -167,7 +169,7 @@ class Runner(BaseRunner):
         #####################################################################
         # Create checkpoint directory
         #####################################################################
-        exp_dir = Path(self.config["experiment_path"]) / f"seed_{self.config['seed']}"
+        exp_dir = Path(self.config["experiment_path"])
         exp_dir.mkdir(parents=True, exist_ok=True)
         self.logger = train_util.init_logger(str(exp_dir / "train.log"))
         # print passed config parameters
@@ -183,13 +185,10 @@ class Runner(BaseRunner):
         # Create dataloaders
         #####################################################################
         dataloaders = self._get_dataloaders()
-        self.train_dataloader = dataloaders["dataloader"]["train"]
-        self.val_dataloader = dataloaders["dataloader"]["val"]
-        self.train_key2refs = dataloaders["key2refs"]["train"]
-        self.val_key2refs = dataloaders["key2refs"]["val"]
+        self.train_dataloader = dataloaders["train"]
+        self.val_dataloader = dataloaders["val"]
         self.logger.info(f"the training dataset has "
             f"{len(self.train_dataloader.dataset)} samples")
-        self.tokenizer = self.train_dataloader.collate_fn.tokenizer
         
         self.__dict__.update(self.config["trainer"])
 
@@ -200,19 +199,20 @@ class Runner(BaseRunner):
         #####################################################################
         # Build model
         #####################################################################
-        model = self._get_model(self.logger.info)
-        self.model = model.to(self.device)
-        swa_model = train_util.AveragedModel(model)
+
+        self.teacher = self._get_teacher(self.logger.info).to(self.device)
+        self.model = train_util.init_model_from_config(
+            self.config["model"], self.logger.info).to(self.device)
         train_util.pprint_dict(self.model, self.logger.info, formatter="pretty")
         num_params = 0
         num_trainable_params = 0
         self.saving_keys = []
-        for name, param in model.named_parameters():
+        for name, param in self.model.named_parameters():
             num_params += param.numel()
             if param.requires_grad:
                 num_trainable_params += param.numel()
                 self.saving_keys.append(name)
-        for name, buffer in model.named_buffers():
+        for name, buffer in self.model.named_buffers():
             self.saving_keys.append(name)
 
         self.logger.info(f"{num_params} parameters in total")
@@ -256,12 +256,6 @@ class Runner(BaseRunner):
         self.lr_scheduler = train_util.init_obj_from_dict(
             self.config["lr_scheduler"], optimizer=self.optimizer)
 
-        if "inference_args" not in self.config:
-            self.config["inference_args"] = {
-                "sample_method": "beam",
-                "beam_size": 3
-            }
-
         #####################################################################
         # Dump configuration
         #####################################################################
@@ -271,15 +265,9 @@ class Runner(BaseRunner):
         # Start training
         #####################################################################
         
-        metric_mode = self.monitor_metric["mode"]
-        metric_name = self.monitor_metric["name"]
-        self.metric_monitor = train_util.MetricImprover(metric_mode)
-
-        self.ss_ratio = 1.0
+        self.metric_monitor = train_util.MetricImprover("min")
         self.iteration = 1
-
         self.train_iter = iter(self.train_dataloader)
-
         self.not_improve_cnt = 0
 
         if not hasattr(self, "early_stop"):
@@ -294,22 +282,14 @@ class Runner(BaseRunner):
         for _ in range(self.epochs):
             
             train_output = self._train_epoch()
-            val_result = self._eval_epoch()
-            val_score = val_result[metric_name]
-
-            #####################################################################
-            # Stochastic weight averaging
-            #####################################################################
-            if self.config["swa"]["use"]:
-                if self.epoch >= self.config["swa"]["start"]:
-                    swa_model.update_parameters(self.model)
+            val_loss = self._eval_epoch()
 
             #####################################################################
             # Update learning rate
             #####################################################################
             if self.lr_update_interval == "epoch":
                 if self.lr_scheduler.__class__.__name__ == "ReduceLROnPlateau":
-                    self.lr_scheduler.step(val_score)
+                    self.lr_scheduler.step(val_loss)
                 else:
                     self.lr_scheduler.step()
 
@@ -319,18 +299,18 @@ class Runner(BaseRunner):
             lr = self.optimizer.param_groups[0]["lr"]
             train_loss = train_output["loss"]
             output_str = f"epoch: {self.epoch}  train_loss: {train_loss:.2g}" \
-                         f"  val_score: {val_score:.2g}  lr: {lr:.2g}"
+                         f"  val_loss: {val_loss:.2g}  lr: {lr:.2g}"
             self.logger.info(output_str)
             if wandb.run is not None:
-                wandb.log({"val/score": val_score}, step=self.iteration)
+                wandb.log({"val/loss": val_loss}, step=self.iteration)
             else:
-                self.tb_writer.add_scalar("score/val", val_score, self.epoch)
+                self.tb_writer.add_scalar("loss/val", val_loss, self.epoch)
 
             #####################################################################
             # Save checkpoint
             #####################################################################
 
-            if self.metric_monitor(val_score):
+            if self.metric_monitor(val_loss):
                 self.not_improve_cnt = 0
                 self.save_checkpoint(exp_dir / "best.pth")
             else:
@@ -344,15 +324,6 @@ class Runner(BaseRunner):
             
             self.epoch += 1
 
-        #####################################################################
-        # Stochastic weight averaging
-        #####################################################################
-        if self.config["swa"]["use"]:
-            model_dict = swa_model.module.state_dict()
-            saved_dict = {"model": { k: model_dict[k] for k in self.saving_keys }}
-            if self.tokenizer.__class__.__name__ == "DictTokenizer":
-                saved_dict["tokenizer"] = self.tokenizer.state_dict()
-            torch.save(saved_dict, exp_dir / "swa.pth")
 
         if wandb.run is not None:
             wandb.finish()
@@ -363,18 +334,20 @@ class Runner(BaseRunner):
     def debug(self, config, **kwargs):
         self.config = train_util.parse_config_or_kwargs(config)
         dataloaders = self._get_dataloaders()
-        self.train_dataloader = dataloaders["dataloader"]["train"]
-        self.tokenizer = self.train_dataloader.collate_fn.tokenizer
-        self.model = self._get_model(print).to(self.device)
+        self.train_dataloader = dataloaders["train"]
+        self.model = train_util.init_model_from_config(self.config["model"],
+                                                       print).to(self.device)
+        self.teacher = self._get_teacher(print).to(self.device)
         self.loss_fn = train_util.init_obj_from_dict(self.config["loss"])
         self.__dict__.update(self.config["trainer"])
 
-        self.ss_ratio = 1.0
         self.iteration = 1
-        batch = next(iter(self.train_dataloader))
-        output = self._forward(batch, training=True)
-        loss = self.loss_fn(output)
-        loss.backward()
+        train_iter = iter(self.train_dataloader)
+        for _ in range(10):
+            batch = next(train_iter)
+            output = self._forward(batch, training=True)
+            loss = self.loss_fn(output)
+            loss.backward()
         print("forward and backward done")
 
 

@@ -82,6 +82,11 @@ def cs_interspeech(Z):
         if index_imp not in red_list:
             imp_list.append(index_imp)
             red_list.append(index_red)
+    
+    if len(imp_list) < d:
+        for i in range(d):
+            if i not in imp_list:
+                imp_list.append(i)
 
     return imp_list
 

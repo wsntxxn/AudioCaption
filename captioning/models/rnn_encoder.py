@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 
 from captioning.models import BaseEncoder, embedding_pooling
-from captioning.models.utils import init, pack_wrapper
+from captioning.utils.model_util import init, pack_wrapper
 
 
 class RnnEncoder(BaseEncoder):

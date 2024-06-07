@@ -2,7 +2,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from captioning.models.utils import max_with_lens, mean_with_lens
+from captioning.utils.model_util import max_with_lens, mean_with_lens
 
 
 def embedding_pooling(x, lens, pooling="mean"):

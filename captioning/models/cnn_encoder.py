@@ -10,7 +10,7 @@ from torchaudio import transforms
 import torchvision
 from torchlibrosa.augmentation import SpecAugmentation
 
-from captioning.models.utils import mean_with_lens, max_with_lens
+from captioning.utils.model_util import mean_with_lens, max_with_lens
 from captioning.utils.train_util import merge_load_state_dict
 
 
@@ -156,7 +156,7 @@ class Cnn6Encoder(nn.Module):
         init_bn(self.bn0)
         init_layer(self.fc1)
 
-    def load_pretrained(self, pretrained):
+    def load_pretrained(self, pretrained, output_fn):
         checkpoint = torch.load(pretrained, map_location="cpu")
 
         if "model" in checkpoint:
@@ -164,7 +164,7 @@ class Cnn6Encoder(nn.Module):
         else:
             raise Exception("Unkown checkpoint format")
 
-        loaded_keys = merge_load_state_dict(state_dict, self)
+        loaded_keys = merge_load_state_dict(state_dict, self, output_fn)
         if self.freeze:
             for name, param in self.named_parameters():
                 if name in loaded_keys:
@@ -264,7 +264,7 @@ class Cnn10Encoder(nn.Module):
         init_bn(self.bn0)
         init_layer(self.fc1)
 
-    def load_pretrained(self, pretrained):
+    def load_pretrained(self, pretrained, output_fn):
         checkpoint = torch.load(pretrained, map_location="cpu")
 
         if "model" in checkpoint:
@@ -272,7 +272,7 @@ class Cnn10Encoder(nn.Module):
         else:
             raise Exception("Unkown checkpoint format")
 
-        loaded_keys = merge_load_state_dict(state_dict, self)
+        loaded_keys = merge_load_state_dict(state_dict, self, output_fn)
         if self.freeze:
             for name, param in self.named_parameters():
                 if name in loaded_keys:
@@ -373,7 +373,7 @@ class Cnn14Encoder(nn.Module):
         init_bn(self.bn0)
         init_layer(self.fc1)
 
-    def load_pretrained(self, pretrained):
+    def load_pretrained(self, pretrained, output_fn):
         checkpoint = torch.load(pretrained, map_location="cpu")
 
         if "model" in checkpoint:
@@ -392,7 +392,7 @@ class Cnn14Encoder(nn.Module):
                         state_dict[model_key] = value
             else: # PANNs
                 state_dict = checkpoint["model"]
-        elif "state_dict" in checkpoint: # CLAP
+        elif "state_dict" in checkpoint: # BLAT
             state_dict = checkpoint["state_dict"]
             state_dict_keys = list(filter(
                 lambda x: "audio_encoder" in x, state_dict.keys()))
@@ -403,7 +403,7 @@ class Cnn14Encoder(nn.Module):
         else:
             raise Exception("Unkown checkpoint format")
 
-        loaded_keys = merge_load_state_dict(state_dict, self)
+        loaded_keys = merge_load_state_dict(state_dict, self, output_fn)
         if self.freeze:
             for name, param in self.named_parameters():
                 if name in loaded_keys:

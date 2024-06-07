@@ -14,7 +14,7 @@ from torchlibrosa.augmentation import SpecAugmentation
 from torch.nn.init import _calculate_fan_in_and_fan_out
 from itertools import repeat
 
-from captioning.models.utils import generate_length_mask
+from captioning.utils.model_util import generate_length_mask
 from captioning.models import BaseEncoder
 from captioning.utils.train_util import merge_load_state_dict
 

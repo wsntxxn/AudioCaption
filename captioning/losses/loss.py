@@ -6,7 +6,7 @@ import ignite.metrics as metrics
 from ignite.engine.engine import Engine
 import wandb
 
-from captioning.models.utils import generate_length_mask, mean_with_lens
+from captioning.utils.model_util import generate_length_mask, mean_with_lens
 
 
 class CrossEntropyLoss(torch.nn.Module):

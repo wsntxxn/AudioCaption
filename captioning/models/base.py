@@ -5,7 +5,7 @@ from typing import Dict
 import torch
 import torch.nn as nn
 
-from captioning.models.utils import mean_with_lens, repeat_tensor
+from captioning.utils.model_util import mean_with_lens, repeat_tensor
 
 
 class CaptionMetaMixin:

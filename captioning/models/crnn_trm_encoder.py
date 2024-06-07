@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from torchaudio import transforms
 
 from captioning.models import embedding_pooling, BaseEncoder
-from captioning.models.utils import init
+from captioning.utils.model_util import init
 
 
 class Block2D(nn.Module):
