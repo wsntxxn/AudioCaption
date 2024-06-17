@@ -2,8 +2,6 @@ from typing import Dict, List
 
 import numpy as np
 import torch
-import ignite.metrics as metrics
-from ignite.engine.engine import Engine
 import wandb
 
 from captioning.utils.model_util import generate_length_mask, mean_with_lens
@@ -219,26 +217,3 @@ class SpecificityLossWrapper(torch.nn.Module):
         condition_loss = self.condtion_fn(cond_pred, conditions)
         loss = word_loss + self.alpha * condition_loss
         return loss, word_loss, condition_loss
-
-
-class Loss(metrics.Loss):
-
-    def update(self, output: Dict) -> None:
-        # logit: [bs, max_len, c]
-        # target: [bs, max_len]
-        # tgt_len: [bs]
-        tgt_len = output["tgt_len"]
-        average_loss = self._loss_fn(output).detach()
-
-        if len(average_loss.shape) != 0:
-            raise ValueError("loss_fn did not return the average loss.")
-
-        n = torch.sum(tgt_len)
-        self._sum += average_loss.to(self._device) * n
-        self._num_examples += n
-
-    @torch.no_grad()
-    def iteration_completed(self, engine: Engine) -> None:
-        output = self._output_transform(engine.state.output)
-        self.update(output)
-

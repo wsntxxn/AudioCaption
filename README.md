@@ -21,34 +21,26 @@ We now support [Clotho](https://arxiv.org/abs/1910.09387) and [AudioCaps](https:
 
 # Training
 
-## Configuration
 The training configuration is written in a YAML file and passed to the training script. Examples are in `eg_configs`.
 
-## Contrastive Audio-text Pre-training
-We use contrastive learning for audio-text pre-training. The code is in [another repo](https://github.com/wsntxxn/DCASE2022T6_CLAP). We also provide [the pre-trained audio-text retrieval model](https://github.com/wsntxxn/AudioCaption/releases/download/v0.0.2/contrastive_pretrain_cnn14_bertm.pth) used for audio captioning training.
-
-## Start training
-For example, train a Cnn14_Rnn-Transformer model on Clohto:
+For example, train a model with Cnn14_Rnn encoder and Transformer decoder on Clotho:
 ```bash
-$ python captioning/pytorch_runners/run.py train eg_configs/clotho_v2/waveform/cnn14rnn_trm.yaml
+$ python python_scripts/train_eval/run.py train eg_configs/clotho_v2/waveform/cnn14rnn_trm.yaml
 ```
 
 # Evaluation
 Assume the experiment directory is `$EXP_PATH`. Evaluation under the configuration in `eg_configs/clotho_v2/waveform/test.yaml`:
 ```bash
-$ python captioning/pytorch_runners/run.py evaluate $EXP_PATH eg_configs/clotho_v2/waveform/test.yaml
+$ python python_scripts/train_eval/run.py evaluate $EXP_PATH eg_configs/clotho_v2/waveform/test.yaml
 ```
 
 # Inference
-Using the trained model (checkpoint in `$CKPT`) to inference on new audio files:
+Inference using the checkpoint `$CKPT`:
 ```bash
-$ python captioning/pytorch_runners/inference_waveform.py test.wav test.json $CKPT
-```
-
-## Ensemble
-Several models can be used to ensemble for inference, especially in challenges. We provide a sample configuration `eg_configs/dcase2022/ensemble/config.yaml`:
-```bash
-$ python captioning/pytorch_runners/ensemble.py evaluate eg_configs/dcase2022/ensemble/config.yaml
+$ python python_scripts/inference/inference.py \
+    --input input.wav 
+    --output output.json
+    --checkpoint $CKPT
 ```
 
 ## Using off-the-shelf models
@@ -61,16 +53,22 @@ AudioCaps:
 ```bash
 $ wget https://github.com/wsntxxn/AudioCaption/releases/download/v0.0.2/audiocaps_cntrstv_cnn14rnn_trm.zip
 $ unzip audiocaps_cntrstv_cnn14rnn_trm.zip
-$ python captioning/pytorch_runners/inference_waveform.py test.wav test.json audiocaps_cntrstv_cnn14rnn_trm/swa.pth
+$ python python_scripts/inference/inference.py \
+    --input input.wav \
+    --output output.json \
+    --checkpoint audiocaps_cntrstv_cnn14rnn_trm/swa.pth
 ```
 Clotho:
 ```bash
 $ wget https://github.com/wsntxxn/AudioCaption/releases/download/v0.0.2/clotho_cntrstv_cnn14rnn_trm.zip
 $ unzip clotho_cntrstv_cnn14rnn_trm.zip
-$ python captioning/pytorch_runners/inference_waveform.py test.wav test.json clotho_cntrstv_cnn14rnn_trm/swa.pth
+$ python python_scripts/inference/inference.py \
+    --input input.wav \
+    --output output.json \
+    --checkpoint clotho_cntrstv_cnn14rnn_trm/swa.pth
 ```
 
-If you find the models useful, please cite our technical report:
+If you find these models useful, please cite our technical report:
 
 ```
 @techreport{xu2022sjtu,

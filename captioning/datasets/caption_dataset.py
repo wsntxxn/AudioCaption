@@ -10,6 +10,7 @@ import numpy as np
 import torch
 import h5py
 from tqdm import tqdm
+import torchaudio
 from torch.utils.data.distributed import DistributedSampler
 
 from captioning.utils.train_util import load_dict_from_csv
@@ -18,19 +19,21 @@ import captioning.datasets.augment as augment
 
 def read_from_h5(key: str, key_to_h5: Dict, cache: Dict):
     hdf5_path = key_to_h5[key]
-    if hdf5_path not in cache:
-        cache[hdf5_path] = h5py.File(hdf5_path, "r")
-    try:
-        return cache[hdf5_path][key][()]
-    except KeyError: # audiocaps compatibility
-        if key.startswith("0902_50000_"):
-            key = key[11:]
-        elif key.startswith("0906_2000_"):
-            key = key[10:]
-        else:
+    if cache is not None:
+        if hdf5_path not in cache:
+            cache[hdf5_path] = h5py.File(hdf5_path, "r")
+        try:
+            return cache[hdf5_path][key][()]
+        except KeyError: # audiocaps compatibility
             key = "Y" + key + ".wav"
-        return cache[hdf5_path][key][()]
-
+            return cache[hdf5_path][key][()]
+    else:
+        with h5py.File(hdf5_path, "r") as reader:
+            try:
+                return reader[key][()]
+            except KeyError:
+                key = "Y" + key + ".wav"
+                return reader[key][()]
 
 def parse_transform(transforms: Dict):
     transform_fn = {}
@@ -52,9 +55,17 @@ class InferenceDataset(torch.utils.data.Dataset):
                  features: Dict,
                  transforms: Dict,
                  load_into_mem: bool = False,
+                 audio_duration: float = None,
+                 orig_sr: int = 32000,
+                 target_sr: int = 32000,
                  audio_ids: Union[List, str] = None):
         self.feat_types = features.keys()
         self.transforms = parse_transform(transforms)
+        self.audio_duration = audio_duration
+        if audio_duration is not None:
+            self.num_audio_samples = int(audio_duration * target_sr)
+        self.orig_sr = orig_sr
+        self.target_sr = target_sr
         self.aid_to_h5 = {}
         self.audio_ids = audio_ids
         if isinstance(self.audio_ids, str):
@@ -95,7 +106,27 @@ class InferenceDataset(torch.utils.data.Dataset):
         else:
             # ensure each process opens hdf5 after fork
             self.dataset_cache = {}
-
+    
+    def process_waveform(self, output):
+        if "wav" in output:
+            if self.orig_sr != self.target_sr:
+                wav = torch.as_tensor(output["wav"])
+                if wav.ndim == 1:
+                    wav = wav.unsqueeze(0)
+                output["wav"] = torchaudio.functional.resample(
+                    wav,
+                    self.orig_sr,
+                    self.target_sr,
+                )[0]
+            if self.audio_duration is not None:
+                if output["wav"].shape[0] > self.num_audio_samples:
+                    start = random.randint(0, output["wav"].shape[0] - self.num_audio_samples)
+                    output["wav"] = output["wav"][start: start + self.num_audio_samples]
+                elif output["wav"].shape[0] < self.num_audio_samples:
+                    output["wav"] = torch.cat([
+                        output["wav"],
+                        torch.zeros(self.num_audio_samples - output["wav"].shape[0])
+                    ])
     
     def load_audio(self, audio_id):
         output = {}
@@ -108,6 +139,9 @@ class InferenceDataset(torch.utils.data.Dataset):
                 output[feat_type] = read_from_h5(
                     audio_id, self.aid_to_h5[feat_type], self.dataset_cache)
                 output[feat_type] = np.array(output[feat_type], dtype=np.float32)
+
+        self.process_waveform(output)
+
         return output
 
 
@@ -143,44 +177,37 @@ class CaptionDataset(InferenceDataset):
                  features: Dict,
                  transforms: Dict,
                  caption: str,
-                 vocabulary: str,
                  load_into_mem: bool = False,
-                 max_audio_len: float = None,
-                 sample_rate: int = 32000,
-                 max_cap_len: int = 20):
+                 audio_duration: float = None,
+                 orig_sr: int = 32000,
+                 target_sr: int = 32000):
         self.caption_info = json.load(open(caption))["audios"]
-        self.vocabulary = pickle.load(open(vocabulary, "rb"))
-        self.bos = self.vocabulary('<start>')
-        self.eos = self.vocabulary('<end>')
-        self.max_cap_len = max_cap_len
-        self.max_audio_len = max_audio_len
-        if max_audio_len is not None:
-            self.num_audio_samples = int(max_audio_len * sample_rate)
-        self.key_to_tokens = {}
+        self.key_to_caps = {}
         self.keys = []
         audio_ids = []
         for item in self.caption_info:
             audio_id = item["audio_id"]
             audio_ids.append(audio_id)
-            self.key_to_tokens[audio_id] = {}
+            self.key_to_caps[audio_id] = {}
             for cap_idx, cap_item in enumerate(item["captions"]):
                 if "cap_id" in cap_item:
                     cap_id = str(cap_item["cap_id"])
                 else:
                     cap_id = str(cap_idx)
-                self.key_to_tokens[audio_id][cap_id] = cap_item["tokens"]
+                self.key_to_caps[audio_id][cap_id] = cap_item["tokens"]
                 self.keys.append((audio_id, cap_id))
-        super().__init__(features, transforms, load_into_mem=load_into_mem,
+        super().__init__(
+            features=features,
+            transforms=transforms,
+            load_into_mem=load_into_mem,
+            audio_duration=audio_duration,
+            orig_sr=orig_sr,
+            target_sr=target_sr,
             audio_ids=audio_ids)
 
     def __getitem__(self, index):
         audio_id, cap_id = self.keys[index]
         output = super().load_audio(audio_id)
-
-        if self.max_audio_len is not None:
-            waveform = output["wav"]
-            start = random.randint(0, waveform.shape[0] - self.num_audio_samples)
-            output["wav"] = output["wav"][start: start + self.num_audio_samples]
 
         for feat_type in self.feat_types:
             transform = self.transforms[feat_type]
@@ -188,13 +215,9 @@ class CaptionDataset(InferenceDataset):
                 for fn in transform:
                     output[feat_type] = fn(output[feat_type])
 
-        tokens = self.key_to_tokens[audio_id][cap_id]
+        caption = self.key_to_caps[audio_id][cap_id]
         # TODO temporary
-        # tokens = tokens.replace("the sound of", "")
-        tokens = tokens.split()
-        caption = [self.vocabulary(token) for token in tokens][:self.max_cap_len]
-        caption = [self.bos] + caption + [self.eos]
-        caption = np.array(caption)
+        # caption = caption.replace("the sound of", "")
         output["cap"] = caption
         output["audio_id"] = audio_id
         output["cap_id"] = cap_id
@@ -202,6 +225,166 @@ class CaptionDataset(InferenceDataset):
 
     def __len__(self):
         return len(self.keys)
+    
+
+class InferKdDataset(InferenceDataset):
+
+    def __init__(self,
+                 features: Dict,
+                 transforms: Dict,
+                 load_into_mem: bool = False,
+                 orig_sr: int = 32000,
+                 target_sr: int = 32000,
+                 teacher_target_sr: int = 32000,
+                 audio_duration: float = None,
+                 teacher_duration: float = None,
+                 audio_ids: Union[List, str] = None):
+        super().__init__(
+            features=features,
+            transforms=transforms,
+            load_into_mem=load_into_mem,
+            audio_duration=audio_duration,
+            orig_sr=orig_sr,
+            target_sr=target_sr,
+            audio_ids=audio_ids,
+        )
+        self.teacher_target_sr = teacher_target_sr
+        self.teacher_duration = teacher_duration
+        if teacher_duration is not None:
+            self.num_teacher_samples = int(teacher_duration * teacher_target_sr)
+    
+    def process_waveform(self, output):
+        if "wav" in output:
+            orig_wav = torch.as_tensor(output["wav"])
+            stu_wav = orig_wav
+            tea_wav = orig_wav.clone()
+
+            # process student
+            if self.orig_sr != self.target_sr:
+                if stu_wav.ndim == 1:
+                    stu_wav = stu_wav.unsqueeze(0)
+                stu_wav = torchaudio.functional.resample(
+                    stu_wav,
+                    self.orig_sr,
+                    self.target_sr,
+                )[0]
+            if self.audio_duration is not None:
+                if stu_wav.shape[0] > self.num_audio_samples:
+                    start = random.randint(0, stu_wav.shape[0] - self.num_audio_samples)
+                    stu_wav = stu_wav[start: start + self.num_audio_samples]
+                else:
+                    start = 0
+                    stu_wav = torch.cat([
+                        stu_wav,
+                        torch.zeros(self.num_audio_samples - stu_wav.shape[0])
+                    ])
+
+            # process teacher
+            if self.orig_sr != self.teacher_target_sr:
+                if tea_wav.ndim == 1:
+                    tea_wav = tea_wav.unsqueeze(0)
+                tea_wav = torchaudio.functional.resample(
+                    tea_wav,
+                    self.orig_sr,
+                    self.teacher_target_sr,
+                )[0]
+            if self.teacher_duration is not None:
+                if tea_wav.shape[0] > self.num_teacher_samples:
+                    tea_start = self.teacher_target_sr * start // self.target_sr
+                    tea_wav = tea_wav[tea_start: tea_start + self.num_teacher_samples]
+                else:
+                    tea_wav = torch.cat([
+                        tea_wav,
+                        torch.zeros(self.num_teacher_samples - tea_wav.shape[0])
+                    ])
+
+            output["wav"] = stu_wav
+            output["teacher_wav"] = tea_wav
+
+    def load_audio(self, audio_id):
+        output = {}
+        if self.load_into_mem:
+            for feat_type in self.feat_types:
+                output[feat_type] = self.aid_to_feat[feat_type][audio_id]
+                output[feat_type] = np.array(output[feat_type], dtype=np.float32)
+        else:
+            for feat_type in self.feat_types:
+                output[feat_type] = read_from_h5(
+                    audio_id, self.aid_to_h5[feat_type], None)
+                output[feat_type] = np.array(output[feat_type], dtype=np.float32)
+
+        self.process_waveform(output)
+
+        return output
+
+
+class CaptionKdDataset(InferKdDataset):
+    
+        def __init__(self,
+                     features: Dict,
+                     transforms: Dict,
+                     caption: str,
+                     load_into_mem: bool = False,
+                     audio_duration: float = None,
+                     orig_sr: int = 32000,
+                     target_sr: int = 32000,
+                     teacher_target_sr: int = 32000,
+                     teacher_duration: float = None):
+            # CaptionDataset.__init__(
+            #     self,
+            #     features=features,
+            #     transforms=transforms,
+            #     caption=caption,
+            #     load_into_mem=load_into_mem,
+            #     audio_duration=audio_duration,
+            #     orig_sr=orig_sr,
+            #     target_sr=target_sr,
+            # )
+            self.caption_info = json.load(open(caption))["audios"]
+            self.key_to_caps = {}
+            self.keys = []
+            audio_ids = []
+            for item in self.caption_info:
+                audio_id = item["audio_id"]
+                audio_ids.append(audio_id)
+                self.key_to_caps[audio_id] = {}
+                for cap_idx, cap_item in enumerate(item["captions"]):
+                    if "cap_id" in cap_item:
+                        cap_id = str(cap_item["cap_id"])
+                    else:
+                        cap_id = str(cap_idx)
+                    self.key_to_caps[audio_id][cap_id] = cap_item["tokens"]
+                    self.keys.append((audio_id, cap_id))
+            InferKdDataset.__init__(
+                self,
+                features=features,
+                transforms=transforms,
+                load_into_mem=load_into_mem,
+                orig_sr=orig_sr,
+                target_sr=target_sr,
+                teacher_target_sr=teacher_target_sr,
+                audio_duration=audio_duration,
+                teacher_duration=teacher_duration,
+                audio_ids=audio_ids
+            )
+    
+        def __getitem__(self, index):
+            audio_id, cap_id = self.keys[index]
+            output = super().load_audio(audio_id)
+    
+            for feat_type in self.feat_types:
+                transform = self.transforms[feat_type]
+                if transform is not None:
+                    for fn in transform:
+                        output[feat_type] = fn(output[feat_type])
+    
+            caption = self.key_to_caps[audio_id][cap_id]
+            # TODO temporary
+            # caption = caption.replace("the sound of", "")
+            output["cap"] = caption
+            output["audio_id"] = audio_id
+            output["cap_id"] = cap_id
+            return output
 
 
 class IterationBatchSampler(object):

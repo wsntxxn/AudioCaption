@@ -1,35 +1,41 @@
-outputpath: experiments/clotho_v2/train_val
-
 data:
     train:
         dataset:
-            type: CaptionDataset
+            type: captioning.datasets.caption_dataset.CaptionDataset
             args:
                 features:
-                    wav: data/clotho_v2/dev/waveform_32k.csv
+                    wav: data/clotho_v2/dev/waveform.csv
                 transforms:
                     wav: Null
                 caption: data/clotho_v2/dev/text.json
-                vocabulary: data/clotho_v2/dev/vocab.pkl
+                orig_sr: &orig_sr 44100
+                target_sr: &target_sr 32000
         collate_fn:
-            type: collate_fn
+            type: captioning.datasets.collate_func.TextCollate
             args:
                 pad_keys: [wav, cap]
                 sort_key: cap
+            tokenizer:
+                type: captioning.datasets.text_tokenizer.DictTokenizer
+                args:
+                    tokenizer_path: data/clotho_v2/dev/vocab.pkl
+                    max_length: 20
         dataloader_args:
             shuffle: True
             batch_size: 32
             num_workers: 4
     val:
         dataset:
-            type: InferenceDataset
+            type: captioning.datasets.caption_dataset.InferenceDataset
             args:
                 features:
-                    wav: data/clotho_v2/val/waveform_32k.csv
+                    wav: data/clotho_v2/dev/waveform.csv
                 transforms:
                     wav: Null
+                orig_sr: *orig_sr
+                target_sr: *target_sr
         collate_fn:
-            type: collate_fn
+            type: captioning.datasets.collate_func.VarLenPadCollate
             args:
                 pad_keys: [wav]
         caption: data/clotho_v2/val/text.json

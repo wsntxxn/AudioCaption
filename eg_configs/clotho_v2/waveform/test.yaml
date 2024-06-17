@@ -1,21 +1,23 @@
 data:
     test:
         dataset:
-            type: InferenceDataset
+            type: captioning.datasets.caption_dataset.InferenceDataset
             args:
                 features:
-                    wav: data/clotho_v2/eval/waveform_32k.csv
+                    wav: data/clotho_v2/eval/waveform.csv
                 transforms:
                     wav: Null
+                orig_sr: 32000
+                target_sr: 32000
         collate_fn:
-            type: collate_fn
+            type: captioning.datasets.collate_func.VarLenPadCollate
             args:
                 pad_keys: [wav]
         caption: data/clotho_v2/eval/text.json
         dataloader_args:
             shuffle: False
             batch_size: 1
-            num_workers: 2
+            num_workers: 4
 
 inference_args:
     sample_method: beam

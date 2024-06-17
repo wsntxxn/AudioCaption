@@ -24,12 +24,19 @@ def load_model(cfg,
     return model, tokenizer
 
 
-def infer(audio, device, model, tokenizer):
-    sr, wav = audio
+def infer(input_type, file, mic, device, model, tokenizer, target_sr):
+    if input_type == "file":
+        sr, wav = file
+    elif input_type == "mic":
+        sr, wav = mic
+    wav = torch.as_tensor(wav)
+    if wav.dtype == torch.short:
+        wav = wav / 2 ** 15
+    elif wav.dtype == torch.int:
+        wav = wav / 2 ** 31
     if wav.ndim > 1:
         wav = wav.mean(1)
-    wav = torch.as_tensor(wav) / 32768.0
-    wav = resample(wav, sr, 16000)
+    wav = resample(wav, sr, target_sr)
     wav_len = len(wav)
     wav = wav.float().unsqueeze(0).to(device)
     input_dict = {
@@ -46,6 +53,12 @@ def infer(audio, device, model, tokenizer):
         cap = tokenizer.decode(seq)[0]
     return cap
 
+def input_toggle(input_type):
+    if input_type == "file":
+        return gr.update(visible=True), gr.update(visible=False)
+    elif input_type == "mic":
+        return gr.update(visible=False), gr.update(visible=True)
+
 
 if __name__ == "__main__":
     
@@ -58,10 +71,38 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     exp_dir = Path(args.exp_dir)
     cfg = train_util.load_config(exp_dir / "config.yaml")
+    target_sr = cfg["data"]["train"]["dataset"]["args"]["target_sr"]
     model, tokenizer = load_model(cfg, exp_dir / "swa.pth", device)
 
-    interface = gr.Interface(fn=partial(infer, device=device, model=model, tokenizer=tokenizer),
-                             inputs="audio",
-                             outputs="text")
-    interface.launch(share=args.share)
+    with gr.Blocks() as demo:
+        with gr.Row():
+            with gr.Column():
+                radio = gr.Radio(
+                    ["file", "mic"],
+                    value="file",
+                    label="Select input type"
+                )
+                file = gr.Audio(label="Input", visible=True)
+                mic = gr.Microphone(label="Input", visible=False)
+                radio.change(fn=input_toggle, inputs=radio, outputs=[file, mic])
+                btn = gr.Button("Run", label="run")
+            with gr.Column():
+                output = gr.Textbox(label="Output")
+            btn.click(
+                fn=partial(infer,
+                           device=device,
+                           model=model,
+                           tokenizer=tokenizer,
+                           target_sr=target_sr),
+                inputs=[radio, file, mic,],
+                outputs=output
+            )
+        
+        demo.launch(share=args.share)
+
+    # interface = gr.Interface(fn=partial(infer, device=device, model=model, tokenizer=tokenizer,
+    #                                     target_sr=target_sr),
+    #                          inputs="audio",
+    #                          outputs="text")
+    # interface.launch(share=args.share)
 

@@ -142,3 +142,7 @@ sed/
 
 # Configuration
 configs/
+
+effb2_trm_demo/
+
+docker/
