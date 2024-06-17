@@ -17,7 +17,7 @@ from einops import rearrange, reduce
 from torch.hub import load_state_dict_from_url
 
 
-model_dir = "/mnt/fast/nobackup/scratch4weeks/xx00336/workspace/audio_caption_xnx/experiments/pretrained_models/eff_latent"
+model_dir = "/hpc_stor03/sjtu_home/xuenan.xu/workspace/audio_captioning/experiments/pretrained_encoder/"
 
 
 class _EffiNet(nn.Module):

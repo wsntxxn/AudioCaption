@@ -1,6 +1,7 @@
 # coding=utf-8
 #!/usr/bin/env python3
 import os
+import gc
 import sys
 from pathlib import Path
 
@@ -49,17 +50,18 @@ class Runner(BaseRunner):
                                                return_status=True)
                     output["tchr_logit"] = tchr_output["logits"]
                 if "seq" in self.config["kd_type"]:
-                    if all([aid in self.aid_to_tchr_seq for aid in batch["audio_id"]]):
-                        tchr_seq = [self.aid_to_tchr_seq[aid] for aid in batch["audio_id"]]
-                    else:
-                        tchr_output = self.teacher.generate(
-                            samples=batch["teacher_wav"],
-                            num_beams=3
-                        )
-                        tchr_seq = []
-                        for aid, seq in zip(batch["audio_id"], tchr_output["caption"]):
-                            self.aid_to_tchr_seq[aid] = seq
-                            tchr_seq.append(seq)
+                    # if all([aid in self.aid_to_tchr_seq for aid in batch["audio_id"]]):
+                    #     tchr_seq = [self.aid_to_tchr_seq[aid] for aid in batch["audio_id"]]
+                    # else:
+
+                    tchr_output = self.teacher.generate(
+                        samples=batch["teacher_wav"],
+                        num_beams=3
+                    )
+                    tchr_seq = []
+                    for aid, seq in zip(batch["audio_id"], tchr_output["caption"]):
+                        # self.aid_to_tchr_seq[aid] = seq
+                        tchr_seq.append(seq)
                     tokenized_seq = self.tokenizer(tchr_seq)
                     for k, v in tokenized_seq.items():
                         if isinstance(v, torch.Tensor):
@@ -129,7 +131,7 @@ class Runner(BaseRunner):
                 )
                 tchr_seq = []
                 for aid, seq in zip(batch["audio_id"], tchr_output["caption"]):
-                    self.aid_to_tchr_seq[aid] = seq
+                    # self.aid_to_tchr_seq[aid] = seq
                     tchr_seq.append(seq)
                 tokenized_seq = self.tokenizer(tchr_seq)
                 for k, v in tokenized_seq.items():
@@ -195,7 +197,7 @@ class Runner(BaseRunner):
         return model
 
     def _get_teacher(self, print_fn=sys.stdout.write):
-        sys.path.append("/mnt/fast/nobackup/scratch4weeks/xx00336/workspace/wavcaps/captioning")
+        sys.path.append(self.config["wavcaps_captioning_path"])
         from models.bart_captioning import BartCaptionModel
         checkpoint_path = self.config["teacher"]
         ckpt = torch.load(checkpoint_path, "cpu")
@@ -284,6 +286,7 @@ class Runner(BaseRunner):
                 pass
 
             self.iteration += 1
+            gc.collect()
 
         return {
             "loss": sum(losses) / len(losses),
@@ -363,7 +366,7 @@ class Runner(BaseRunner):
 
         if "teacher" in self.config:
             self.teacher = self._get_teacher(self.logger.info).to(self.device)
-        self.aid_to_tchr_seq = {}
+        # self.aid_to_tchr_seq = {}
 
         self.model = self._get_model(self.logger.info).to(self.device)
         swa_model = train_util.AveragedModel(self.model)
@@ -527,7 +530,7 @@ class Runner(BaseRunner):
 
 
     def debug(self, config, **kwargs):
-        self.config = train_util.parse_config_or_kwargs(config)
+        self.config = train_util.parse_config_or_kwargs(config, **kwargs)
         dataloaders = self._get_dataloaders()
         self.train_dataloader = dataloaders["dataloader"]["train"]
         self.tokenizer = self.train_dataloader.collate_fn.tokenizer
@@ -540,7 +543,7 @@ class Runner(BaseRunner):
 
         self.ss_ratio = 1.0
         self.iteration = 1
-        self.aid_to_tchr_seq = {}
+        # self.aid_to_tchr_seq = {}
         batch = next(iter(self.train_dataloader))
         output = self._forward(batch, training=True)
         loss = self.loss_fn(output)

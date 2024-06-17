@@ -134,7 +134,7 @@ class Runner(BaseRunner):
         return model
 
     def _get_teacher(self, print_fn=sys.stdout.write):
-        sys.path.append("/mnt/fast/nobackup/scratch4weeks/xx00336/workspace/wavcaps/captioning")
+        sys.path.append(self.config["wavcaps_captioning_path"])
         from models.bart_captioning import BartCaptionModel
         checkpoint_path = self.config["teacher"]
         ckpt = torch.load(checkpoint_path, "cpu")
@@ -272,8 +272,7 @@ class Runner(BaseRunner):
         # Build model
         #####################################################################
 
-        if "teacher" in self.config:
-            self.teacher = self._get_teacher(self.logger.info).to(self.device)
+        self.teacher = self._get_teacher(self.logger.info).to(self.device)
         self.aid_to_tchr_seq = {}
 
         self.model = self._get_model(self.logger.info).to(self.device)
@@ -441,8 +440,7 @@ class Runner(BaseRunner):
         self.train_dataloader = dataloaders["dataloader"]["train"]
         self.tokenizer = self.train_dataloader.collate_fn.tokenizer
         self.model = self._get_model(print).to(self.device)
-        if "teacher" in self.config:
-            self.teacher = self._get_teacher(print).to(self.device)
+        self.teacher = self._get_teacher(print).to(self.device)
         self.loss_fn = train_util.init_obj_from_dict(self.config["loss"])
         self.__dict__.update(self.config["trainer"])
 

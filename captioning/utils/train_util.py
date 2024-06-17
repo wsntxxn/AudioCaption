@@ -21,7 +21,6 @@ def load_dict_from_csv(csv, cols):
     output = dict(zip(df[cols[0]], df[cols[1]]))
     return output
 
-
 def pad_sequence(data, pad_value=0):
     if isinstance(data[0], (np.ndarray, torch.Tensor)):
         data = [torch.as_tensor(arr) for arr in data]
@@ -30,7 +29,6 @@ def pad_sequence(data, pad_value=0):
                                                  padding_value=pad_value)
     length = np.array([x.shape[0] for x in data])
     return padded_seq, length
-
 
 def init_logger(filename, level="INFO"):
     formatter = logging.Formatter(
@@ -47,12 +45,10 @@ def init_logger(filename, level="INFO"):
     # logger.addHandler(stdhandler)
     return logger
 
-
 def init_obj(module, config, **kwargs):
     obj_args = config["args"].copy()
     obj_args.update(kwargs)
     return getattr(module, config["type"])(**obj_args)
-
 
 def read_from_h5(key: str, key_to_h5: Dict, cache: Dict):
     hdf5_path = key_to_h5[key]
@@ -64,7 +60,6 @@ def read_from_h5(key: str, key_to_h5: Dict, cache: Dict):
         key = "Y" + key + ".wav"
         return cache[hdf5_path][key][()]
 
-
 def get_cls_from_str(string, reload=False):
     module_name, cls_name = string.rsplit(".", 1)
     if reload:
@@ -72,15 +67,18 @@ def get_cls_from_str(string, reload=False):
         importlib.reload(module_imp)
     return getattr(importlib.import_module(module_name, package=None), cls_name)
 
-
 def init_obj_from_dict(config, **kwargs):
     obj_args = config["args"].copy()
     obj_args.update(kwargs)
     for k in config:
         if k not in ["type", "args"] and isinstance(config[k], dict) and k not in kwargs:
             obj_args[k] = init_obj_from_dict(config[k])
-    return get_cls_from_str(config["type"])(**obj_args)
-
+    try:
+        obj = get_cls_from_str(config["type"])(**obj_args)
+        return obj
+    except Exception as e:
+        print(f"Initializing {config} failed, detailed error stack: ")
+        raise e
 
 def init_model_from_config(config, print_fn=sys.stdout.write):
     kwargs = {}
@@ -94,7 +92,6 @@ def init_model_from_config(config, print_fn=sys.stdout.write):
             kwargs[k] = sub_model
     model = init_obj_from_dict(config, **kwargs)
     return model
-
 
 def pprint_dict(in_dict, print_fn=sys.stdout.write, formatter='yaml'):
     """pprint_dict
@@ -111,7 +108,6 @@ def pprint_dict(in_dict, print_fn=sys.stdout.write, formatter='yaml'):
     for line in format_fn(in_dict).split('\n'):
         print_fn(line)
 
-
 def merge_a_into_b(a, b):
     # merge dict a into dict b. values in a will overwrite b.
     for k, v in a.items():
@@ -122,7 +118,6 @@ def merge_a_into_b(a, b):
             merge_a_into_b(v, b[k])
         else:
             b[k] = v
-
 
 def load_config(config_file):
     with open(config_file, "r") as reader:
@@ -140,7 +135,6 @@ def load_config(config_file):
         return base_config
     return config
 
-
 def parse_config_or_kwargs(config_file, **kwargs):
     toml_list = []
     for k, v in kwargs.items():
@@ -155,7 +149,6 @@ def parse_config_or_kwargs(config_file, **kwargs):
     yaml_config = load_config(config_file)
     merge_a_into_b(cmd_config, yaml_config)
     return yaml_config
-
 
 def store_yaml(config, config_file):
     with open(config_file, "w") as con_writer:
@@ -185,7 +178,6 @@ class MetricImprover:
     def load_state_dict(self, state_dict):
         self.__dict__.update(state_dict)
 
-
 def fix_batchnorm(model: torch.nn.Module):
     def inner(module):
         class_name = module.__class__.__name__
@@ -193,20 +185,21 @@ def fix_batchnorm(model: torch.nn.Module):
             module.eval()
     model.apply(inner)
 
-
 def merge_load_state_dict(state_dict,
                           model: torch.nn.Module,
                           output_fn: Callable = sys.stdout.write):
     model_dict = model.state_dict()
-    pretrained_dict = {
-        k: v for k, v in state_dict.items() if (k in model_dict) and (
-            model_dict[k].shape == v.shape)
-    }
-    output_fn(f"Loading pretrained keys {pretrained_dict.keys()}")
+    pretrained_dict = {}
+    mismatch_keys = []
+    for key, value in state_dict.items():
+        if key in model_dict and model_dict[key].shape == value.shape:
+            pretrained_dict[key] = value
+        else:
+            mismatch_keys.append(key)
+    output_fn(f"Loading pre-trained model, with mismatched keys {mismatch_keys}")
     model_dict.update(pretrained_dict)
     model.load_state_dict(model_dict, strict=True)
     return pretrained_dict.keys()
-
 
 def load_pretrained_model(model: torch.nn.Module,
                           pretrained: Union[str, Dict],
@@ -228,7 +221,6 @@ def load_pretrained_model(model: torch.nn.Module,
         state_dict = state_dict["model"]
     
     merge_load_state_dict(state_dict, model, output_fn)
-
 
 def set_seed(seed):
     random.seed(seed)

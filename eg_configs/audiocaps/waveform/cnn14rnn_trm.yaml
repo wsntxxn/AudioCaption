@@ -1,40 +1,51 @@
 inherit_from: ./train_data.yaml
 
-remark: cnn14rnn_trm
+experiment_path: experiments/audiocaps/cnn14rnn_trm/
+
+seed: 1
 
 model:
     encoder:
-        type: Cnn14RnnEncoder
+        type: captioning.models.crnn_trm_encoder.CrnnEncoder
         args:
-            sample_rate: 32000
-            pretrained: sed/audioset_tagging_cnn/pretrained_weights/Cnn14_mAP=0.431.pth
             freeze_cnn: True
             freeze_cnn_bn: True
-            bidirectional: True
-            hidden_size: 256
-            dropout: 0.5
-            num_layers: 3
+        cnn:
+            type: captioning.models.cnn_encoder.Cnn14Encoder
+            args:
+                sample_rate: 32000
+                pretrained: experiments/pretrained_encoder/Cnn14_mAP=0.431.pth
+        rnn:
+            type: captioning.models.rnn_encoder.RnnEncoder
+            args:
+                bidirectional: True
+                hidden_size: 256
+                dropout: 0.5
+                num_layers: 3
+                spec_dim: -1
+                fc_feat_dim: 2048
+                attn_feat_dim: 2048
     decoder:
-        type: TransformerDecoder
+        type: captioning.models.transformer_decoder.TransformerDecoder
         args:
             emb_dim: 256
             fc_emb_dim: 512
             attn_emb_dim: 512
             nlayers: 2
             dropout: 0.2
-    type: TransformerModel
+    type: captioning.models.transformer_model.TransformerModel
     args: {}
 
 specaug: False
 
 optimizer:
-    type: Adam
+    type: torch.optim.Adam
     args:
         lr: !!float 5e-4
         weight_decay: !!float 1e-6
 
 lr_scheduler:
-    type: ExponentialDecayScheduler
+    type: captioning.utils.lr_scheduler.ExponentialDecayScheduler
     args:
         # warmup_iters: 3000
         final_lrs: !!float 5e-7
@@ -61,7 +72,7 @@ scheduled_sampling:
     final_ratio: 0.7
 
 loss:
-    type: LabelSmoothingLoss
+    type: captioning.losses.loss.LabelSmoothingLoss
     args:
         smoothing: 0.1
 

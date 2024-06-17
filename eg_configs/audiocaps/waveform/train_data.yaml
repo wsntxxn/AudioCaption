@@ -1,41 +1,48 @@
-outputpath: experiments/audiocaps/pre_val
-
 data:
     train:
         dataset:
-            type: CaptionDataset
+            type: captioning.datasets.caption_dataset.CaptionDataset
             args:
                 features:
-                    wav: data/audiocaps/train/waveform_32k.csv
+                    wav: data/audiocaps/train/waveform.csv
                 transforms:
                     wav: Null
                 caption: data/audiocaps/train/text.json
-                vocabulary: data/audiocaps/train/vocab.pkl
+                orig_sr: &orig_sr 32000
+                target_sr: &target_sr 32000
         collate_fn:
-            type: collate_fn
+            type: captioning.datasets.collate_func.TextCollate
             args:
-                pad_keys: [wav, cap]
-                sort_key: cap
+                text_key: cap
+                pad_keys: [wav]
+            tokenizer:
+                type: captioning.datasets.text_tokenizer.DictTokenizer
+                args:
+                    tokenizer_path: data/audiocaps/train/vocab.pkl
+                    max_length: 20
+        dataloader_args:
         dataloader_args:
             shuffle: True
             batch_size: 32
             num_workers: 4
     val:
         dataset:
-            type: InferenceDataset
+            type: captioning.datasets.caption_dataset.InferenceDataset
             args:
                 features:
-                    wav: data/audiocaps/val/waveform_32k.csv
+                    wav: data/audiocaps/val/waveform.csv
                 transforms:
                     wav: Null
+                orig_sr: *orig_sr
+                target_sr: *target_sr
         collate_fn:
-            type: collate_fn
+            type: captioning.datasets.collate_func.VarLenPadCollate
             args:
                 pad_keys: [wav]
         caption: data/audiocaps/val/text.json
         dataloader_args:
             shuffle: False
-            batch_size: 64
+            batch_size: 32
             num_workers: 4
 
 zh: False

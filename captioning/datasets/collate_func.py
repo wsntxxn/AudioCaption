@@ -1,3 +1,5 @@
+import warnings
+
 import numpy as np
 import torch
 
@@ -68,6 +70,9 @@ class TextCollate(VarLenPadCollate):
                 elif key == self.text_key:
                     output.update(self.tokenizer(output[key]))
                 else:
+                    if isinstance(output[key][0], (np.ndarray, torch.Tensor)) and \
+                        output[key][0].ndim > 1:
+                        warnings.warn(f"collating multi-dimensional {key} as a single tensor")
                     data = np.array(output[key])
                     if isinstance(output[key][0], np.ndarray):
                         output[key] = torch.as_tensor(data)

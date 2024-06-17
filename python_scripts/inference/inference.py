@@ -10,7 +10,6 @@ import torchaudio
 import numpy as np
 import pandas as pd
 import torch
-import kaldiio
 import h5py
 
 import captioning.utils.train_util as train_util
@@ -31,15 +30,8 @@ def load_model(cfg, ckpt_path, device):
 
 
 def load_audio(specifier: str, target_sr: int):
-    if specifier.endswith("|"):
-        fd = kaldiio.utils.open_like_kaldi(specifier, "rb")
-        mat = kaldiio.matio._load_mat(fd, None)
-        fd.close()
-        sr, y = mat
-        y = y.copy() / 2 ** 15
-    else:
-        assert Path(specifier).exists(), specifier + " not exists!"
-        y, sr = librosa.core.load(specifier, sr=None)
+    assert Path(specifier).exists(), specifier + " not exists!"
+    y, sr = librosa.core.load(specifier, sr=None)
     if y.shape[0] == 0:
         return None
     y = torch.as_tensor(y)
