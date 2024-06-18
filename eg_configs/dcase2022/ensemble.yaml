@@ -1,0 +1,19 @@
+inherit_from: '../clotho_v2/waveform/test.yaml'
+
+output_path: experiments/dcase2022/ensemble_output/2trm_4trm
+experiment_path:
+    - 'experiments/dcase2022/cnn14rnn_2trm/seed_1/swa.pth'
+    - 'experiments/dcase2022/cnn14rnn_4trm/seed_1/swa.pth'
+
+inference_args:
+    method: beam # "greedy", "beam", "gumble"
+    beam_size: 3
+    beam_temp: 1
+    n_best: False
+    n_best_size: 5
+    sample_word_temp: 1
+    max_length: 20
+
+caption_output: predictions/swa_beam3.json
+score_output: results/swa_beam3.txt
+zh: False

@@ -1,6 +1,7 @@
 # Audio Captioning Recipe
 
 This repository provides a recipe for audio captioning with sequence to sequence models: data preprocessing, training, evaluation and inference.
+Specifically in this branch, we provide the main code of our DCASE2022 submission.  
 
 # Install
 
@@ -21,6 +22,10 @@ We now support [Clotho](https://arxiv.org/abs/1910.09387) and [AudioCaps](https:
 
 # Training
 
+## Contrastive Audio-text Pre-training
+The first step is audio-text pre-training using contrastive learning. The code is in [another repo](https://github.com/wsntxxn/DCASE2022T6_CLAP). The pre-trained audio-text retrieval model [checkpoint](https://github.com/wsntxxn/AudioCaption/releases/download/v0.0.2/contrastive_pretrain_cnn14_bertm.pth) is provided for captioning training in the following step.
+
+## Captioning Training
 The training configuration is written in a YAML file and passed to the training script. Examples are in `eg_configs`.
 
 For example, train a model with Cnn14_Rnn encoder and Transformer decoder on Clotho:
@@ -41,6 +46,12 @@ $ python python_scripts/inference/inference.py \
     --input input.wav 
     --output output.json
     --checkpoint $CKPT
+```
+
+## Ensemble
+To ensemble several models for inference, especially in challenges, the script with an sample configuration `eg_configs/dcase2022/ensemble/config.yaml` is:
+```bash
+$ python python_scripts/inference/ensemble.py evaluate eg_configs/dcase2022/ensemble.yaml
 ```
 
 ## Using off-the-shelf models
@@ -78,9 +89,3 @@ If you find these models useful, please cite our technical report:
     year={2022}
 }
 ```
-
-# Related Papers
-The following papers are related to this repository:
-* [A CRNN-GRU Based Reinforcement Learning Approach to Audio Captioning](https://dcase.community/documents/workshop2020/proceedings/DCASE2020Workshop_Xu_83.pdf)
-* [Investigating Local and Global Information for Automated Audio Captioning with Transfer Learning](https://ieeexplore.ieee.org/abstract/document/9413982)
-* [Diversity-Controllable and Accurate Audio Captioning Based on Neural Condition](https://ieeexplore.ieee.org/document/9746834)

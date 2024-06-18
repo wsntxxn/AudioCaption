@@ -1,6 +1,6 @@
-inherit_from: ./train_data.yaml
+inherit_from: ../clotho_v2/waveform/train_data.yaml
 
-experiment_path: experiments/clotho_v2/cnn14rnn_trm/
+experiment_path: experiments/dcase2022/cnn14rnn_2trm/
 
 seed: 1
 
@@ -14,7 +14,7 @@ model:
             type: captioning.models.cnn_encoder.Cnn14Encoder
             args:
                 sample_rate: 32000
-            pretrained: experiments/pretrained_encoder/Cnn14_mAP=0.431.pth
+            pretrained: pretrained_feature_extractors/contrastive_pretrain_cnn14_bertm.pth
         rnn:
             type: captioning.models.rnn_encoder.RnnEncoder
             args:
@@ -48,7 +48,7 @@ optimizer:
 lr_scheduler:
     type: captioning.utils.lr_scheduler.ExponentialDecayScheduler
     args:
-        # warmup_iters: 3000
+        warmup_iters: 3000
         final_lrs: !!float 5e-7
 
 trainer:
@@ -60,7 +60,7 @@ trainer:
         name: score
         mode: max
     include_optim_in_ckpt: False
-    finetune: True
+
 
 inference_args:
     sample_method: beam
