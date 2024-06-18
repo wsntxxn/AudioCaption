@@ -21,11 +21,12 @@ In order to successfully run the audio captioning recipe, you need to install th
 
 First checkout this repository:
 ```bash
-git clone --recursive https://github.com/wsntxxn/AudioCaption
+$ git clone https://github.com/wsntxxn/AudioCaption
 ```
-Then install the required packages:
+Then install the required packages and the repo for convenience:
 ```bash
-pip install -r requirements.txt
+$ pip install -r requirements.txt
+$ pip install -e .
 ```
 
 # Data preprocessing
@@ -40,13 +41,13 @@ All configurations are stored in `config/*.yaml`, where parameters like model ty
 
 ## Start training
 ```bash
-python captioning/ignite_runners/run.py train \
+$ python captioning/ignite_runners/run.py train \
     --config config/clotho_xe.yaml
 ```
 The training script will use all configurations specified in `config/clotho_xe.yaml`.
 They can also be switched by passing `--ARG VALUE`, e.g., if you want to use scheduled sampling, you can run:
 ```bash
-python captioning/ignite_runners/run.py train \
+$ python captioning/ignite_runners/run.py train \
     --config config/clotho_xe.yaml \
     --ss True
 ```
@@ -54,17 +55,17 @@ python captioning/ignite_runners/run.py train \
 ## DCASE2021 onfiguration and training
 First download [pre-trained CNN10](https://zenodo.org/record/5090473/files/cnn10_unbalanced.pth) audio encoder:
 ```bash
-mkdir experiments/pretrained_encoder
-wget -O experiments/pretrained_encoder/cnn10_unbalanced.pth https://zenodo.org/record/5090473/files/cnn10_unbalanced.pth
+$ mkdir experiments/pretrained_encoder
+$ wget -O experiments/pretrained_encoder/cnn10_unbalanced.pth https://zenodo.org/record/5090473/files/cnn10_unbalanced.pth
 ```
 Then run the training script:
 ```bash
-python captioning/ignite_runners/run.py train \
+$ python captioning/ignite_runners/run.py train \
     --config config/dcase2021_xe.yaml
 ```
 After the XE training finishes, continue training the model by scst fine-tuning:
 ```bash
-python captioning/ignite_runners/run_scst.py train \
+$ python captioning/ignite_runners/run_scst.py train \
     --config config/dcase2021_scst.yaml
 ```
 
@@ -73,8 +74,8 @@ python captioning/ignite_runners/run_scst.py train \
 
 Evaluation is done by running function `evaluate` in `runners/run.py`. For example:
 ```bash
-export EXP_PATH=experiments/***
-python captioning/ignite_runners/run.py evaluate \
+$ export EXP_PATH=experiments/***
+$ python captioning/ignite_runners/run.py evaluate \
     --experiment_path $EXP_PATH \
     --task clotho \
     --raw_feat_csv data/clotho_v2/eval/lms.csv \
@@ -84,7 +85,7 @@ python captioning/ignite_runners/run.py evaluate \
 ```
 To use beam search (for example with a beam size of 3), use:
 ```bash
-python captioning/ignite_runners/run.py evaluate \
+$ python captioning/ignite_runners/run.py evaluate \
     --experiment_path $EXP_PATH \
     --task clotho \
     --raw_feat_csv data/clotho_v2/eval/lms.csv \
@@ -97,5 +98,23 @@ python captioning/ignite_runners/run.py evaluate \
 
 Standard captioning metrics (BLEU@1-4, ROUGE-L, CIDEr, METEOR and SPICE) will be calculated.
 
-
+# Citation
+If you find this repo useful, please consider citing
+```BibTeX
+@inproceedings{xu2020crnn,
+    author={Xu, Xuenan and Dinkel, Heinrich and Wu, Mengyue and Yu, Kai},
+    title={A CRNN-GRU Based Reinforcement Learning Approach to Audio Captioning},
+    booktitle={Proceedings of the Detection and Classification of Acoustic Scenes and Events Workshop},
+    year={2020},
+    pages={225-229}
+}
+```
+```BibTeX
+@techreport{xu2021sjtu,
+    author={Xu, Xuenan and Xie, Zeyu and Wu, Mengyue and Yu, Kai},
+    title={The {SJTU} System for {DCASE2021} Challenge Task 6: Audio Captioning Based on Encoder Pre-training and Reinforcement Learning},
+    institution={DCASE2021 Challenge},
+    year={2021}
+}
+```
 
