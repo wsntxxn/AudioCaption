@@ -73,7 +73,7 @@ If you find these models useful, please cite our technical report:
 ```BibTeX
 @techreport{xu2022sjtu,
     author={Xu, Xuenan and Xie, Zeyu and Wu, Mengyue and Yu, Kai},
-    title={The SJTU System for DCASE2022 Challenge Task 6: Audio Captioning with Audio-Text Retrieval Pre-training},
+    title={The {SJTU} System for {DCASE2022} Challenge Task 6: Audio Captioning with Audio-Text Retrieval Pre-training},
     institution={DCASE2022 Challenge},
     year={2022}
 }
