@@ -51,7 +51,7 @@ $ python python_scripts/inference/inference.py \
 ## Ensemble
 To ensemble several models for inference, especially in challenges, the script with an sample configuration `eg_configs/dcase2022/ensemble/config.yaml` is:
 ```bash
-$ python python_scripts/inference/ensemble.py evaluate eg_configs/dcase2022/ensemble.yaml
+$ python python_scripts/train_eval/ensemble.py evaluate eg_configs/dcase2022/ensemble.yaml
 ```
 
 ## Using off-the-shelf models

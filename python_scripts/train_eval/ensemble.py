@@ -11,14 +11,9 @@ import torch
 from tqdm import tqdm
 from typing import List, Union, Dict
 
-import captioning.models
-import captioning.models.encoder
-import captioning.models.decoder
 import captioning.utils.train_util as train_util
-from captioning.utils.build_vocab import Vocabulary
-from captioning.pytorch_runners.base import BaseRunner
+from python_scripts.train_eval.base import BaseRunner
 from pycocoevalcap.cider.cider import Cider
-import captioning.datasets as dataset_module
 import pandas as pd
 
 
@@ -26,35 +21,9 @@ class EnsembleRunner(BaseRunner):
 
 
     def _get_model(self, config, print_fn=sys.stdout.write):
-        encoder_cfg = config["model"]["encoder"]
-        encoder = train_util.init_obj(
-            captioning.models.encoder,
-            encoder_cfg)
-        if "pretrained" in encoder_cfg:
-            pretrained = encoder_cfg["pretrained"]
-            train_util.load_pretrained_model(encoder,
-                                             pretrained,
-                                             print_fn)
-        decoder_cfg = config["model"]["decoder"]
-        decoder = train_util.init_obj(
-            captioning.models.decoder,
-            decoder_cfg
-        )
-        if "word_embedding" in decoder_cfg:
-            decoder.load_word_embedding(**decoder_cfg["word_embedding"])
-        if "pretrained" in decoder_cfg:
-            pretrained = decoder_cfg["pretrained"]
-            train_util.load_pretrained_model(decoder,
-                                             pretrained,
-                                             print_fn)
-        model = train_util.init_obj(captioning.models, config["model"],
-            encoder=encoder, decoder=decoder)
-
-        if "modelwrapper" in config:
-            model = train_util.init_obj(captioning.models,
-                                        config["modelwrapper"],
-                                        model=model)
-
+        model = train_util.init_model_from_config(self.config["model"], print_fn)
+        if hasattr(self, "tokenizer"):
+            model.set_index(self.tokenizer.bos, self.tokenizer.eos, self.tokenizer.pad)
         return model
 
 
@@ -301,11 +270,9 @@ class EnsembleRunner(BaseRunner):
             models.append(model)
         
         dataset_config = eval_config["data"]["test"]["dataset"]
-        dataset = getattr(dataset_module, dataset_config["type"])(
-            **dataset_config["args"])
+        dataset = train_util.init_obj_from_dict(dataset_config)
         collate_config = eval_config["data"]["test"]["collate_fn"]
-        collate_fn = getattr(dataset_module, collate_config["type"])(
-            **collate_config["args"])
+        collate_fn = train_util.init_obj_from_dict(collate_config)
         dataloader = torch.utils.data.DataLoader(
             dataset=dataset, collate_fn=collate_fn,
             **eval_config["data"]["test"]["dataloader_args"])
