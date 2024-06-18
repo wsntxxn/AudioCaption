@@ -145,4 +145,7 @@ configs/
 
 effb2_trm_demo/
 
+# Dockerfiles for VC
 docker/
+
+bash_scripts/

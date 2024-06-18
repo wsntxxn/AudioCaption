@@ -196,7 +196,7 @@ def merge_load_state_dict(state_dict,
             pretrained_dict[key] = value
         else:
             mismatch_keys.append(key)
-    output_fn(f"Loading pre-trained model, with mismatched keys {mismatch_keys}")
+    output_fn(f"Loading pre-trained model, with mismatched keys {mismatch_keys}\n")
     model_dict.update(pretrained_dict)
     model.load_state_dict(model_dict, strict=True)
     return pretrained_dict.keys()
