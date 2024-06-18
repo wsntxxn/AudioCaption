@@ -40,12 +40,15 @@ All configurations are stored in `config/*.yaml`, where parameters like model ty
 
 ## Start training
 ```bash
-python runners/run.py train config/clotho_xe.yaml
+python captioning/ignite_runners/run.py train \
+    --config config/clotho_xe.yaml
 ```
 The training script will use all configurations specified in `config/clotho_xe.yaml`.
 They can also be switched by passing `--ARG VALUE`, e.g., if you want to use scheduled sampling, you can run:
 ```bash
-python runners/run.py train config/clotho_xe.yaml --ss True
+python captioning/ignite_runners/run.py train \
+    --config config/clotho_xe.yaml \
+    --ss True
 ```
 
 ## DCASE2021 onfiguration and training
@@ -56,11 +59,13 @@ wget -O experiments/pretrained_encoder/cnn10_unbalanced.pth https://zenodo.org/r
 ```
 Then run the training script:
 ```bash
-python runners/run.py train config/dcase2021_xe.yaml
+python captioning/ignite_runners/run.py train \
+    --config config/dcase2021_xe.yaml
 ```
 After the XE training finishes, continue training the model by scst fine-tuning:
 ```bash
-python runners/run_scst.py train config/dcase2021_scst.yaml
+python captioning/ignite_runners/run_scst.py train \
+    --config config/dcase2021_scst.yaml
 ```
 
 
@@ -69,19 +74,23 @@ python runners/run_scst.py train config/dcase2021_scst.yaml
 Evaluation is done by running function `evaluate` in `runners/run.py`. For example:
 ```bash
 export EXP_PATH=experiments/***
-python runners/run.py \
-    evaluate \
-    $EXP_PATH \
-    data/clotho_v2/eval/lms.csv \
-    data/clotho_v2/eval/text.json
+python captioning/ignite_runners/run.py evaluate \
+    --experiment_path $EXP_PATH \
+    --task clotho \
+    --raw_feat_csv data/clotho_v2/eval/lms.csv \
+    --fc_feat_csv data/clotho_v2/eval/lms.csv \
+    --attn_feat_csv data/clotho_v2/eval/lms.csv \
+    --caption_file data/clotho_v2/eval/text.json
 ```
 To use beam search (for example with a beam size of 3), use:
 ```bash
-python runners/run.py \
-    evaluate \
-    $EXP_PATH \
-    data/clotho_v2/eval/lms.csv \
-    data/clotho_v2/eval/text.json \
+python captioning/ignite_runners/run.py evaluate \
+    --experiment_path $EXP_PATH \
+    --task clotho \
+    --raw_feat_csv data/clotho_v2/eval/lms.csv \
+    --fc_feat_csv data/clotho_v2/eval/lms.csv \
+    --attn_feat_csv data/clotho_v2/eval/lms.csv \    
+    --caption_file data/clotho_v2/eval/text.json \
     --method beam \
     --beam-size 3
 ```
