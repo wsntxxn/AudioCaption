@@ -31,9 +31,9 @@
 ### Pack waveform data to hdf5
 We pack audio files to a single HDF5 to avoid reading too many files (which may yield low read performance on some machines):
 ```bash
-$ python create_dataset/pack_waveform.py $CLOTHO_DIR/dev/wav.csv --output $CLOTHO_DIR/dev/waveform.h5
-$ python create_dataset/pack_waveform.py $CLOTHO_DIR/val/wav.csv --output $CLOTHO_DIR/val/waveform.h5
-$ python create_dataset/pack_waveform.py $CLOTHO_DIR/eval/wav.csv --output $CLOTHO_DIR/eval/waveform.h5
+$ python ../python_scripts/utils/pack_waveform.py $CLOTHO_DIR/dev/wav.csv --output $CLOTHO_DIR/dev/waveform.h5
+$ python ../python_scripts/utils/pack_waveform.py $CLOTHO_DIR/val/wav.csv --output $CLOTHO_DIR/val/waveform.h5
+$ python ../python_scripts/utils/pack_waveform.py $CLOTHO_DIR/eval/wav.csv --output $CLOTHO_DIR/eval/waveform.h5
 ```
 
 ### Tokenize captions and build vocabulary
@@ -61,9 +61,9 @@ $ python create_dataset/prepare_audiocaps.py $AUDIOCAPS_ANNOTATION $AUDIOSET_WAV
 ```
 Similarly, pack waveform and build vocabulary:
 ```bash
-$ python create_dataset/pack_waveform.py $AUDIOCAPS_DIR/train/wav.csv --output $AUDIOCAPS_DIR/train/waveform.h5
-$ python create_dataset/pack_waveform.py $AUDIOCAPS_DIR/val/wav.csv --output $AUDIOCAPS_DIR/val/waveform.h5
-$ python create_dataset/pack_waveform.py $AUDIOCAPS_DIR/test/wav.csv --output $AUDIOCAPS_DIR/test/waveform.h5
+$ python ../python_scripts/utils/pack_waveform.py $AUDIOCAPS_DIR/train/wav.csv --output $AUDIOCAPS_DIR/train/waveform.h5
+$ python ../python_scripts/utils/pack_waveform.py $AUDIOCAPS_DIR/val/wav.csv --output $AUDIOCAPS_DIR/val/waveform.h5
+$ python ../python_scripts/utils/pack_waveform.py $AUDIOCAPS_DIR/test/wav.csv --output $AUDIOCAPS_DIR/test/waveform.h5
 $ python ../python_scripts/utils/build_custom_tokenizer.py \
     --input_json $AUDIOCAPS_DIR/train/text.json \
     --output_file $AUDIOCAPS_DIR/train/vocab.pkl
