@@ -14,7 +14,7 @@ model:
             type: captioning.models.cnn_encoder.Cnn14Encoder
             args:
                 sample_rate: 32000
-                pretrained: experiments/pretrained_encoder/Cnn14_mAP=0.431.pth
+            pretrained: experiments/pretrained_encoder/Cnn14_mAP=0.431.pth
         rnn:
             type: captioning.models.rnn_encoder.RnnEncoder
             args:
