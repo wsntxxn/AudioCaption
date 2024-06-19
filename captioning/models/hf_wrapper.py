@@ -1,11 +1,219 @@
-# -*- coding: utf-8 -*-
+from typing import Dict, Callable, Union, List
+import random
+import math
+import sys
 
-from typing import Dict
-
+import numpy as np
 import torch
 import torch.nn as nn
+from torch.nn import functional as F
+from torchaudio import transforms
+from torchlibrosa import SpecAugmentation
+from efficientnet_pytorch import EfficientNet
+from efficientnet_pytorch import utils as efficientnet_utils
+from einops import rearrange, reduce
+from torch.hub import load_state_dict_from_url
+from transformers import PretrainedConfig, PreTrainedModel
 
-from captioning.utils.model_util import mean_with_lens, repeat_tensor
+
+def init(m, method="kaiming"):
+    if isinstance(m, (nn.Conv2d, nn.Conv1d)):
+        if method == "kaiming":
+            nn.init.kaiming_uniform_(m.weight)
+        elif method == "xavier":
+            nn.init.xavier_uniform_(m.weight)
+        else:
+            raise Exception(f"initialization method {method} not supported")
+        if m.bias is not None:
+            nn.init.constant_(m.bias, 0)
+    elif isinstance(m, (nn.BatchNorm2d, nn.BatchNorm1d)):
+        nn.init.constant_(m.weight, 1)
+        if m.bias is not None:
+            nn.init.constant_(m.bias, 0)
+    elif isinstance(m, nn.Linear):
+        if method == "kaiming":
+            nn.init.kaiming_uniform_(m.weight)
+        elif method == "xavier":
+            nn.init.xavier_uniform_(m.weight)
+        else:
+            raise Exception(f"initialization method {method} not supported")
+        if m.bias is not None:
+            nn.init.constant_(m.bias, 0)
+    elif isinstance(m, nn.Embedding):
+        if method == "kaiming":
+            nn.init.kaiming_uniform_(m.weight)
+        elif method == "xavier":
+            nn.init.xavier_uniform_(m.weight)
+        else:
+            raise Exception(f"initialization method {method} not supported")
+
+class _EffiNet(nn.Module):
+    """A proxy for efficient net models"""
+    def __init__(self,
+                 blocks_args=None,
+                 global_params=None,
+                 ) -> None:
+        super().__init__()
+        self.eff_net = EfficientNet(blocks_args=blocks_args,
+                                    global_params=global_params)
+        
+
+    def forward(self, x: torch.Tensor): 
+        x = rearrange(x, 'b f t -> b 1 f t')
+        x = self.eff_net.extract_features(x)
+        return reduce(x, 'b c f t -> b t c', 'mean')
+
+
+def get_effb2_model(pretrained=True) -> _EffiNet:
+    blocks_args, global_params = efficientnet_utils.get_model_params(
+        'efficientnet-b2', {'include_top': False})
+    model = _EffiNet(blocks_args=blocks_args,
+                     global_params=global_params)
+    model.eff_net._change_in_channels(1)
+    if pretrained:
+        state_dict = load_state_dict_from_url(
+            'https://github.com/richermans/HEAR2021_EfficientLatent/releases/download/v0.0.1/effb2.pt',
+            progress=True)
+        del_keys = [key for key in state_dict if key.startswith("front_end")]
+        for key in del_keys:
+            del state_dict[key]
+        model.eff_net.load_state_dict(state_dict)
+    return model
+
+def merge_load_state_dict(state_dict,
+                          model: torch.nn.Module,
+                          output_fn: Callable = sys.stdout.write):
+    model_dict = model.state_dict()
+    pretrained_dict = {}
+    mismatch_keys = []
+    for key, value in state_dict.items():
+        if key in model_dict and model_dict[key].shape == value.shape:
+            pretrained_dict[key] = value
+        else:
+            mismatch_keys.append(key)
+    output_fn(f"Loading pre-trained model, with mismatched keys {mismatch_keys}\n")
+    model_dict.update(pretrained_dict)
+    model.load_state_dict(model_dict, strict=True)
+    return pretrained_dict.keys()
+
+
+class EfficientNetB2(nn.Module):
+
+    def __init__(self,
+                 n_mels: int = 64,
+                 win_length: int = 32,
+                 hop_length: int = 10,
+                 f_min: int = 0,
+                 pretrained: bool = False,
+                 freeze: bool = False,):
+        super().__init__()
+        sample_rate = 16000
+        self.melspec_extractor = transforms.MelSpectrogram(
+            sample_rate=sample_rate,
+            n_fft=win_length * sample_rate // 1000,
+            win_length=win_length * sample_rate // 1000,
+            hop_length=hop_length * sample_rate // 1000,
+            f_min=f_min,
+            n_mels=n_mels,
+        )
+        self.hop_length = 10 * sample_rate // 1000
+        self.db_transform = transforms.AmplitudeToDB(top_db=120)
+        self.spec_augmenter = SpecAugmentation(time_drop_width=64,
+            time_stripes_num=2, freq_drop_width=8, freq_stripes_num=2)
+        self.backbone = get_effb2_model(pretrained=pretrained)
+        self.fc_emb_size = self.backbone.eff_net._conv_head.out_channels
+        self.downsample_ratio = 32
+        if freeze:
+            for param in self.parameters():
+                param.requires_grad = False
+
+    def forward(self, input_dict):
+        
+        waveform = input_dict["wav"]
+        wave_length = input_dict["wav_len"]
+        specaug = input_dict["specaug"]
+        x = self.melspec_extractor(waveform)
+        x = self.db_transform(x)    # (batch_size, mel_bins, time_steps)
+        
+        x = rearrange(x, 'b f t -> b 1 t f')
+        if self.training and specaug:
+            x = self.spec_augmenter(x)
+        x = rearrange(x, 'b 1 t f -> b f t')
+        
+        x = self.backbone(x)
+        attn_emb = x
+
+        wave_length = torch.as_tensor(wave_length)
+        feat_length = torch.div(wave_length, self.hop_length,
+            rounding_mode="floor") + 1
+        feat_length = torch.div(feat_length, self.downsample_ratio,
+            rounding_mode="floor")
+        fc_emb = mean_with_lens(attn_emb, feat_length)
+        
+        output_dict = {
+            'fc_emb': fc_emb,
+            'attn_emb': attn_emb,
+            'attn_emb_len': feat_length
+        }
+        return output_dict
+
+
+def generate_length_mask(lens, max_length=None):
+    lens = torch.as_tensor(lens)
+    N = lens.size(0)
+    if max_length is None:
+        max_length = max(lens)
+        if isinstance(max_length, torch.Tensor):
+            max_length = max_length.item()
+    idxs = torch.arange(max_length).repeat(N).view(N, max_length)
+    idxs = idxs.to(lens.device)
+    mask = (idxs < lens.view(-1, 1))
+    return mask
+
+def mean_with_lens(features, lens):
+    """
+    features: [N, T, ...] (assume the second dimension represents length)
+    lens: [N,]
+    """
+    lens = torch.as_tensor(lens)
+    if max(lens) != features.size(1):
+        max_length = features.size(1)
+        mask = generate_length_mask(lens, max_length)
+    else:
+        mask = generate_length_mask(lens)
+    mask = mask.to(features.device) # [N, T]
+
+    while mask.ndim < features.ndim:
+        mask = mask.unsqueeze(-1)
+    feature_mean = features * mask
+    feature_mean = feature_mean.sum(1)
+    while lens.ndim < feature_mean.ndim:
+        lens = lens.unsqueeze(1)
+    feature_mean = feature_mean / lens.to(features.device)
+    # feature_mean = features * mask.unsqueeze(-1)
+    # feature_mean = feature_mean.sum(1) / lens.unsqueeze(1).to(features.device)
+    return feature_mean
+
+def max_with_lens(features, lens):
+    """
+    features: [N, T, ...] (assume the second dimension represents length)
+    lens: [N,]
+    """
+    lens = torch.as_tensor(lens)
+    if max(lens) != features.size(1):
+        max_length = features.size(1)
+        mask = generate_length_mask(lens, max_length)
+    else:
+        mask = generate_length_mask(lens)
+    mask = mask.to(features.device) # [N, T]
+
+    feature_max = features.clone()
+    feature_max[~mask] = float("-inf")
+    feature_max, _ = feature_max.max(1)
+    return feature_max
+
+def repeat_tensor(x, n):
+    return x.unsqueeze(0).repeat(n, *([1] * len(x.shape)))
 
 
 class CaptionMetaMixin:
@@ -477,31 +685,343 @@ class CaptionModel(nn.Module, CaptionMetaMixin):
         pass
 
 
-class CaptionSequenceModel(nn.Module, CaptionMetaMixin):
+class TransformerModel(CaptionModel):
 
-    def __init__(self, model, seq_output_size):
-        super().__init__()
-        self.model = model
-        if model.decoder.d_model != seq_output_size:
-            self.output_transform = nn.Linear(model.decoder.d_model, seq_output_size)
+    def __init__(self, encoder: nn.Module, decoder: nn.Module, **kwargs):
+        if not hasattr(self, "compatible_decoders"):
+            self.compatible_decoders = (
+                TransformerDecoder,
+            )
+        super().__init__(encoder, decoder, **kwargs)
+
+    def seq_forward(self, input_dict):
+        cap = input_dict["cap"]
+        cap_padding_mask = (cap == self.pad_idx).to(cap.device)
+        cap_padding_mask = cap_padding_mask[:, :-1]
+        output = self.decoder(
+            {
+                "word": cap[:, :-1],
+                "attn_emb": input_dict["attn_emb"],
+                "attn_emb_len": input_dict["attn_emb_len"],
+                "cap_padding_mask": cap_padding_mask
+            }
+        )
+        return output
+
+    def prepare_decoder_input(self, input_dict, output):
+        decoder_input = {
+            "attn_emb": input_dict["attn_emb"],
+            "attn_emb_len": input_dict["attn_emb_len"]
+        }
+        t = input_dict["t"]
+        
+        ###############
+        # determine input word
+        ################
+        if input_dict["mode"] == "train" and random.random() < input_dict["ss_ratio"]: # training, scheduled sampling
+            word = input_dict["cap"][:, :t+1]
         else:
-            self.output_transform = lambda x: x
+            start_word = torch.tensor([self.start_idx,] * input_dict["attn_emb"].size(0)).unsqueeze(1).long()
+            if t == 0:
+                word = start_word
+            else:
+                word = torch.cat((start_word, output["seq"][:, :t]), dim=-1)
+        # word: [N, T]
+        decoder_input["word"] = word
+
+        cap_padding_mask = (word == self.pad_idx).to(input_dict["attn_emb"].device)
+        decoder_input["cap_padding_mask"] = cap_padding_mask
+        return decoder_input
+
+    def prepare_beamsearch_decoder_input(self, input_dict, output_i):
+        decoder_input = {}
+        t = input_dict["t"]
+        i = input_dict["sample_idx"]
+        beam_size = input_dict["beam_size"]
+        ###############
+        # prepare attn embeds
+        ################
+        if t == 0:
+            attn_emb = repeat_tensor(input_dict["attn_emb"][i], beam_size)
+            attn_emb_len = repeat_tensor(input_dict["attn_emb_len"][i], beam_size)
+            output_i["attn_emb"] = attn_emb
+            output_i["attn_emb_len"] = attn_emb_len
+        decoder_input["attn_emb"] = output_i["attn_emb"]
+        decoder_input["attn_emb_len"] = output_i["attn_emb_len"]
+        ###############
+        # determine input word
+        ################
+        start_word = torch.tensor([self.start_idx,] * beam_size).unsqueeze(1).long()
+        if t == 0:
+            word = start_word
+        else:
+            word = torch.cat((start_word, output_i["seq"]), dim=-1)
+        decoder_input["word"] = word
+        cap_padding_mask = (word == self.pad_idx).to(input_dict["attn_emb"].device)
+        decoder_input["cap_padding_mask"] = cap_padding_mask
+
+        return decoder_input
+
+
+class BaseDecoder(nn.Module):
+    """
+    Take word/audio embeddings and output the next word probs
+    """
+    def __init__(self, emb_dim, vocab_size, fc_emb_dim,
+                 attn_emb_dim, dropout=0.2, tie_weights=False):
+        super().__init__()
+        self.emb_dim = emb_dim
+        self.vocab_size = vocab_size
+        self.fc_emb_dim = fc_emb_dim
+        self.attn_emb_dim = attn_emb_dim
+        self.tie_weights = tie_weights
+        self.word_embedding = nn.Embedding(vocab_size, emb_dim)
+        self.in_dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        raise NotImplementedError
+
+    def load_word_embedding(self, weight, freeze=True):
+        embedding = np.load(weight)
+        assert embedding.shape[0] == self.vocab_size, "vocabulary size mismatch"
+        assert embedding.shape[1] == self.emb_dim, "embed size mismatch"
+        
+        # embeddings = torch.as_tensor(embeddings).float()
+        # self.word_embeddings.weight = nn.Parameter(embeddings)
+        # for para in self.word_embeddings.parameters():
+            # para.requires_grad = tune
+        self.word_embedding = nn.Embedding.from_pretrained(embedding,
+            freeze=freeze)
+
+
+class PositionalEncoding(nn.Module):
+
+    def __init__(self, d_model, dropout=0.1, max_len=100):
+        super(PositionalEncoding, self).__init__()
+        self.dropout = nn.Dropout(p=dropout)
+
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * \
+            (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0).transpose(0, 1)
+        # self.register_buffer("pe", pe)
+        self.register_parameter("pe", nn.Parameter(pe, requires_grad=False))
+
+    def forward(self, x):
+        # x: [T, N, E]
+        x = x + self.pe[:x.size(0), :]
+        return self.dropout(x)
+
+
+class TransformerDecoder(BaseDecoder):
+
+    def __init__(self,
+                 emb_dim,
+                 vocab_size,
+                 fc_emb_dim,
+                 attn_emb_dim,
+                 dropout,
+                 freeze=False,
+                 tie_weights=False,
+                 **kwargs):
+        super().__init__(emb_dim, vocab_size, fc_emb_dim, attn_emb_dim,
+                         dropout=dropout, tie_weights=tie_weights)
+        self.d_model = emb_dim
+        self.nhead = kwargs.get("nhead", self.d_model // 64)
+        self.nlayers = kwargs.get("nlayers", 2)
+        self.dim_feedforward = kwargs.get("dim_feedforward", self.d_model * 4)
+
+        self.pos_encoder = PositionalEncoding(self.d_model, dropout)
+        layer = nn.TransformerDecoderLayer(d_model=self.d_model,
+                                           nhead=self.nhead,
+                                           dim_feedforward=self.dim_feedforward,
+                                           dropout=dropout)
+        self.model = nn.TransformerDecoder(layer, self.nlayers)
+        self.classifier = nn.Linear(self.d_model, vocab_size, bias=False)
+        if tie_weights:
+            self.classifier.weight = self.word_embedding.weight
+        self.attn_proj = nn.Sequential(
+            nn.Linear(self.attn_emb_dim, self.d_model),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.LayerNorm(self.d_model)
+        )
+        self.init_params()
+
+        self.freeze = freeze
+        if freeze:
+            for p in self.parameters():
+                p.requires_grad = False
+
+    def init_params(self):
+        for p in self.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p)
+    
+    def load_pretrained(self, pretrained, output_fn):
+        checkpoint = torch.load(pretrained, map_location="cpu")
+
+        if "model" in checkpoint:
+            checkpoint = checkpoint["model"]
+            if next(iter(checkpoint)).startswith("decoder."):
+                state_dict = {}
+                for k, v in checkpoint.items():
+                    state_dict[k[8:]] = v
+
+        loaded_keys = merge_load_state_dict(state_dict, self, output_fn)
+        if self.freeze:
+            for name, param in self.named_parameters():
+                if name in loaded_keys:
+                    param.requires_grad = False
+                else:
+                    param.requires_grad = True
+
+
+    def generate_square_subsequent_mask(self, max_length):
+        mask = (torch.triu(torch.ones(max_length, max_length)) == 1).transpose(0, 1)
+        mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
+        return mask
 
     def forward(self, input_dict):
-        output = self.model(input_dict)
+        word = input_dict["word"]
+        attn_emb = input_dict["attn_emb"]
+        attn_emb_len = input_dict["attn_emb_len"]
+        cap_padding_mask = input_dict["cap_padding_mask"]
 
-        if input_dict["mode"] == "train":
-            lens = input_dict["cap_len"] - 1
-            # seq_outputs: [N, d_model]
-        elif input_dict["mode"] == "inference":
-            if "sample_method" in input_dict and input_dict["sample_method"] == "beam":
-                return output
-            seq = output["seq"]
-            lens = torch.where(seq == self.model.end_idx, torch.zeros_like(seq), torch.ones_like(seq)).sum(dim=1)
-        else:
-            raise Exception("mode should be either 'train' or 'inference'")
-        seq_output = mean_with_lens(output["embed"], lens)
-        seq_output = self.output_transform(seq_output)
-        output["seq_output"] = seq_output
+        p_attn_emb = self.attn_proj(attn_emb)
+        p_attn_emb = p_attn_emb.transpose(0, 1) # [T_src, N, emb_dim]
+        word = word.to(attn_emb.device)
+        embed = self.in_dropout(self.word_embedding(word)) * math.sqrt(self.emb_dim) # [N, T, emb_dim]
+        embed = embed.transpose(0, 1) # [T, N, emb_dim]
+        embed = self.pos_encoder(embed)
+
+        tgt_mask = self.generate_square_subsequent_mask(embed.size(0)).to(attn_emb.device)
+        memory_key_padding_mask = ~generate_length_mask(attn_emb_len, attn_emb.size(1)).to(attn_emb.device)
+        output = self.model(embed, p_attn_emb, tgt_mask=tgt_mask,
+                            tgt_key_padding_mask=cap_padding_mask,
+                            memory_key_padding_mask=memory_key_padding_mask)
+        output = output.transpose(0, 1)
+        output = {
+            "embed": output,
+            "logit": self.classifier(output),
+        }
         return output
+    
+
+class ContraEncoderKdWrapper(nn.Module, CaptionMetaMixin):
+
+    def __init__(self,
+                 model: nn.Module,
+                 shared_dim: int,
+                 tchr_dim: int,
+                 ):
+        super().__init__()
+        self.model = model
+        self.tchr_dim = tchr_dim
+        if hasattr(model, "encoder"):
+            self.stdnt_proj = nn.Linear(model.encoder.fc_emb_size,
+                                        shared_dim)
+        else:
+            self.stdnt_proj = nn.Linear(model.fc_emb_size,
+                                        shared_dim)
+        self.stdnt_proj.apply(init)
+        self.tchr_proj = nn.Linear(tchr_dim, shared_dim)
+        self.tchr_proj.apply(init)
+        self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
+
+    def forward(self, input_dict: Dict):
+        unsup = input_dict.get("unsup", False)
+        if unsup is False:
+            output_dict = self.model(input_dict)
+        else:
+            output_dict = self.model.encoder(input_dict)
+        if "tchr_output" in input_dict:
+            stdnt_emb = output_dict["fc_emb"]
+            stdnt_emb = self.stdnt_proj(stdnt_emb)
+            tchr_emb = input_dict["tchr_output"]["embedding"]
+            thcr_emb = self.tchr_proj(tchr_emb)
+
+            stdnt_emb = F.normalize(stdnt_emb, dim=-1)
+            thcr_emb = F.normalize(thcr_emb, dim=-1)
+
+            unscaled_logit = stdnt_emb @ thcr_emb.transpose(0, 1)
+            logit = self.logit_scale * unscaled_logit
+            label = torch.arange(logit.shape[0]).to(logit.device)
+            loss1 = F.cross_entropy(logit, label)
+            loss2 = F.cross_entropy(logit.transpose(0, 1), label)
+            loss = (loss1 + loss2) / 2
+            output_dict["enc_kd_loss"] = loss
+        return output_dict
+
+
+class Effb2TrmConfig(PretrainedConfig):
+
+    def __init__(
+        self,
+        sample_rate: int = 16000,
+        tchr_dim: int = 768,
+        shared_dim: int = 1024,
+        fc_emb_dim: int = 1408,
+        attn_emb_dim: int = 1408,
+        decoder_n_layers: int = 2,
+        decoder_we_tie_weights: bool = True,
+        decoder_emb_dim: int = 256,
+        decoder_dropout: float = 0.2,
+        vocab_size: int = 4981,
+        **kwargs
+    ):
+        self.sample_rate = sample_rate
+        self.tchr_dim = tchr_dim
+        self.shared_dim = shared_dim
+        self.fc_emb_dim = fc_emb_dim
+        self.attn_emb_dim = attn_emb_dim
+        self.decoder_n_layers = decoder_n_layers
+        self.decoder_we_tie_weights = decoder_we_tie_weights
+        self.decoder_emb_dim = decoder_emb_dim
+        self.decoder_dropout = decoder_dropout
+        self.vocab_size = vocab_size
+        super().__init__(**kwargs)
+
+
+class Effb2TrmCaptioningModel(PreTrainedModel):
+    config_class = Effb2TrmConfig
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.encoder = EfficientNetB2(pretrained=True)
+        self.decoder = TransformerDecoder(
+            emb_dim=config.decoder_emb_dim,
+            vocab_size=config.vocab_size,
+            fc_emb_dim=config.fc_emb_dim,
+            attn_emb_dim=config.attn_emb_dim,
+            dropout=config.decoder_dropout,
+            nlayers=config.decoder_n_layers,
+            tie_weights=config.decoder_we_tie_weights
+        )
+        model = TransformerModel(self.encoder, self.decoder)
+        self.model = ContraEncoderKdWrapper(model, config.shared_dim, config.tchr_dim)
+    
+    def forward(self,
+                audio: torch.Tensor,
+                audio_length: Union[List, np.ndarray, torch.Tensor],
+                sample_method: str = "beam",
+                beam_size: int = 3,
+                max_length: int = 20,
+                temp: float = 1.0,):
+        device = self.device
+        input_dict = {
+            "wav": audio.to(device),
+            "wav_len": audio_length,
+            "specaug": False,
+            "mode": "inference",
+            "sample_method": sample_method,
+            "max_length": max_length,
+            "temp": temp,
+        }
+        if sample_method == "beam":
+            input_dict["beam_size"] = beam_size
+        return self.model(input_dict)["seq"].cpu()
 
