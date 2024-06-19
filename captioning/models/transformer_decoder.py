@@ -8,7 +8,6 @@ from captioning.utils.model_util import generate_length_mask, PositionalEncoding
 from captioning.utils.train_util import merge_load_state_dict
 
 
-
 class TransformerDecoder(BaseDecoder):
 
     def __init__(self,

@@ -16,6 +16,10 @@ Install the repository as a package:
 ```bash
 $ pip install -e .
 ```
+PTB tokenizer and SPICE evaluation also requires java, which can be installed by conda
+```bash
+$ conda install bioconda::java-jdk
+```
 
 # Data pre-processing
 
@@ -30,6 +34,7 @@ For example, train a model with Cnn14_Rnn encoder and Transformer decoder on Clo
 $ python python_scripts/train_eval/run.py train \
     --config eg_configs/clotho_v2/waveform/cnn14rnn_trm.yaml
 ```
+where the CNN14 is initialized by the [PANNs checkpoint](https://zenodo.org/records/3987831/files/Cnn14_mAP%3D0.431.pth), which should be manually downloaded to `experiments/pretrained_encoder/Cnn14_mAP=0.431.pth`.
 
 # Evaluation
 Assume the experiment directory is `$EXP_PATH`. Evaluation under the configuration in `eg_configs/clotho_v2/waveform/test.yaml`:
@@ -46,6 +51,72 @@ $ python python_scripts/inference/inference.py \
     --input input.wav 
     --output output.json
     --checkpoint $CKPT
+```
+
+## Hugging Face🤗 usage
+
+For convenient usage with Hugging Face, we provide the corresponding [wrapper script](captioning/models/hf_wrapper.py). It contains an implementation of a lightweight captioning model. You can use it for inference without installing this repository:
+```python
+import torch
+from transformers import PreTrainedTokenizerFast
+import torchaudio
+from captioning.models.hf_wrapper import Effb2TrmCaptioningModel
+
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# use the model trained on AudioCaps
+model = Effb2TrmCaptioningModel.from_pretrained(
+    "wsntxxn/effb2-trm-audio-captioning",
+).to(device)
+tokenizer = PreTrainedTokenizerFast.from_pretrained(
+    "wsntxxn/audiocaps-simple-tokenizer"
+)
+
+# inference on a single audio clip
+wav, sr = torchaudio.load("/path/to/file.wav")
+wav = torchaudio.functional.resample(wav, sr, model.config.sample_rate)
+if wav.size(0) > 1:
+    wav = wav.mean(0).unsqueeze(0)
+
+with torch.no_grad():
+    word_idxs = model(
+        audio=wav,
+        audio_length=[wav.size(1)],
+    )
+
+caption = tokenizer.decode(word_idxs[0], skip_special_tokens=True)
+print(caption)
+
+# inference on a batch
+wav1, sr1 = torchaudio.load("/path/to/file1.wav")
+wav1 = torchaudio.functional.resample(wav1, sr1, model.config.sample_rate)
+wav1 = wav1.mean(0) if wav1.size(0) > 1 else wav1[0]
+
+wav2, sr2 = torchaudio.load("/path/to/file2.wav")
+wav2 = torchaudio.functional.resample(wav2, sr2, model.config.sample_rate)
+wav2 = wav2.mean(0) if wav2.size(0) > 1 else wav2[0]
+
+wav_batch = torch.nn.utils.rnn.pad_sequence([wav1, wav2], batch_first=True)
+
+with torch.no_grad():
+    word_idxs = model(
+        audio=wav_batch,
+        audio_length=[wav1.size(0), wav2.size(0)],
+    )
+
+captions = tokenizer.batch_decode(word_idxs, skip_special_tokens=True)
+print(captions)
+```
+
+Alternatively, you can use the model trained on Clotho:
+```python
+model = Effb2TrmCaptioningModel.from_pretrained(
+    "wsntxxn/effb2-trm-clotho-captioning",
+).to(device)
+tokenizer = PreTrainedTokenizerFast.from_pretrained(
+    "wsntxxn/clotho-simple-tokenizer"
+)
 ```
 
 ## Using off-the-shelf models

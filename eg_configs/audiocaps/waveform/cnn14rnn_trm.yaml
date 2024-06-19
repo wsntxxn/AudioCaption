@@ -28,6 +28,7 @@ model:
     decoder:
         type: captioning.models.transformer_decoder.TransformerDecoder
         args:
+            vocab_size: 4981
             emb_dim: 256
             fc_emb_dim: 512
             attn_emb_dim: 512
