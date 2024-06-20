@@ -66,7 +66,7 @@ Use the lightweight EffB2-Transformer model for fast inference:
 import torch
 from transformers import PreTrainedTokenizerFast
 import torchaudio
-from captioning.models.hf_wrapper import Effb2TrmCaptioningModel
+from hf_captioning import Effb2TrmCaptioningModel
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -128,6 +128,8 @@ tokenizer = PreTrainedTokenizerFast.from_pretrained(
 ### Temporal-sensitive and controllable model
 Use the temporal-enhanced captioning model for captioning with specific (simultaneous / sequential) temporal relationship description:
 ```python
+from hf_captioning import Cnn14RnnTempAttnGruModel
+
 model = Cnn14RnnTempAttnGruModel.from_pretrained(
     "wsntxxn/audiocaps-temporal-cnn14rnn-gru",
 ).to(device)
