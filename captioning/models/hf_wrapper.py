@@ -233,20 +233,12 @@ class _EffiNet(nn.Module):
         return reduce(x, 'b c f t -> b t c', 'mean')
 
 
-def get_effb2_model(pretrained=True) -> _EffiNet:
+def get_effb2_model() -> _EffiNet:
     blocks_args, global_params = efficientnet_utils.get_model_params(
         'efficientnet-b2', {'include_top': False})
     model = _EffiNet(blocks_args=blocks_args,
                      global_params=global_params)
     model.eff_net._change_in_channels(1)
-    if pretrained:
-        state_dict = load_state_dict_from_url(
-            'https://github.com/richermans/HEAR2021_EfficientLatent/releases/download/v0.0.1/effb2.pt',
-            progress=True)
-        del_keys = [key for key in state_dict if key.startswith("front_end")]
-        for key in del_keys:
-            del state_dict[key]
-        model.eff_net.load_state_dict(state_dict)
     return model
 
 def merge_load_state_dict(state_dict,
@@ -273,7 +265,6 @@ class EfficientNetB2(nn.Module):
                  win_length: int = 32,
                  hop_length: int = 10,
                  f_min: int = 0,
-                 pretrained: bool = False,
                  freeze: bool = False,):
         super().__init__()
         sample_rate = 16000
@@ -287,9 +278,7 @@ class EfficientNetB2(nn.Module):
         )
         self.hop_length = 10 * sample_rate // 1000
         self.db_transform = transforms.AmplitudeToDB(top_db=120)
-        self.spec_augmenter = SpecAugmentation(time_drop_width=64,
-            time_stripes_num=2, freq_drop_width=8, freq_stripes_num=2)
-        self.backbone = get_effb2_model(pretrained=pretrained)
+        self.backbone = get_effb2_model()
         self.fc_emb_size = self.backbone.eff_net._conv_head.out_channels
         self.downsample_ratio = 32
         if freeze:
@@ -1158,7 +1147,7 @@ class Effb2TrmCaptioningModel(PreTrainedModel):
 
     def __init__(self, config):
         super().__init__(config)
-        encoder = EfficientNetB2(pretrained=True)
+        encoder = EfficientNetB2()
         decoder = TransformerDecoder(
             emb_dim=config.decoder_emb_dim,
             vocab_size=config.vocab_size,
