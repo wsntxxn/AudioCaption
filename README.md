@@ -55,7 +55,13 @@ $ python python_scripts/inference/inference.py \
 
 ## Hugging Face🤗 usage
 
-For convenient usage with Hugging Face, we provide the corresponding [wrapper script](captioning/models/hf_wrapper.py). It contains an implementation of a lightweight captioning model. You can use it for inference without installing this repository:
+For convenient usage with Hugging Face, we provide the corresponding [wrapper script](captioning/models/hf_wrapper.py). It contains pure PyTorch implementation of captioning models. You can use it without installing this repository:
+```bash
+wget https://github.com/wsntxxn/AudioCaption/raw/master/captioning/models/hf_wrapper.py -O hf_captioning.py
+```
+
+### Lightweight EffB2-Transformer model
+Use the lightweight EffB2-Transformer model for fast inference:
 ```python
 import torch
 from transformers import PreTrainedTokenizerFast
@@ -117,6 +123,55 @@ model = Effb2TrmCaptioningModel.from_pretrained(
 tokenizer = PreTrainedTokenizerFast.from_pretrained(
     "wsntxxn/clotho-simple-tokenizer"
 )
+```
+
+### Temporal-sensitive and controllable model
+Use the temporal-enhanced captioning model for captioning with specific (simultaneous / sequential) temporal relationship description:
+```python
+model = Cnn14RnnTempAttnGruModel.from_pretrained(
+    "wsntxxn/audiocaps-temporal-cnn14rnn-gru",
+).to(device)
+tokenizer = PreTrainedTokenizerFast.from_pretrained(
+    "wsntxxn/audiocaps-simple-tokenizer"
+)
+
+wav, sr = torchaudio.load("/path/to/file.wav")
+wav = torchaudio.functional.resample(wav, sr, model.config.sample_rate)
+if wav.size(0) > 1:
+    wav = wav.mean(0).unsqueeze(0)
+
+with torch.no_grad():
+    word_idxs = model(
+        audio=wav,
+        audio_length=[wav.size(1)],
+        temporal_tag=[2], # desribe "sequential" if there are sequential events, otherwise use the most complex relationship
+    )
+
+caption = tokenizer.decode(word_idxs[0], skip_special_tokens=True)
+print(caption)
+```
+The temporal tag is defined as:
+|temporal tag|Definition|
+|----:|-----:|
+|0|Only 1 Event|
+|1|Simultaneous Events|
+|2|Sequential Events|
+|3|More Complex Events|
+
+From 0 to 3, the relationship indicated by the tag becomes more and more complex.
+The model will infer the tag automatically.
+If `temporal_tag` is not provided as the input, the model will use the inferred tag.
+Otherwise, the model will try to follow the input tag if possible. 
+
+If you find the temporal model useful, please cite this paper:
+```BibTeX
+@inproceedings{xie2023enhance,
+    author = {Zeyu Xie and Xuenan Xu and Mengyue Wu and Kai Yu},
+    title = {Enhance Temporal Relations in Audio Captioning with Sound Event Detection},
+    year = 2023,
+    booktitle = {Proc. INTERSPEECH},
+    pages = {4179--4183},
+}
 ```
 
 ## Using off-the-shelf models

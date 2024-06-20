@@ -6,7 +6,8 @@ import sys
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.nn import functional as F
+import torch.nn.functional as F
+from torch.nn.utils.rnn import PackedSequence, pack_padded_sequence, pad_packed_sequence
 from torchaudio import transforms
 from torchlibrosa import SpecAugmentation
 from efficientnet_pytorch import EfficientNet
@@ -16,36 +17,205 @@ from torch.hub import load_state_dict_from_url
 from transformers import PretrainedConfig, PreTrainedModel
 
 
-def init(m, method="kaiming"):
-    if isinstance(m, (nn.Conv2d, nn.Conv1d)):
-        if method == "kaiming":
-            nn.init.kaiming_uniform_(m.weight)
-        elif method == "xavier":
-            nn.init.xavier_uniform_(m.weight)
+def sort_pack_padded_sequence(input, lengths):
+    sorted_lengths, indices = torch.sort(lengths, descending=True)
+    tmp = pack_padded_sequence(input[indices], sorted_lengths.cpu(), batch_first=True)
+    inv_ix = indices.clone()
+    inv_ix[indices] = torch.arange(0,len(indices)).type_as(inv_ix)
+    return tmp, inv_ix
+
+def pad_unsort_packed_sequence(input, inv_ix):
+    tmp, _ = pad_packed_sequence(input, batch_first=True)
+    tmp = tmp[inv_ix]
+    return tmp
+
+def pack_wrapper(module, attn_feats, attn_feat_lens):
+    packed, inv_ix = sort_pack_padded_sequence(attn_feats, attn_feat_lens)
+    if isinstance(module, torch.nn.RNNBase):
+        return pad_unsort_packed_sequence(module(packed)[0], inv_ix)
+    else:
+        return pad_unsort_packed_sequence(PackedSequence(module(packed[0]), packed[1]), inv_ix)
+
+def embedding_pooling(x, lens, pooling="mean"):
+    if pooling == "max":
+        fc_embs = max_with_lens(x, lens)
+    elif pooling == "mean":
+        fc_embs = mean_with_lens(x, lens)
+    elif pooling == "mean+max":
+        x_mean = mean_with_lens(x, lens)
+        x_max = max_with_lens(x, lens)
+        fc_embs = x_mean + x_max
+    elif pooling == "last":
+        indices = (lens - 1).reshape(-1, 1, 1).repeat(1, 1, x.size(-1))
+        # indices: [N, 1, hidden]
+        fc_embs = torch.gather(x, 1, indices).squeeze(1)
+    else:
+        raise Exception(f"pooling method {pooling} not support")
+    return fc_embs
+
+def interpolate(x, ratio):
+    """Interpolate data in time domain. This is used to compensate the 
+    resolution reduction in downsampling of a CNN.
+    
+    Args:
+      x: (batch_size, time_steps, classes_num)
+      ratio: int, ratio to interpolate
+
+    Returns:
+      upsampled: (batch_size, time_steps * ratio, classes_num)
+    """
+    (batch_size, time_steps, classes_num) = x.shape
+    upsampled = x[:, :, None, :].repeat(1, 1, ratio, 1)
+    upsampled = upsampled.reshape(batch_size, time_steps * ratio, classes_num)
+    return upsampled
+
+def pad_framewise_output(framewise_output, frames_num):
+    """Pad framewise_output to the same length as input frames. The pad value 
+    is the same as the value of the last frame.
+
+    Args:
+      framewise_output: (batch_size, frames_num, classes_num)
+      frames_num: int, number of frames to pad
+
+    Outputs:
+      output: (batch_size, frames_num, classes_num)
+    """
+    pad = framewise_output[:, -1 :, :].repeat(1, frames_num - framewise_output.shape[1], 1)
+    """tensor for padding"""
+
+    output = torch.cat((framewise_output, pad), dim=1)
+    """(batch_size, frames_num, classes_num)"""
+
+    return output
+
+def find_contiguous_regions(activity_array):
+    """Find contiguous regions from bool valued numpy.array.
+    Copy of https://dcase-repo.github.io/dcase_util/_modules/dcase_util/data/decisions.html#DecisionEncoder
+
+    Reason is:
+    1. This does not belong to a class necessarily
+    2. Import DecisionEncoder requires sndfile over some other imports..which causes some problems on clusters
+
+    """
+
+    # Find the changes in the activity_array
+    change_indices = np.logical_xor(activity_array[1:],
+                                    activity_array[:-1]).nonzero()[0]
+
+    # Shift change_index with one, focus on frame after the change.
+    change_indices += 1
+
+    if activity_array[0]:
+        # If the first element of activity_array is True add 0 at the beginning
+        change_indices = np.r_[0, change_indices]
+
+    if activity_array[-1]:
+        # If the last element of activity_array is True, add the length of the array
+        change_indices = np.r_[change_indices, activity_array.size]
+
+    # Reshape the result into two columns
+    return change_indices.reshape((-1, 2))
+
+def double_threshold(x, high_thres, low_thres, n_connect=1):
+    """double_threshold
+    Helper function to calculate double threshold for n-dim arrays
+
+    :param x: input array
+    :param high_thres: high threshold value
+    :param low_thres: Low threshold value
+    :param n_connect: Distance of <= n clusters will be merged
+    """
+    assert x.ndim <= 3, "Whoops something went wrong with the input ({}), check if its <= 3 dims".format(
+        x.shape)
+    if x.ndim == 3:
+        apply_dim = 1
+    elif x.ndim < 3:
+        apply_dim = 0
+    # x is assumed to be 3d: (batch, time, dim)
+    # Assumed to be 2d : (time, dim)
+    # Assumed to be 1d : (time)
+    # time axis is therefore at 1 for 3d and 0 for 2d (
+    return np.apply_along_axis(lambda x: _double_threshold(
+        x, high_thres, low_thres, n_connect=n_connect),
+                               axis=apply_dim,
+                               arr=x)
+
+def _double_threshold(x, high_thres, low_thres, n_connect=1, return_arr=True):
+    """_double_threshold
+    Computes a double threshold over the input array
+
+    :param x: input array, needs to be 1d
+    :param high_thres: High threshold over the array
+    :param low_thres: Low threshold over the array
+    :param n_connect: Postprocessing, maximal distance between clusters to connect
+    :param return_arr: By default this function returns the filtered indiced, but if return_arr = True it returns an array of tsame size as x filled with ones and zeros.
+    """
+    assert x.ndim == 1, "Input needs to be 1d"
+    high_locations = np.where(x > high_thres)[0]
+    locations = x > low_thres
+    encoded_pairs = find_contiguous_regions(locations)
+
+    filtered_list = list(
+        filter(
+            lambda pair:
+            ((pair[0] <= high_locations) & (high_locations <= pair[1])).any(),
+            encoded_pairs))
+
+    filtered_list = connect_(filtered_list, n_connect)
+    if return_arr:
+        zero_one_arr = np.zeros_like(x, dtype=int)
+        for sl in filtered_list:
+            zero_one_arr[sl[0]:sl[1]] = 1
+        return zero_one_arr
+    return filtered_list
+
+def connect_(pairs, n=1):
+    """connect_
+    Connects two adjacent clusters if their distance is <= n
+
+    :param pairs: Clusters of iterateables e.g., [(1,5),(7,10)]
+    :param n: distance between two clusters 
+    """
+    if len(pairs) == 0:
+        return []
+    start_, end_ = pairs[0]
+    new_pairs = []
+    for i, (next_item, cur_item) in enumerate(zip(pairs[1:], pairs[0:])):
+        end_ = next_item[1]
+        if next_item[0] - cur_item[1] <= n:
+            pass
         else:
-            raise Exception(f"initialization method {method} not supported")
-        if m.bias is not None:
-            nn.init.constant_(m.bias, 0)
-    elif isinstance(m, (nn.BatchNorm2d, nn.BatchNorm1d)):
-        nn.init.constant_(m.weight, 1)
-        if m.bias is not None:
-            nn.init.constant_(m.bias, 0)
-    elif isinstance(m, nn.Linear):
-        if method == "kaiming":
-            nn.init.kaiming_uniform_(m.weight)
-        elif method == "xavier":
-            nn.init.xavier_uniform_(m.weight)
-        else:
-            raise Exception(f"initialization method {method} not supported")
-        if m.bias is not None:
-            nn.init.constant_(m.bias, 0)
-    elif isinstance(m, nn.Embedding):
-        if method == "kaiming":
-            nn.init.kaiming_uniform_(m.weight)
-        elif method == "xavier":
-            nn.init.xavier_uniform_(m.weight)
-        else:
-            raise Exception(f"initialization method {method} not supported")
+            new_pairs.append((start_, cur_item[1]))
+            start_ = next_item[0]
+    new_pairs.append((start_, end_))
+    return new_pairs
+
+def segments_to_temporal_tag(segments, thre=0.5):
+    after_flag, while_flag = 0, 0
+    for j in range(len(segments)):
+        for k in range(len(segments)):
+            if segments[j][0] == segments[k][0]:
+                continue
+            min_duration = min(segments[j][2] - segments[j][1], segments[k][2] - segments[k][1])
+            overlap = segments[j][2] - segments[k][1]
+            if overlap < thre * min_duration:
+                after_flag = 2
+            if segments[j][1] < segments[k][1] and overlap > thre * min_duration:
+                while_flag = 1
+    return after_flag + while_flag
+
+def decode_with_timestamps(labels, time_resolution):
+    batch_results = []
+    for lab in labels:
+        segments = []
+        for i, label_column in enumerate(lab.T):
+            change_indices = find_contiguous_regions(label_column)
+            # append [onset, offset] in the result list
+            for row in change_indices:
+                segments.append((i, row[0] * time_resolution, row[1] * time_resolution))
+        temporal_tag = segments_to_temporal_tag(segments)
+        batch_results.append(temporal_tag)
+    return batch_results
 
 class _EffiNet(nn.Module):
     """A proxy for efficient net models"""
@@ -927,9 +1097,7 @@ class ContraEncoderKdWrapper(nn.Module, CaptionMetaMixin):
         else:
             self.stdnt_proj = nn.Linear(model.fc_emb_size,
                                         shared_dim)
-        self.stdnt_proj.apply(init)
         self.tchr_proj = nn.Linear(tchr_dim, shared_dim)
-        self.tchr_proj.apply(init)
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
 
     def forward(self, input_dict: Dict):
@@ -991,8 +1159,8 @@ class Effb2TrmCaptioningModel(PreTrainedModel):
 
     def __init__(self, config):
         super().__init__(config)
-        self.encoder = EfficientNetB2(pretrained=True)
-        self.decoder = TransformerDecoder(
+        encoder = EfficientNetB2(pretrained=True)
+        decoder = TransformerDecoder(
             emb_dim=config.decoder_emb_dim,
             vocab_size=config.vocab_size,
             fc_emb_dim=config.fc_emb_dim,
@@ -1001,7 +1169,7 @@ class Effb2TrmCaptioningModel(PreTrainedModel):
             nlayers=config.decoder_n_layers,
             tie_weights=config.decoder_we_tie_weights
         )
-        model = TransformerModel(self.encoder, self.decoder)
+        model = TransformerModel(encoder, decoder)
         self.model = ContraEncoderKdWrapper(model, config.shared_dim, config.tchr_dim)
     
     def forward(self,
@@ -1025,3 +1193,795 @@ class Effb2TrmCaptioningModel(PreTrainedModel):
             input_dict["beam_size"] = beam_size
         return self.model(input_dict)["seq"].cpu()
 
+
+class ConvBlock(nn.Module):
+
+    def __init__(self, in_channels, out_channels):
+        
+        super(ConvBlock, self).__init__()
+        
+        self.conv1 = nn.Conv2d(in_channels=in_channels,
+                               out_channels=out_channels,
+                               kernel_size=(3, 3), stride=(1, 1),
+                               padding=(1, 1), bias=False)
+                              
+        self.conv2 = nn.Conv2d(in_channels=out_channels,
+                               out_channels=out_channels,
+                               kernel_size=(3, 3), stride=(1, 1),
+                               padding=(1, 1), bias=False)
+                              
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+
+    def forward(self, input, pool_size=(2, 2), pool_type='avg'):
+        
+        x = input
+        x = F.relu_(self.bn1(self.conv1(x)))
+        x = F.relu_(self.bn2(self.conv2(x)))
+        if pool_type == 'max':
+            x = F.max_pool2d(x, kernel_size=pool_size)
+        elif pool_type == 'avg':
+            x = F.avg_pool2d(x, kernel_size=pool_size)
+        elif pool_type == 'avg+max':
+            x1 = F.avg_pool2d(x, kernel_size=pool_size)
+            x2 = F.max_pool2d(x, kernel_size=pool_size)
+            x = x1 + x2
+        else:
+            raise Exception('Incorrect argument!')
+        
+        return x
+
+
+class Cnn14Encoder(nn.Module):
+
+    def __init__(self, sample_rate=32000):
+        super().__init__()
+        sr_to_fmax = {
+            32000: 14000,
+            16000: 8000
+        }
+        # Logmel spectrogram extractor
+        self.melspec_extractor = transforms.MelSpectrogram(
+            sample_rate=sample_rate,
+            n_fft=32 * sample_rate // 1000,
+            win_length=32 * sample_rate // 1000,
+            hop_length=10 * sample_rate // 1000,
+            f_min=50,
+            f_max=sr_to_fmax[sample_rate],
+            n_mels=64,
+            norm="slaney",
+            mel_scale="slaney"
+        )
+        self.hop_length = 10 * sample_rate // 1000
+        self.db_transform = transforms.AmplitudeToDB()
+
+        self.bn0 = nn.BatchNorm2d(64)
+
+        self.conv_block1 = ConvBlock(in_channels=1, out_channels=64)
+        self.conv_block2 = ConvBlock(in_channels=64, out_channels=128)
+        self.conv_block3 = ConvBlock(in_channels=128, out_channels=256)
+        self.conv_block4 = ConvBlock(in_channels=256, out_channels=512)
+        self.conv_block5 = ConvBlock(in_channels=512, out_channels=1024)
+        self.conv_block6 = ConvBlock(in_channels=1024, out_channels=2048)
+
+        self.downsample_ratio = 32
+
+        self.fc1 = nn.Linear(2048, 2048, bias=True)
+        self.fc_emb_size = 2048
+ 
+    def forward(self, input_dict):
+        lms = input_dict["lms"]
+        wave_length = input_dict["wav_len"]
+
+        x = lms    # (batch_size, mel_bins, time_steps)
+        x = x.transpose(1, 2)
+        x = x.unsqueeze(1)      # (batch_size, 1, time_steps, mel_bins)
+
+        x = x.transpose(1, 3)
+        x = self.bn0(x)
+        x = x.transpose(1, 3)
+
+        x = self.conv_block1(x, pool_size=(2, 2), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = self.conv_block2(x, pool_size=(2, 2), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = self.conv_block3(x, pool_size=(2, 2), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = self.conv_block4(x, pool_size=(2, 2), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = self.conv_block5(x, pool_size=(2, 2), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = self.conv_block6(x, pool_size=(1, 1), pool_type='avg')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = torch.mean(x, dim=3)
+        attn_emb = x.transpose(1, 2)
+        
+        wave_length = torch.as_tensor(wave_length)
+        feat_length = torch.div(wave_length, self.hop_length,
+            rounding_mode="floor") + 1
+        feat_length = torch.div(feat_length, self.downsample_ratio,
+            rounding_mode="floor")
+        x_max = max_with_lens(attn_emb, feat_length)
+        x_mean = mean_with_lens(attn_emb, feat_length)
+        x = x_max + x_mean
+        x = F.dropout(x, p=0.5, training=self.training)
+        x = F.relu_(self.fc1(x))
+        fc_emb = F.dropout(x, p=0.5, training=self.training)
+        
+        output_dict = {
+            'fc_emb': fc_emb,
+            'attn_emb': attn_emb,
+            'attn_emb_len': feat_length
+        }
+
+        return output_dict
+
+
+class RnnEncoder(nn.Module):
+
+    def __init__(self,
+                 attn_feat_dim,
+                 pooling="mean",
+                 **kwargs):
+        super().__init__()
+        self.pooling = pooling
+        self.hidden_size = kwargs.get('hidden_size', 512)
+        self.bidirectional = kwargs.get('bidirectional', False)
+        self.num_layers = kwargs.get('num_layers', 1)
+        self.dropout = kwargs.get('dropout', 0.2)
+        self.rnn_type = kwargs.get('rnn_type', "GRU")
+        self.in_bn = kwargs.get('in_bn', False)
+        self.embed_dim = self.hidden_size * (self.bidirectional + 1)
+        self.network = getattr(nn, self.rnn_type)(
+            attn_feat_dim,
+            self.hidden_size,
+            num_layers=self.num_layers,
+            bidirectional=self.bidirectional,
+            dropout=self.dropout,
+            batch_first=True)
+        if self.in_bn:
+            self.bn = nn.BatchNorm1d(self.embed_dim)
+
+    def forward(self, input_dict):
+        x = input_dict["attn"]
+        lens = input_dict["attn_len"]
+        lens = torch.as_tensor(lens)
+        # x: [N, T, E]
+        if self.in_bn:
+            x = pack_wrapper(self.bn, x, lens)
+        out = pack_wrapper(self.network, x, lens)
+        # out: [N, T, hidden]
+        attn_emb = out
+        fc_emb = embedding_pooling(out, lens, self.pooling)
+        return {
+            "attn_emb": attn_emb,
+            "fc_emb": fc_emb,
+            "attn_emb_len": lens
+        }
+
+
+class Cnn14RnnEncoder(nn.Module):
+
+    def __init__(self,
+                 sample_rate,
+                 rnn_bidirectional,
+                 rnn_hidden_size,
+                 rnn_dropout,
+                 rnn_num_layers):
+        super().__init__()
+        self.cnn = Cnn14Encoder(sample_rate=sample_rate)
+        self.rnn = RnnEncoder(
+            2048,
+            bidirectional=rnn_bidirectional,
+            hidden_size=rnn_hidden_size,
+            dropout=rnn_dropout,
+            num_layers=rnn_num_layers,
+        )
+
+    def forward(self, input_dict):
+        output_dict = self.cnn(input_dict)
+        output_dict["attn"] = output_dict["attn_emb"]
+        output_dict["attn_len"] = output_dict["attn_emb_len"]
+        del output_dict["attn_emb"], output_dict["attn_emb_len"]
+        output_dict = self.rnn(output_dict)
+        return output_dict
+
+
+class Seq2SeqAttention(nn.Module):
+
+    def __init__(self, hs_enc, hs_dec, attn_size):
+        """
+        Args:
+            hs_enc: encoder hidden size
+            hs_dec: decoder hidden size
+            attn_size: attention vector size
+        """
+        super(Seq2SeqAttention, self).__init__()
+        self.h2attn = nn.Linear(hs_enc + hs_dec, attn_size)
+        self.v = nn.Parameter(torch.randn(attn_size))
+
+    def forward(self, h_dec, h_enc, src_lens):
+        """
+        Args:
+            h_dec: decoder hidden (query), [N, hs_dec]
+            h_enc: encoder memory (key/value), [N, src_max_len, hs_enc]
+            src_lens: source (encoder memory) lengths, [N, ]
+        """
+        N = h_enc.size(0)
+        src_max_len = h_enc.size(1)
+        h_dec = h_dec.unsqueeze(1).repeat(1, src_max_len, 1) # [N, src_max_len, hs_dec]
+
+        attn_input = torch.cat((h_dec, h_enc), dim=-1)
+        attn_out = torch.tanh(self.h2attn(attn_input)) # [N, src_max_len, attn_size]
+
+        v = self.v.repeat(N, 1).unsqueeze(1) # [N, 1, attn_size]
+        score = torch.bmm(v, attn_out.transpose(1, 2)).squeeze(1) # [N, src_max_len]
+
+        idxs = torch.arange(src_max_len).repeat(N).view(N, src_max_len)
+        mask = (idxs < src_lens.view(-1, 1)).to(h_dec.device)
+
+        score = score.masked_fill(mask == 0, -1e10)
+        weights = torch.softmax(score, dim=-1) # [N, src_max_len]
+        ctx = torch.bmm(weights.unsqueeze(1), h_enc).squeeze(1) # [N, hs_enc]
+
+        return ctx, weights
+
+
+class RnnDecoder(BaseDecoder):
+
+    def __init__(self, emb_dim, vocab_size, fc_emb_dim, attn_emb_dim,
+                 dropout, d_model, **kwargs):
+        super().__init__(emb_dim, vocab_size, fc_emb_dim, attn_emb_dim,
+                         dropout,)
+        self.d_model = d_model
+        self.num_layers = kwargs.get('num_layers', 1)
+        self.bidirectional = kwargs.get('bidirectional', False)
+        self.rnn_type = kwargs.get('rnn_type', "GRU")
+        self.classifier = nn.Linear(
+            self.d_model * (self.bidirectional + 1), vocab_size)
+
+    def forward(self, x):
+        raise NotImplementedError
+
+    def init_hidden(self, bs, device):
+        num_dire = self.bidirectional + 1
+        n_layer = self.num_layers
+        hid_dim = self.d_model
+        if self.rnn_type == "LSTM":
+            return (torch.zeros(num_dire * n_layer, bs, hid_dim).to(device),
+                    torch.zeros(num_dire * n_layer, bs, hid_dim).to(device))
+        else:
+            return torch.zeros(num_dire * n_layer, bs, hid_dim).to(device)
+    
+
+class BahAttnCatFcDecoder(RnnDecoder):
+
+    def __init__(self, emb_dim, vocab_size, fc_emb_dim, attn_emb_dim,
+                 dropout, d_model, **kwargs):
+        """
+        concatenate fc, attn, word to feed to the rnn
+        """
+        super().__init__(emb_dim, vocab_size, fc_emb_dim, attn_emb_dim,
+                         dropout, d_model, **kwargs)
+        attn_size = kwargs.get("attn_size", self.d_model)
+        self.model = getattr(nn, self.rnn_type)(
+            input_size=self.emb_dim * 3,
+            hidden_size=self.d_model,
+            batch_first=True,
+            num_layers=self.num_layers,
+            bidirectional=self.bidirectional)
+        self.attn = Seq2SeqAttention(self.attn_emb_dim,
+                                     self.d_model * (self.bidirectional + 1) * \
+                                             self.num_layers,
+                                     attn_size)
+        self.fc_proj = nn.Linear(self.fc_emb_dim, self.emb_dim)
+        self.ctx_proj = nn.Linear(self.attn_emb_dim, self.emb_dim)
+
+    def forward(self, input_dict):
+        word = input_dict["word"]
+        state = input_dict.get("state", None) # [n_layer * n_dire, bs, d_model]
+        fc_emb = input_dict["fc_emb"]
+        attn_emb = input_dict["attn_emb"]
+        attn_emb_len = input_dict["attn_emb_len"]
+
+        word = word.to(fc_emb.device)
+        embed = self.in_dropout(self.word_embedding(word))
+
+        # embed: [N, 1, embed_size]
+        if state is None:
+            state = self.init_hidden(word.size(0), fc_emb.device)
+        if self.rnn_type == "LSTM":
+            query = state[0].transpose(0, 1).flatten(1)
+        else:
+            query = state.transpose(0, 1).flatten(1)
+        c, attn_weight = self.attn(query, attn_emb, attn_emb_len)
+
+        p_fc_emb = self.fc_proj(fc_emb)
+        p_ctx = self.ctx_proj(c)
+        rnn_input = torch.cat((embed, p_ctx.unsqueeze(1), p_fc_emb.unsqueeze(1)),
+                              dim=-1)
+
+        out, state = self.model(rnn_input, state)
+
+        output = {
+            "state": state,
+            "embed": out,
+            "logit": self.classifier(out),
+            "attn_weight": attn_weight
+        }
+        return output
+
+
+class TemporalBahAttnDecoder(BahAttnCatFcDecoder):
+
+    def __init__(self, emb_dim, vocab_size, fc_emb_dim, attn_emb_dim,
+                 dropout, d_model, **kwargs):
+        """
+        concatenate fc, attn, word to feed to the rnn
+        """
+        super().__init__(emb_dim, vocab_size, fc_emb_dim, attn_emb_dim,
+                         dropout, d_model, **kwargs)
+        self.temporal_embedding = nn.Embedding(4, emb_dim)
+
+    def forward(self, input_dict):
+        word = input_dict["word"]
+        state = input_dict.get("state", None) # [n_layer * n_dire, bs, d_model]
+        fc_embs = input_dict["fc_emb"]
+        attn_embs = input_dict["attn_emb"]
+        attn_emb_lens = input_dict["attn_emb_len"]
+        temporal_tag = input_dict["temporal_tag"]
+
+        if input_dict["t"] == 0:
+            embed = self.in_dropout(
+                self.temporal_embedding(temporal_tag)).unsqueeze(1)
+        elif word.size(-1) == self.fc_emb_dim: # fc_embs
+            embed = word.unsqueeze(1)
+        elif word.size(-1) == 1: # word
+            word = word.to(fc_embs.device)
+            embed = self.in_dropout(self.word_embedding(word))
+        else:
+            raise Exception(f"problem with word input size {word.size()}")
+
+        # embed: [N, 1, embed_size]
+        if state is None:
+            state = self.init_hidden(word.size(0), fc_embs.device)
+        if self.rnn_type == "LSTM":
+            query = state[0].transpose(0, 1).flatten(1)
+        else:
+            query = state.transpose(0, 1).flatten(1)
+        c, attn_weight = self.attn(query, attn_embs, attn_emb_lens)
+
+        p_ctx = self.ctx_proj(c)
+        p_fc_embs = self.fc_proj(fc_embs)
+        p_ctx = self.ctx_proj(c)
+        rnn_input = torch.cat((embed, p_ctx.unsqueeze(1), p_fc_embs.unsqueeze(1)), dim=-1)
+
+        out, state = self.model(rnn_input, state)
+
+        output = {
+            "state": state,
+            "embed": out,
+            "logit": self.classifier(out),
+            "attn_weight": attn_weight
+        }
+        return output
+
+
+class Seq2SeqAttnModel(CaptionModel):
+
+    def __init__(self, encoder, decoder, **kwargs):
+        if not hasattr(self, "compatible_decoders"):
+            self.compatible_decoders = (
+                BahAttnCatFcDecoder,
+            )
+        super().__init__(encoder, decoder, **kwargs)
+
+
+    def seq_forward(self, input_dict):
+        # Bahdanau attention only supports step-by-step implementation, so we implement forward in 
+        # step-by-step manner whether in training or evaluation
+        return self.stepwise_forward(input_dict)
+
+    def prepare_output(self, input_dict):
+        output = super().prepare_output(input_dict)
+        attn_weight = torch.empty(output["seq"].size(0),
+            input_dict["attn_emb"].size(1), output["seq"].size(1))
+        output["attn_weight"] = attn_weight
+        return output
+
+    def prepare_decoder_input(self, input_dict, output):
+        decoder_input = {
+            "fc_emb": input_dict["fc_emb"],
+            "attn_emb": input_dict["attn_emb"],
+            "attn_emb_len": input_dict["attn_emb_len"]
+        }
+        t = input_dict["t"]
+        ###############
+        # determine input word
+        ################
+        if input_dict["mode"] == "train" and random.random() < input_dict["ss_ratio"]: # training, scheduled sampling
+            word = input_dict["cap"][:, t]
+        else:
+            if t == 0:
+                word = torch.tensor([self.start_idx,] * input_dict["fc_emb"].size(0)).long()
+            else:
+                word = output["seq"][:, t-1]
+        # word: [N,]
+        decoder_input["word"] = word.unsqueeze(1)
+
+        ################
+        # prepare rnn state
+        ################
+        if t > 0:
+            decoder_input["state"] = output["state"]
+        return decoder_input
+
+    def stepwise_process_step(self, output, output_t):
+        super().stepwise_process_step(output, output_t)
+        output["state"] = output_t["state"]
+        t = output_t["t"]
+        output["attn_weight"][:, :, t] = output_t["attn_weight"]
+
+    def prepare_beamsearch_output(self, input_dict):
+        output = super().prepare_beamsearch_output(input_dict)
+        beam_size = input_dict["beam_size"]
+        max_length = input_dict["max_length"]
+        output["attn_weight"] = torch.empty(beam_size,
+            max(input_dict["attn_emb_len"]), max_length)
+        return output
+
+    def prepare_beamsearch_decoder_input(self, input_dict, output_i):
+        decoder_input = {}
+        t = input_dict["t"]
+        i = input_dict["sample_idx"]
+        beam_size = input_dict["beam_size"]
+        ###############
+        # prepare fc embeds
+        ################
+        if t == 0:
+            fc_emb = repeat_tensor(input_dict["fc_emb"][i], beam_size)
+            output_i["fc_emb"] = fc_emb
+        decoder_input["fc_emb"] = output_i["fc_emb"]
+
+        ###############
+        # prepare attn embeds
+        ################
+        if t == 0:
+            attn_emb = repeat_tensor(input_dict["attn_emb"][i], beam_size)
+            attn_emb_len = repeat_tensor(input_dict["attn_emb_len"][i], beam_size)
+            output_i["attn_emb"] = attn_emb
+            output_i["attn_emb_len"] = attn_emb_len
+        decoder_input["attn_emb"] = output_i["attn_emb"]
+        decoder_input["attn_emb_len"] = output_i["attn_emb_len"]
+
+        ###############
+        # determine input word
+        ################
+        if t == 0:
+            word = torch.tensor([self.start_idx,] * beam_size).long()
+        else:
+            word = output_i["next_word"]
+        decoder_input["word"] = word.unsqueeze(1)
+
+        ################
+        # prepare rnn state
+        ################
+        if t > 0:
+            if self.decoder.rnn_type == "LSTM":
+                decoder_input["state"] = (output_i["state"][0][:, output_i["prev_words_beam"], :].contiguous(),
+                                          output_i["state"][1][:, output_i["prev_words_beam"], :].contiguous())
+            else:
+                decoder_input["state"] = output_i["state"][:, output_i["prev_words_beam"], :].contiguous()
+
+        return decoder_input
+
+    def beamsearch_process_step(self, output_i, output_t):
+        t = output_t["t"]
+        output_i["state"] = output_t["state"]
+        output_i["attn_weight"][..., t] = output_t["attn_weight"]
+        output_i["attn_weight"] = output_i["attn_weight"][output_i["prev_words_beam"], ...]
+
+    def beamsearch_process(self, output, output_i, input_dict):
+        super().beamsearch_process(output, output_i, input_dict)
+        i = input_dict["sample_idx"]
+        output["attn_weight"][i] = output_i["attn_weight"][0]
+
+    def prepare_dbs_decoder_input(self, input_dict, output_i):
+        decoder_input = {}
+        t = input_dict["t"]
+        i = input_dict["sample_idx"]
+        bdash = input_dict["bdash"]
+        divm = input_dict["divm"]
+
+        local_time = t - divm
+        ###############
+        # prepare fc embeds
+        ################
+        # repeat only at the first timestep to save consumption
+        if t == 0:
+            fc_emb = repeat_tensor(input_dict["fc_emb"][i], bdash).unsqueeze(1)
+            output_i["fc_emb"] = fc_emb
+        decoder_input["fc_emb"] = output_i["fc_emb"]
+
+        ###############
+        # prepare attn embeds
+        ################
+        if t == 0:
+            attn_emb = repeat_tensor(input_dict["attn_emb"][i], bdash)
+            attn_emb_len = repeat_tensor(input_dict["attn_emb_len"][i], bdash)
+            output_i["attn_emb"] = attn_emb
+            output_i["attn_emb_len"] = attn_emb_len
+        decoder_input["attn_emb"] = output_i["attn_emb"]
+        decoder_input["attn_emb_len"] = output_i["attn_emb_len"]
+
+        ###############
+        # determine input word
+        ################
+        if local_time == 0:
+            word = torch.tensor([self.start_idx,] * bdash).long()
+        else:
+            word = output_i["next_word"][divm]
+        decoder_input["word"] = word.unsqueeze(1)
+
+        ################
+        # prepare rnn state
+        ################
+        if local_time > 0:
+            if self.decoder.rnn_type == "LSTM":
+                decoder_input["state"] = (
+                    output_i["state"][0][divm][
+                        :, output_i["prev_words_beam"][divm], :].contiguous(),
+                    output_i["state"][1][divm][
+                        :, output_i["prev_words_beam"][divm], :].contiguous()
+                )
+            else:
+                decoder_input["state"] = output_i["state"][divm][
+                    :, output_i["prev_words_beam"][divm], :].contiguous()
+
+        return decoder_input
+
+    def dbs_process_step(self, output_i, output_t):
+        divm = output_t["divm"]
+        output_i["state"][divm] = output_t["state"]
+        # TODO attention weight
+
+
+class TemporalSeq2SeqAttnModel(Seq2SeqAttnModel):
+
+    def __init__(self, encoder, decoder, **kwargs):
+        if not hasattr(self, "compatible_decoders"):
+            self.compatible_decoders = (
+                TemporalBahAttnDecoder,
+            )
+        super().__init__(encoder, decoder, **kwargs)
+        self.train_forward_keys = ["cap", "cap_len", "ss_ratio", "temporal_tag"] 
+        self.inference_forward_keys = ["sample_method", "max_length", "temp", "temporal_tag"]
+        
+    
+    def prepare_decoder_input(self, input_dict, output):
+        decoder_input = super().prepare_decoder_input(input_dict, output)
+        decoder_input["temporal_tag"] = input_dict["temporal_tag"]
+        decoder_input["t"] = input_dict["t"]
+       
+        return decoder_input
+
+
+    def prepare_beamsearch_decoder_input(self, input_dict, output_i):
+        decoder_input = super().prepare_beamsearch_decoder_input(input_dict, output_i)
+        t = input_dict["t"]
+        i = input_dict["sample_idx"]
+        beam_size = input_dict["beam_size"]
+        ###############
+        # prepare temporal_tag
+        ################
+        if t == 0:
+            temporal_tag = repeat_tensor(input_dict["temporal_tag"][i], beam_size)
+            output_i["temporal_tag"] = temporal_tag
+        decoder_input["temporal_tag"] = output_i["temporal_tag"]
+        decoder_input["t"] = input_dict["t"]
+
+        return decoder_input
+
+    def prepare_dbs_decoder_input(self, input_dict, output_i):
+        decoder_input = super.prepare_dbs_decoder_input(input_dict, output_i)
+        t = input_dict["t"]
+        i = input_dict["sample_idx"]
+        bdash = input_dict["bdash"]
+
+        ###############
+        # prepare temporal tag
+        ################
+        # repeat only at the first timestep to save consumption
+        if t == 0:
+            temporal_tag = repeat_tensor(input_dict["temporal_tag"][i], bdash)
+            output_i["temporal_tag"] = temporal_tag
+        decoder_input["temporal_tag"] = output_i["temporal_tag"]
+        decoder_input["t"] = input_dict["t"]
+
+        return decoder_input
+
+
+class Cnn8rnnSedModel(nn.Module):
+    def __init__(self, classes_num):
+        
+        super().__init__()
+
+        self.time_resolution = 0.01
+        self.interpolate_ratio = 4     # Downsampled ratio
+
+        self.bn0 = nn.BatchNorm2d(64)
+
+        self.conv_block1 = ConvBlock(in_channels=1, out_channels=64)
+        self.conv_block2 = ConvBlock(in_channels=64, out_channels=128)
+        self.conv_block3 = ConvBlock(in_channels=128, out_channels=256)
+        self.conv_block4 = ConvBlock(in_channels=256, out_channels=512)
+
+        self.fc1 = nn.Linear(512, 512, bias=True)
+        self.rnn = nn.GRU(512, 256, bidirectional=True, batch_first=True)
+        self.fc_audioset = nn.Linear(512, classes_num, bias=True)
+    
+    def forward(self, lms):
+        output = self.forward_prob(lms)
+        framewise_output = output["framewise_output"].cpu().numpy()
+        thresholded_predictions = double_threshold(
+            framewise_output, 0.75, 0.25)
+        decoded_tags = decode_with_timestamps(
+            thresholded_predictions, self.time_resolution
+        )
+        return decoded_tags
+ 
+    def forward_prob(self, lms):
+        """
+        lms: (batch_size, mel_bins, time_steps)"""
+
+        x = lms
+        x = x.transpose(1, 2)
+        x = x.unsqueeze(1)
+
+        frames_num = x.shape[2]
+        
+        x = x.transpose(1, 3)
+        x = self.bn0(x)
+        x = x.transpose(1, 3)
+
+        x = self.conv_block1(x, pool_size=(2, 2), pool_type='avg+max')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = self.conv_block2(x, pool_size=(2, 2), pool_type='avg+max')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = self.conv_block3(x, pool_size=(1, 2), pool_type='avg+max')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = self.conv_block4(x, pool_size=(1, 2), pool_type='avg+max')
+        x = F.dropout(x, p=0.2, training=self.training) # (batch_size, 256, time_steps / 4, mel_bins / 16)
+        x = torch.mean(x, dim=3)
+        
+        x = x.transpose(1, 2)
+        x = F.dropout(x, p=0.5, training=self.training)
+        x = F.relu_(self.fc1(x))
+        x, _  = self.rnn(x)
+        segmentwise_output = torch.sigmoid(self.fc_audioset(x)).clamp(1e-7, 1.)
+        
+        framewise_output = interpolate(segmentwise_output,
+                                       self.interpolate_ratio)
+        framewise_output = pad_framewise_output(framewise_output, frames_num)
+
+        output_dict = {
+            "segmentwise_output": segmentwise_output,
+            'framewise_output': framewise_output,
+        }
+
+        return output_dict
+
+
+class Cnn14RnnTempAttnGruConfig(PretrainedConfig):
+
+    def __init__(
+        self,
+        sample_rate: int = 32000,
+        encoder_rnn_bidirectional: bool = True,
+        encoder_rnn_hidden_size: int = 256,
+        encoder_rnn_dropout: float = 0.5,
+        encoder_rnn_num_layers: int = 3,
+        decoder_emb_dim: int = 512,
+        vocab_size: int = 4981,
+        fc_emb_dim: int = 512,
+        attn_emb_dim: int = 512,
+        decoder_rnn_type: str = "GRU",
+        decoder_num_layers: int = 1,
+        decoder_d_model: int = 512,
+        decoder_dropout: float = 0.5,
+        **kwargs
+    ):
+        self.sample_rate = sample_rate
+        self.encoder_rnn_bidirectional = encoder_rnn_bidirectional
+        self.encoder_rnn_hidden_size = encoder_rnn_hidden_size
+        self.encoder_rnn_dropout = encoder_rnn_dropout
+        self.encoder_rnn_num_layers = encoder_rnn_num_layers
+        self.decoder_emb_dim = decoder_emb_dim
+        self.vocab_size = vocab_size
+        self.fc_emb_dim = fc_emb_dim
+        self.attn_emb_dim = attn_emb_dim
+        self.decoder_rnn_type = decoder_rnn_type
+        self.decoder_num_layers = decoder_num_layers
+        self.decoder_d_model = decoder_d_model
+        self.decoder_dropout = decoder_dropout
+        super().__init__(**kwargs)
+
+
+class Cnn14RnnTempAttnGruModel(PreTrainedModel):
+    config_class = Cnn14RnnTempAttnGruConfig
+
+    def __init__(self, config):
+        super().__init__(config)
+        sample_rate = config.sample_rate
+        sr_to_fmax = {
+            32000: 14000,
+            16000: 8000
+        }
+        self.melspec_extractor = transforms.MelSpectrogram(
+            sample_rate=sample_rate,
+            n_fft=32 * sample_rate // 1000,
+            win_length=32 * sample_rate // 1000,
+            hop_length=10 * sample_rate // 1000,
+            f_min=50,
+            f_max=sr_to_fmax[sample_rate],
+            n_mels=64,
+            norm="slaney",
+            mel_scale="slaney"
+        )
+        self.db_transform = transforms.AmplitudeToDB()
+
+        encoder = Cnn14RnnEncoder(
+            sample_rate=config.sample_rate,
+            rnn_bidirectional=config.encoder_rnn_bidirectional,
+            rnn_hidden_size=config.encoder_rnn_hidden_size,
+            rnn_dropout=config.encoder_rnn_dropout,
+            rnn_num_layers=config.encoder_rnn_num_layers
+        )
+        decoder = TemporalBahAttnDecoder(
+            emb_dim=config.decoder_emb_dim,
+            vocab_size=config.vocab_size,
+            fc_emb_dim=config.fc_emb_dim,
+            attn_emb_dim=config.attn_emb_dim,
+            rnn_type=config.decoder_rnn_type,
+            num_layers=config.decoder_num_layers,
+            d_model=config.decoder_d_model,
+            dropout=config.decoder_dropout,
+        )
+        cap_model = TemporalSeq2SeqAttnModel(encoder, decoder)
+        sed_model = Cnn8rnnSedModel(classes_num=447)
+        self.cap_model = cap_model
+        self.sed_model = sed_model
+
+    def forward(self,
+                audio: torch.Tensor,
+                audio_length: Union[List, np.ndarray, torch.Tensor],
+                temporal_tag: Union[List, np.ndarray, torch.Tensor] = None,
+                sample_method: str = "beam",
+                beam_size: int = 3,
+                max_length: int = 20,
+                temp: float = 1.0,):
+        device = self.device
+        mel_spec = self.melspec_extractor(audio.to(device))
+        log_mel_spec = self.db_transform(mel_spec)
+
+        sed_tag = self.sed_model(log_mel_spec)
+        sed_tag = torch.as_tensor(sed_tag).to(device)
+        if temporal_tag is not None:
+            temporal_tag = torch.as_tensor(temporal_tag).to(device)
+            temporal_tag = torch.stack([temporal_tag, sed_tag], dim=0)
+            temporal_tag = torch.min(temporal_tag, dim=0).values
+        else:
+            temporal_tag = sed_tag
+
+        input_dict = {
+            "lms": log_mel_spec,
+            "wav_len": audio_length,
+            "temporal_tag": temporal_tag,
+            "mode": "inference",
+            "sample_method": sample_method,
+            "max_length": max_length,
+            "temp": temp,
+        }
+        if sample_method == "beam":
+            input_dict["beam_size"] = beam_size
+        return self.cap_model(input_dict)["seq"].cpu()
