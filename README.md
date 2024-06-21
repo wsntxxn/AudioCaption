@@ -22,7 +22,10 @@ import torchaudio
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # use the model trained on AudioCaps
-model = AutoModel.from_pretrained("wsntxxn/effb2-trm-audio-captioning").to(device)
+model = AutoModel.from_pretrained(
+    "wsntxxn/effb2-trm-audio-captioning",
+    trust_remote_code=True
+).to(device)
 tokenizer = PreTrainedTokenizerFast.from_pretrained(
     "wsntxxn/audiocaps-simple-tokenizer"
 )
@@ -65,7 +68,10 @@ print(captions)
 
 Alternatively, you can use the model trained on Clotho:
 ```python
-model = AutoModel.from_pretrained("wsntxxn/effb2-trm-clotho-captioning").to(device)
+model = AutoModel.from_pretrained(
+    "wsntxxn/effb2-trm-clotho-captioning",
+    trust_remote_code=True
+).to(device)
 tokenizer = PreTrainedTokenizerFast.from_pretrained(
     "wsntxxn/clotho-simple-tokenizer"
 )
@@ -75,7 +81,8 @@ tokenizer = PreTrainedTokenizerFast.from_pretrained(
 We also provide a temporal-enhanced captioning model for specific (simultaneous / sequential) temporal relationship description:
 ```python
 model = AutoModel.from_pretrained(
-    "wsntxxn/cnn14rnn-tempgru-audiocaps-captioning"
+    "wsntxxn/cnn14rnn-tempgru-audiocaps-captioning",
+    trust_remote_code=True
 ).to(device)
 tokenizer = PreTrainedTokenizerFast.from_pretrained(
     "wsntxxn/audiocaps-simple-tokenizer"
