@@ -12,7 +12,6 @@ from torchaudio import transforms
 from efficientnet_pytorch import EfficientNet
 from efficientnet_pytorch import utils as efficientnet_utils
 from einops import rearrange, reduce
-from torch.hub import load_state_dict_from_url
 from transformers import PretrainedConfig, PreTrainedModel
 
 

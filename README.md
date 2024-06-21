@@ -4,6 +4,133 @@ This repository provides a simple and easy-to-use recipe for audio captioning: d
 
 Since we refactor our code several times, codebase of previous challenges are maintained in separate branches: [DCASE2021](https://github.com/wsntxxn/AudioCaption/tree/dcase2021) and [DCASE2022](https://github.com/wsntxxn/AudioCaption/tree/dcase2022). Please check these branches for reference to challenge submissions.
 
+# Quick usage with Hugging Face🤗
+
+For quick usage, we provide an inference inference with Hugging Face. You can use it easily. Only some necessary repositories need to be installed:
+```bash
+pip install numpy torch torchaudio einops transformers efficientnet_pytorch
+```
+
+## Lightweight EffB2-Transformer model
+For standard captioning, we recommend our latest lightweight model for fast inference:
+```python
+import torch
+from transformers import AutoModel, PreTrainedTokenizerFast
+import torchaudio
+
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# use the model trained on AudioCaps
+model = AutoModel.from_pretrained("wsntxxn/effb2-trm-audio-captioning").to(device)
+tokenizer = PreTrainedTokenizerFast.from_pretrained(
+    "wsntxxn/audiocaps-simple-tokenizer"
+)
+
+# inference on a single audio clip
+wav, sr = torchaudio.load("/path/to/file.wav")
+wav = torchaudio.functional.resample(wav, sr, model.config.sample_rate)
+if wav.size(0) > 1:
+    wav = wav.mean(0).unsqueeze(0)
+
+with torch.no_grad():
+    word_idxs = model(
+        audio=wav,
+        audio_length=[wav.size(1)],
+    )
+
+caption = tokenizer.decode(word_idxs[0], skip_special_tokens=True)
+print(caption)
+
+# inference on a batch
+wav1, sr1 = torchaudio.load("/path/to/file1.wav")
+wav1 = torchaudio.functional.resample(wav1, sr1, model.config.sample_rate)
+wav1 = wav1.mean(0) if wav1.size(0) > 1 else wav1[0]
+
+wav2, sr2 = torchaudio.load("/path/to/file2.wav")
+wav2 = torchaudio.functional.resample(wav2, sr2, model.config.sample_rate)
+wav2 = wav2.mean(0) if wav2.size(0) > 1 else wav2[0]
+
+wav_batch = torch.nn.utils.rnn.pad_sequence([wav1, wav2], batch_first=True)
+
+with torch.no_grad():
+    word_idxs = model(
+        audio=wav_batch,
+        audio_length=[wav1.size(0), wav2.size(0)],
+    )
+
+captions = tokenizer.batch_decode(word_idxs, skip_special_tokens=True)
+print(captions)
+```
+
+Alternatively, you can use the model trained on Clotho:
+```python
+model = AutoModel.from_pretrained("wsntxxn/effb2-trm-clotho-captioning").to(device)
+tokenizer = PreTrainedTokenizerFast.from_pretrained(
+    "wsntxxn/clotho-simple-tokenizer"
+)
+```
+
+## Temporal-sensitive and controllable model
+We also provide a temporal-enhanced captioning model for specific (simultaneous / sequential) temporal relationship description:
+```python
+model = AutoModel.from_pretrained(
+    "wsntxxn/cnn14rnn-tempgru-audiocaps-captioning"
+).to(device)
+tokenizer = PreTrainedTokenizerFast.from_pretrained(
+    "wsntxxn/audiocaps-simple-tokenizer"
+)
+
+wav, sr = torchaudio.load("/path/to/file.wav")
+wav = torchaudio.functional.resample(wav, sr, model.config.sample_rate)
+if wav.size(0) > 1:
+    wav = wav.mean(0).unsqueeze(0)
+
+with torch.no_grad():
+    word_idxs = model(
+        audio=wav,
+        audio_length=[wav.size(1)],
+    )
+
+caption = tokenizer.decode(word_idxs[0], skip_special_tokens=True)
+print(caption)
+```
+You can also manually assign a temporal tag:
+```python
+with torch.no_grad():
+    word_idxs = model(
+        audio=wav,
+        audio_length=[wav.size(1)],
+        temporal_tag=[2], # desribe "sequential" if there are sequential events, otherwise use the most complex relationship
+    )
+```
+The temporal tag is defined as:
+|Temporal Tag|Definition|
+|----:|-----:|
+|0|Only 1 Event|
+|1|Simultaneous Events|
+|2|Sequential Events|
+|3|More Complex Events|
+
+From 0 to 3, the relationship indicated by the tag becomes more and more complex.
+The model will infer the tag automatically.
+If `temporal_tag` is not provided as the input, the model will use the inferred tag.
+Otherwise, the model will try to follow the input tag if possible. 
+
+If you find the temporal model useful, please cite this paper:
+```BibTeX
+@inproceedings{xie2023enhance,
+    author = {Zeyu Xie and Xuenan Xu and Mengyue Wu and Kai Yu},
+    title = {Enhance Temporal Relations in Audio Captioning with Sound Event Detection},
+    year = 2023,
+    booktitle = {Proc. INTERSPEECH},
+    pages = {4179--4183},
+}
+```
+
+The above instruction is for quick inference with pre-trained models.
+If you want to further develop your own captioning model, please refer to the following instructions. 
+
 # Install
 
 Checkout this repository and install the required packages:
@@ -51,129 +178,6 @@ $ python python_scripts/inference/inference.py \
     --input input.wav 
     --output output.json
     --checkpoint $CKPT
-```
-
-## Hugging Face🤗 usage
-
-For convenient usage with Hugging Face, we provide the corresponding [wrapper script](captioning/models/hf_wrapper.py). It contains pure PyTorch implementation of captioning models. You can use it without installing this repository:
-```bash
-wget https://github.com/wsntxxn/AudioCaption/raw/master/captioning/models/hf_wrapper.py -O hf_captioning.py
-```
-
-### Lightweight EffB2-Transformer model
-Use the lightweight EffB2-Transformer model for fast inference:
-```python
-import torch
-from transformers import PreTrainedTokenizerFast
-import torchaudio
-from hf_captioning import Effb2TrmCaptioningModel
-
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-# use the model trained on AudioCaps
-model = Effb2TrmCaptioningModel.from_pretrained(
-    "wsntxxn/effb2-trm-audio-captioning",
-).to(device)
-tokenizer = PreTrainedTokenizerFast.from_pretrained(
-    "wsntxxn/audiocaps-simple-tokenizer"
-)
-
-# inference on a single audio clip
-wav, sr = torchaudio.load("/path/to/file.wav")
-wav = torchaudio.functional.resample(wav, sr, model.config.sample_rate)
-if wav.size(0) > 1:
-    wav = wav.mean(0).unsqueeze(0)
-
-with torch.no_grad():
-    word_idxs = model(
-        audio=wav,
-        audio_length=[wav.size(1)],
-    )
-
-caption = tokenizer.decode(word_idxs[0], skip_special_tokens=True)
-print(caption)
-
-# inference on a batch
-wav1, sr1 = torchaudio.load("/path/to/file1.wav")
-wav1 = torchaudio.functional.resample(wav1, sr1, model.config.sample_rate)
-wav1 = wav1.mean(0) if wav1.size(0) > 1 else wav1[0]
-
-wav2, sr2 = torchaudio.load("/path/to/file2.wav")
-wav2 = torchaudio.functional.resample(wav2, sr2, model.config.sample_rate)
-wav2 = wav2.mean(0) if wav2.size(0) > 1 else wav2[0]
-
-wav_batch = torch.nn.utils.rnn.pad_sequence([wav1, wav2], batch_first=True)
-
-with torch.no_grad():
-    word_idxs = model(
-        audio=wav_batch,
-        audio_length=[wav1.size(0), wav2.size(0)],
-    )
-
-captions = tokenizer.batch_decode(word_idxs, skip_special_tokens=True)
-print(captions)
-```
-
-Alternatively, you can use the model trained on Clotho:
-```python
-model = Effb2TrmCaptioningModel.from_pretrained(
-    "wsntxxn/effb2-trm-clotho-captioning",
-).to(device)
-tokenizer = PreTrainedTokenizerFast.from_pretrained(
-    "wsntxxn/clotho-simple-tokenizer"
-)
-```
-
-### Temporal-sensitive and controllable model
-Use the temporal-enhanced captioning model for captioning with specific (simultaneous / sequential) temporal relationship description:
-```python
-from hf_captioning import Cnn14RnnTempAttnGruModel
-
-model = Cnn14RnnTempAttnGruModel.from_pretrained(
-    "wsntxxn/audiocaps-temporal-cnn14rnn-gru",
-).to(device)
-tokenizer = PreTrainedTokenizerFast.from_pretrained(
-    "wsntxxn/audiocaps-simple-tokenizer"
-)
-
-wav, sr = torchaudio.load("/path/to/file.wav")
-wav = torchaudio.functional.resample(wav, sr, model.config.sample_rate)
-if wav.size(0) > 1:
-    wav = wav.mean(0).unsqueeze(0)
-
-with torch.no_grad():
-    word_idxs = model(
-        audio=wav,
-        audio_length=[wav.size(1)],
-        temporal_tag=[2], # desribe "sequential" if there are sequential events, otherwise use the most complex relationship
-    )
-
-caption = tokenizer.decode(word_idxs[0], skip_special_tokens=True)
-print(caption)
-```
-The temporal tag is defined as:
-|temporal tag|Definition|
-|----:|-----:|
-|0|Only 1 Event|
-|1|Simultaneous Events|
-|2|Sequential Events|
-|3|More Complex Events|
-
-From 0 to 3, the relationship indicated by the tag becomes more and more complex.
-The model will infer the tag automatically.
-If `temporal_tag` is not provided as the input, the model will use the inferred tag.
-Otherwise, the model will try to follow the input tag if possible. 
-
-If you find the temporal model useful, please cite this paper:
-```BibTeX
-@inproceedings{xie2023enhance,
-    author = {Zeyu Xie and Xuenan Xu and Mengyue Wu and Kai Yu},
-    title = {Enhance Temporal Relations in Audio Captioning with Sound Event Detection},
-    year = 2023,
-    booktitle = {Proc. INTERSPEECH},
-    pages = {4179--4183},
-}
 ```
 
 ## Using off-the-shelf models
