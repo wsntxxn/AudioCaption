@@ -6,7 +6,7 @@ Since we refactor our code several times, codebase of previous challenges are ma
 
 # Quick usage with Hugging Face🤗
 
-For quick usage, we provide an inference inference with Hugging Face. You can use it easily. Only some necessary repositories need to be installed:
+For quick usage, we provide an inference interface with Hugging Face. You can use it easily. Only some necessary repositories need to be installed:
 ```bash
 pip install numpy torch torchaudio einops transformers efficientnet_pytorch
 ```
