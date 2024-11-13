@@ -63,12 +63,12 @@ class TextCollate(VarLenPadCollate):
 
         for key in data_batch[0].keys():
             try:
-                if key in self.pad_keys:
+                if key == self.text_key:
+                    output.update(self.tokenizer(output[key]))
+                elif key in self.pad_keys:
                     padded_seq, length = pad_sequence(output[key])
                     output[key] = padded_seq
                     output[f"{key}_len"] = np.array(length)
-                elif key == self.text_key:
-                    output.update(self.tokenizer(output[key]))
                 else:
                     if isinstance(output[key][0], (np.ndarray, torch.Tensor)) and \
                         output[key][0].ndim > 1:
